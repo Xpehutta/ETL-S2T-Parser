@@ -3,15 +3,18 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AI Excel Parser – Human Correction</title>
+    <title>AI Excel Parser – Human Correction & Schema Matching</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding-top: 2rem; }
         .card { margin-top: 2rem; }
         .sheet-card { margin-bottom: 1rem; border-left: 4px solid #0d6efd; }
-        pre { background: #f4f4f4; padding: 0.5rem; border-radius: 0.25rem; overflow-x: auto; font-size: 0.8rem; }
+        pre { background: #f4f4f4; padding: 0.5rem; border-radius: 0.25rem; overflow-x: auto; }
+        .decision-badge { font-size: 0.8rem; }
         .header-preview { font-family: monospace; background: #e9ecef; padding: 0.5rem; border-radius: 0.25rem; margin-top: 0.5rem; }
         .skip-checkbox { margin-right: 1rem; }
+        .alert-success { margin-top: 1rem; }
+        .similarity-table { font-size: 0.9rem; }
     </style>
 </head>
 <body>
@@ -20,7 +23,7 @@
         <div class="col-md-10">
             <div class="card shadow-sm">
                 <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction</h4>
+                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction & Schema Matching</h4>
                 </div>
                 <div class="card-body">
                     <form id="uploadForm" enctype="multipart/form-data">
@@ -29,20 +32,24 @@
                             <input class="form-control" type="file" id="fileInput" name="file" accept=".xlsx,.xls,.xlsm" required>
                         </div>
                         <button type="submit" class="btn btn-primary">Upload & Analyze</button>
+                        <button type="button" id="resetBtn" class="btn btn-secondary">🔄 New File</button>
                         <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing headers... ⏳</div>
                     </form>
 
                     <div id="correctionArea" class="mt-4" style="display: none;">
                         <h5>📝 Review and correct AI decisions</h5>
                         <div id="sheetsContainer"></div>
-                        <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections & Store</button>
-                        <button id="resetBtn" class="btn btn-secondary mt-3 ms-2">🔄 Upload Another File</button>
+                        <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections & Check Similarity</button>
                     </div>
 
-                    <div id="successArea" class="mt-4 alert alert-success" style="display: none;">
-                        Corrections applied and data stored successfully!
+                    <div id="similarityArea" class="mt-4" style="display: none;">
+                        <h5>📊 Schema Similarity Report</h5>
+                        <div id="similarityContent"></div>
+                        <button id="loadDataBtn" class="btn btn-primary mt-3" style="display: none;">📥 Load Data into Target Tables</button>
+                        <div id="loadResult" class="alert alert-info mt-3" style="display: none;"></div>
                     </div>
-                    <div id="errorArea" class="mt-4 alert alert-danger" style="display: none;">
+
+                    <div id="errorArea" class="mt-4 text-danger" style="display: none;">
                         <strong>Error:</strong> <span id="errorMessage"></span>
                     </div>
                 </div>
@@ -54,28 +61,58 @@
 <script>
     let currentFileHash = null;
     let currentSheets = [];
+    let currentSimilarityReport = null;
 
     const form = document.getElementById('uploadForm');
     const fileInput = document.getElementById('fileInput');
     const loadingDiv = document.getElementById('loading');
     const correctionArea = document.getElementById('correctionArea');
     const sheetsContainer = document.getElementById('sheetsContainer');
+    const similarityArea = document.getElementById('similarityArea');
+    const similarityContent = document.getElementById('similarityContent');
+    const loadDataBtn = document.getElementById('loadDataBtn');
+    const loadResult = document.getElementById('loadResult');
     const errorArea = document.getElementById('errorArea');
     const errorMessage = document.getElementById('errorMessage');
     const submitBtn = document.getElementById('submitCorrectionsBtn');
     const resetBtn = document.getElementById('resetBtn');
-    const successArea = document.getElementById('successArea');
+
+    // Reset UI but keep the selected file (used before upload)
+    function resetUI() {
+        correctionArea.style.display = 'none';
+        similarityArea.style.display = 'none';
+        errorArea.style.display = 'none';
+        loadResult.style.display = 'none';
+        loadDataBtn.style.display = 'none';
+        sheetsContainer.innerHTML = '';
+        errorMessage.textContent = '';
+        currentFileHash = null;
+        currentSheets = [];
+        currentSimilarityReport = null;
+        loadDataBtn.disabled = false;
+        loadDataBtn.innerText = '📥 Load Data into Target Tables';
+    }
+
+    // Full reset including file input (used by New File button)
+    function fullReset() {
+        resetUI();
+        fileInput.value = '';
+    }
+
+    resetBtn.addEventListener('click', fullReset);
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        // Clear previous results
-        correctionArea.style.display = 'none';
-        errorArea.style.display = 'none';
-        successArea.style.display = 'none';
-        sheetsContainer.innerHTML = '';
 
         const file = fileInput.files[0];
-        if (!file) return;
+        if (!file) {
+            errorMessage.textContent = 'Please select a file';
+            errorArea.style.display = 'block';
+            return;
+        }
+
+        // Reset UI before new upload (but keep the file)
+        resetUI();
 
         const formData = new FormData();
         formData.append('file', file);
@@ -92,7 +129,6 @@
 
             currentFileHash = data.file_hash;
             currentSheets = data.sheets;
-
             renderCorrectionUI(data.sheets);
             correctionArea.style.display = 'block';
         } catch (err) {
@@ -215,6 +251,7 @@
                 header_rows_count: rows
             });
         }
+
         loadingDiv.classList.remove('d-none');
         try {
             const response = await fetch('/apply_corrections', {
@@ -227,10 +264,22 @@
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error);
-            successArea.style.display = 'block';
+
+            const matchResponse = await fetch('/match_schema', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+            const report = await matchResponse.json();
+            if (!matchResponse.ok) throw new Error(report.error);
+
             correctionArea.style.display = 'none';
-            // Clear file input to allow another upload
-            fileInput.value = '';
+            similarityContent.innerHTML = renderSimilarityReport(report);
+            similarityArea.style.display = 'block';
+            loadDataBtn.style.display = 'inline-block';
+            loadResult.style.display = 'none';
+
+            currentSimilarityReport = report;
         } catch (err) {
             errorMessage.textContent = err.message;
             errorArea.style.display = 'block';
@@ -239,15 +288,63 @@
         }
     });
 
-    resetBtn.addEventListener('click', () => {
-        // Reset everything to start a new upload
-        correctionArea.style.display = 'none';
-        successArea.style.display = 'none';
-        errorArea.style.display = 'none';
-        sheetsContainer.innerHTML = '';
-        fileInput.value = '';
-        currentFileHash = null;
-        currentSheets = [];
+    function renderSimilarityReport(report) {
+        let html = `<p><strong>Overall similarity score:</strong> ${report.similarity_score}%</p>`;
+        html += `<table class="table table-sm table-bordered similarity-table">
+                    <thead>
+                        <tr><th>Excel Sheet</th><th>Target Table</th><th>Similarity</th><th>Explanation</th>
+                        </tr>
+                    </thead>
+                    <tbody>`;
+        for (let sugg of report.mapping_suggestions) {
+            html += `<tr>
+                        <td>${escapeHtml(sugg.excel_sheet)}</td>
+                        <td>${escapeHtml(sugg.target_table || '—')}</td>
+                        <td>${escapeHtml(sugg.similarity)}</td>
+                        <td>${escapeHtml(sugg.explanation)}</td>
+                     </tr>`;
+        }
+        html += `</tbody></table>`;
+        if (report.unmatched_excel_sheets && report.unmatched_excel_sheets.length) {
+            html += `<div class="alert alert-warning">⚠️ Unmatched Excel sheets: ${report.unmatched_excel_sheets.join(', ')}</div>`;
+        }
+        if (report.unmatched_target_tables && report.unmatched_target_tables.length) {
+            html += `<div class="alert alert-info">ℹ️ Unmatched target tables: ${report.unmatched_target_tables.join(', ')}</div>`;
+        }
+        html += `<pre class="small">${escapeHtml(JSON.stringify(report.recommendations, null, 2))}</pre>`;
+        return html;
+    }
+
+    loadDataBtn.addEventListener('click', async () => {
+        loadDataBtn.disabled = true;
+        loadDataBtn.innerText = 'Loading...';
+        loadResult.style.display = 'block';
+        loadResult.innerHTML = '⏳ Loading data into target tables...';
+        loadResult.className = 'alert alert-info';
+
+        try {
+            const response = await fetch('/finalize_and_load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    file_hash: currentFileHash,
+                    similarity_report: currentSimilarityReport
+                })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error);
+
+            loadResult.className = 'alert alert-success';
+            loadResult.innerHTML = `✅ Data loaded successfully!<br>
+                                    Inserted counts: ${JSON.stringify(data.inserted_counts)}<br>
+                                    Similarity score: ${data.similarity_score}%`;
+            loadDataBtn.style.display = 'none';
+        } catch (err) {
+            loadResult.className = 'alert alert-danger';
+            loadResult.innerHTML = `❌ Error: ${err.message}`;
+            loadDataBtn.disabled = false;
+            loadDataBtn.innerText = '📥 Load Data into Target Tables';
+        }
     });
 
     function escapeHtml(str) {

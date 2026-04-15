@@ -4,11 +4,14 @@ import pandas as pd
 import numpy as np
 import json
 import datetime
+import hashlib
 from typing import List, Any, Dict
 from flask import Flask, request, jsonify, render_template
 from agent import get_header_decision, get_model_name
 from db_storage import init_db, store_excel_data, update_file_result_json, get_db_connection
 from summarizer_agent import summarize_file
+from schema_matcher import compare_with_target
+from data_loader import load_data_from_similarity_report
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
@@ -17,8 +20,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'xlsm'}
-
-# Cache for file bytes (for re‑parsing after corrections)
 file_bytes_cache = {}
 
 init_db()
@@ -27,7 +28,6 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def convert_to_serializable(obj: Any) -> Any:
-    """Recursively convert all non‑JSON‑serializable objects to serializable types."""
     if obj is None:
         return None
     if isinstance(obj, (datetime.datetime, datetime.date)):
@@ -197,8 +197,12 @@ def parse_excel_with_decisions(file_bytes: bytes, corrections: Dict[str, Dict] =
             nested = header_rows >= 2
             logger.info(f"Using correction for {sheet_name}: start_row={start_row}, header_rows={header_rows}")
         else:
-            start_row, header_rows, nested = get_header_decision(sheet_name, preview_rows)
-            logger.info(f"AI decision for {sheet_name}: start_row={start_row}, header_rows={header_rows}")
+            try:
+                start_row, header_rows, nested = get_header_decision(sheet_name, preview_rows)
+                logger.info(f"AI decision for {sheet_name}: start_row={start_row}, header_rows={header_rows}")
+            except Exception as e:
+                logger.error(f"AI header decision failed for {sheet_name}: {e}. Using default (first row as header).")
+                start_row, header_rows, nested = 0, 1, False
 
         rows_to_skip = start_row + header_rows
         if are_rows_empty(file_bytes, sheet_name, rows_to_skip, num_rows=5):
@@ -350,7 +354,6 @@ def apply_corrections():
 
     file_bytes = file_bytes_cache[file_hash]
 
-    # Retrieve original filename from the database
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT filename FROM files WHERE file_hash = ?", (file_hash,))
@@ -358,7 +361,6 @@ def apply_corrections():
     conn.close()
     original_filename = row["filename"] if row else "unknown.xlsx"
 
-    # Separate skipped sheets and header corrections
     skipped_sheets = []
     header_corrections = {}
     for corr in corrections:
@@ -432,7 +434,7 @@ def preview_headers():
         start_row, header_rows = 0, 1
     elif option == "2":
         start_row, header_rows = 1, 1
-    else:  # "12"
+    else:
         start_row, header_rows = 0, 2
 
     headers = get_preview_headers(file_bytes, sheet_name, start_row, header_rows)
@@ -458,6 +460,67 @@ def get_summary(file_hash):
             return jsonify({"file_hash": file_hash, "summary": summary}), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+@app.route('/match_schema', methods=['POST'])
+def match_schema():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON provided"}), 400
+    try:
+        report = compare_with_target(data)
+        return jsonify(report), 200
+    except Exception as e:
+        logger.exception("Schema matching failed")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/finalize_and_load', methods=['POST'])
+def finalize_and_load():
+    data = request.get_json()
+    file_hash = data.get("file_hash")
+    similarity_report = data.get("similarity_report")
+
+    if not file_hash:
+        return jsonify({"error": "Missing file_hash"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT result_json FROM files WHERE file_hash = ?", (file_hash,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row or not row["result_json"]:
+        return jsonify({"error": "No stored JSON data for this file"}), 404
+
+    try:
+        excel_json = json.loads(row["result_json"])
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid JSON stored"}), 500
+
+    # Use provided report if available, otherwise compute (fallback)
+    if similarity_report:
+        report = similarity_report
+        logger.info("Using similarity report from frontend (no extra LLM call)")
+    else:
+        logger.warning("No similarity report provided – recomputing (may be slow)")
+        try:
+            report = compare_with_target(excel_json)
+        except Exception as e:
+            return jsonify({"error": f"Similarity check failed: {str(e)}"}), 500
+
+    try:
+        inserted_counts = load_data_from_similarity_report(
+            file_hash,
+            report,
+            include_medium=True,
+            min_similarity="medium"
+        )
+        return jsonify({
+            "status": "success",
+            "inserted_counts": inserted_counts,
+            "similarity_score": report.get("similarity_score", 0)
+        }), 200
+    except Exception as e:
+        logger.exception("Data loading failed")
+        return jsonify({"error": f"Data loading failed: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)

@@ -24,4 +24,6 @@ dependencies = [
     "jupyter>=1.1.1",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "langfuse>=4.2.0",
+    "openinference-instrumentation-langchain>=0.1.62",
 ]

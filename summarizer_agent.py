@@ -3,6 +3,23 @@ import json
 import re
 from typing import List, Dict, Any, TypedDict
 from langgraph.graph import StateGraph, END
+
+# Optional Langfuse imports
+try:
+    from langfuse import observe
+    from langfuse_setup import get_callback_handler
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
+    # dummy decorator
+    def observe(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    # dummy handler
+    def get_callback_handler():
+        return None
+
 from agent import giga, get_model_name
 from gigachat.models import Chat, Messages, MessagesRole
 from db_storage import get_db_connection, update_file_summary
@@ -19,10 +36,6 @@ SYSTEM_PROMPT = f"""
 You are a business analyst and technical writer. Use the skills and tools above.
 """
 
-
-# ------------------------------------------------------------
-# State definition
-# ------------------------------------------------------------
 class SummarizerState(TypedDict):
     file_hash: str
     filename: str
@@ -33,9 +46,8 @@ class SummarizerState(TypedDict):
     final_summary: str
     validation_errors: List[str]
 
-
 # ------------------------------------------------------------
-# Data fetching from database
+# Data fetching (no tracing)
 # ------------------------------------------------------------
 def fetch_file_data(file_hash: str):
     conn = get_db_connection()
@@ -46,8 +58,6 @@ def fetch_file_data(file_hash: str):
         conn.close()
         raise ValueError(f"File hash {file_hash} not found")
     filename = row["filename"]
-
-    # Get sheets and columns
     cursor.execute("""
         SELECT s.sheet_name, s.header_start_row, s.header_rows_count, s.nested_structure,
                c.column_index, c.column_name_flat, c.column_header
@@ -57,7 +67,6 @@ def fetch_file_data(file_hash: str):
         ORDER BY s.sheet_name, c.column_index
     """, (file_hash,))
     rows = cursor.fetchall()
-
     sheets_dict = {}
     for r in rows:
         sheet_name = r["sheet_name"]
@@ -68,8 +77,6 @@ def fetch_file_data(file_hash: str):
                 "sample_rows": []
             }
         sheets_dict[sheet_name]["columns"].append(r["column_name_flat"])
-
-    # Get sample rows (first 5 rows per sheet)
     for sheet_name in sheets_dict:
         cursor.execute("""
             SELECT s.sheet_hash
@@ -93,8 +100,6 @@ def fetch_file_data(file_hash: str):
             {"row_num": r["row_num"], "values": r["row_values"][:500] if r["row_values"] else ""}
             for r in sample_rows
         ]
-
-    # Extract important business values from data
     important_values = set()
     cursor.execute("""
         SELECT DISTINCT d.value
@@ -106,57 +111,44 @@ def fetch_file_data(file_hash: str):
     all_values = cursor.fetchall()
     for val_row in all_values:
         val = str(val_row["value"])
-        if re.search(r'(КЮЛ|ТБО|Сбер|ВТБ|IFRS|МСФО|субсид|продуктовый регистр|процентная ставка|гарантия|обеспечение)',
-                     val, re.IGNORECASE):
+        if re.search(r'(КЮЛ|ТБО|Сбер|ВТБ|IFRS|МСФО|субсид|продуктовый регистр|процентная ставка|гарантия|обеспечение)', val, re.IGNORECASE):
             important_values.add(val[:100])
         if re.search(r'\b[A-Z]{2,5}\b', val):
             important_values.add(val[:100])
-
     conn.close()
     sheets_list = list(sheets_dict.values())
     return filename, sheets_list, list(important_values)[:30]
 
+# ------------------------------------------------------------
+# Traced GigaChat call (generation)
+# ------------------------------------------------------------
+@observe(as_type="generation", capture_input=True, capture_output=True)
+def call_gigachat_for_summary(user_content: str) -> str:
+    """Call GigaChat for summarization with tracing."""
+    if LANGFUSE_AVAILABLE:
+        try:
+            from langfuse import get_current_observation
+            current_obs = get_current_observation()
+            if current_obs:
+                current_obs.update(model=get_model_name())
+        except Exception:
+            pass
+    messages = [
+        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
+        Messages(role=MessagesRole.USER, content=user_content)
+    ]
+    response = giga.chat(Chat(messages=messages))
+    answer = response.choices[0].message.content.strip()
+    return answer
 
 # ------------------------------------------------------------
-# Step 1: Extract schema (entities, history, source/target)
+# LangGraph steps (each decorated with @observe)
 # ------------------------------------------------------------
-SCHEMA_EXTRACTION_PROMPT = """
-Ты – эксперт по анализу данных. Извлеки структурированную информацию из Excel-файла.
-
-Файл: {filename}
-
-Листы и колонки (первые 30 колонок на лист):
-{sheets_columns}
-
-Примеры данных (первые строки):
-{sample_data}
-
-Важные бизнес-термины, найденные в данных:
-{important_values}
-
-Извлеки следующие элементы в формате JSON. Будь максимально конкретным. Используй найденные термины.
-
-Пример вывода:
-{{
-    "business_domain": "корпоративное кредитование юридических лиц (КЮЛ)",
-    "bank_hint": "Сбербанк (предположительно)",
-    "project_codes": ["КЮЛ", "S2T"],
-    "key_entities": ["кредитные договоры", "договоры банковской гарантии", "обеспечение", "контрагенты", "валюты", "процентные ставки", "субсидии", "продуктовые регистры", "МСФО (IFRS 9)"],
-    "history_types": ["Снимок", "Историзм", "Снимок-История 3"],
-    "source_tables": ["список таблиц-источников"],
-    "target_tables": ["список целевых таблиц"],
-    "transformation_patterns": ["SQL-склейка", "справочники", "суррогатные ключи"]
-}}
-
-Теперь извлеки для данного файла. Используй только то, что реально присутствует.
-"""
-
-
+@observe()
 def extract_schema(state: SummarizerState) -> SummarizerState:
     filename = state["filename"]
     sheets = state["raw_sheets"]
     important_vals = state["important_values"]
-
     sheets_columns = []
     sample_data = []
     for sheet in sheets:
@@ -166,25 +158,51 @@ def extract_schema(state: SummarizerState) -> SummarizerState:
             sample_data.append(f"Лист '{sheet['sheet_name']}':")
             for row in sheet["sample_rows"]:
                 sample_data.append(f"  Строка {row['row_num']}: {row['values']}")
+    prompt = """
+Ты – эксперт по анализу данных. Извлеки структурированную информацию из Excel-файла.
 
-    prompt = SCHEMA_EXTRACTION_PROMPT.format(
+Файл: {filename}
+
+Листы и колонки:
+{sheets_columns}
+
+Примеры данных (первые строки):
+{sample_data}
+
+Важные бизнес-термины, найденные в данных:
+{important_values}
+
+Извлеки JSON:
+{{
+    "business_domain": "...",
+    "bank_hint": "...",
+    "project_codes": [],
+    "key_entities": [],
+    "history_types": [],
+    "source_tables": [],
+    "target_tables": [],
+    "transformation_patterns": []
+}}
+"""
+    user_content = prompt.format(
         filename=filename,
         sheets_columns="\n".join(sheets_columns),
         sample_data="\n".join(sample_data[:10]),
         important_values="\n".join(important_vals[:15])
     )
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
-        Messages(role=MessagesRole.USER, content=prompt)
-    ]
+    answer = call_gigachat_for_summary(user_content)
     try:
-        response = giga.chat(Chat(messages=messages))
-        text = response.choices[0].message.content.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0]
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0]
-        schema = json.loads(text)
+        if "```json" in answer:
+            answer = answer.split("```json")[1].split("```")[0]
+        elif "```" in answer:
+            answer = answer.split("```")[1].split("```")[0]
+        schema = json.loads(answer)
+        # Ensure key_entities is a list of strings
+        if "key_entities" in schema:
+            schema["key_entities"] = [
+                (e if isinstance(e, str) else e.get("name") or e.get("entity") or str(e))
+                for e in schema["key_entities"]
+            ]
         state["schema"] = schema
         logger.info(f"Schema extracted: {schema}")
     except Exception as e:
@@ -193,43 +211,24 @@ def extract_schema(state: SummarizerState) -> SummarizerState:
         state["validation_errors"].append(f"Schema error: {e}")
     return state
 
-
-# ------------------------------------------------------------
-# Step 2: Structural summary (pass 1)
-# ------------------------------------------------------------
-STRUCTURAL_PROMPT = """
-Опиши структуру документа (листы и их назначение). 1-2 абзаца на русском.
-
-Листы и колонки:
-{sheets_columns}
-"""
-
-
+@observe()
 def structural_summary(state: SummarizerState) -> SummarizerState:
     sheets = state["raw_sheets"]
     sheets_columns = []
     for sheet in sheets:
         cols = ", ".join(sheet["columns"][:20])
         sheets_columns.append(f"Лист '{sheet['sheet_name']}': {cols}")
-    prompt = STRUCTURAL_PROMPT.format(sheets_columns="\n".join(sheets_columns))
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
-        Messages(role=MessagesRole.USER, content=prompt)
-    ]
-    try:
-        response = giga.chat(Chat(messages=messages))
-        summary = response.choices[0].message.content.strip()
-        state["section_summaries"].append(summary)
-    except Exception as e:
-        logger.error(f"Structural summary failed: {e}")
-        state["section_summaries"].append("Не удалось сгенерировать структурное описание.")
+    prompt = "Опиши структуру документа (листы и их назначение). 1-2 абзаца на русском.\n\nЛисты и колонки:\n{sheets_columns}"
+    user_content = prompt.format(sheets_columns="\n".join(sheets_columns))
+    answer = call_gigachat_for_summary(user_content)
+    state["section_summaries"].append(answer)
     return state
 
-
-# ------------------------------------------------------------
-# Step 3: Domain summary (pass 2)
-# ------------------------------------------------------------
-DOMAIN_PROMPT = """
+@observe()
+def domain_summary(state: SummarizerState) -> SummarizerState:
+    schema = state.get("schema", {})
+    schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
+    prompt = """
 На основе извлечённой схемы:
 {schema}
 
@@ -240,30 +239,15 @@ DOMAIN_PROMPT = """
 - Конкретные продукты (кредиты, гарантии, субсидии, продуктовые регистры)
 Напиши 2 абзаца на русском.
 """
-
-
-def domain_summary(state: SummarizerState) -> SummarizerState:
-    schema = state.get("schema", {})
-    schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
-    prompt = DOMAIN_PROMPT.format(schema=schema_str)
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
-        Messages(role=MessagesRole.USER, content=prompt)
-    ]
-    try:
-        response = giga.chat(Chat(messages=messages))
-        summary = response.choices[0].message.content.strip()
-        state["section_summaries"].append(summary)
-    except Exception as e:
-        logger.error(f"Domain summary failed: {e}")
-        state["section_summaries"].append("Не удалось сгенерировать доменное описание.")
+    user_content = prompt.format(schema=schema_str)
+    answer = call_gigachat_for_summary(user_content)
+    state["section_summaries"].append(answer)
     return state
 
-
-# ------------------------------------------------------------
-# Step 4: Final synthesis (pass 3)
-# ------------------------------------------------------------
-SYNTHESIS_PROMPT = """
+@observe()
+def synthesize(state: SummarizerState) -> SummarizerState:
+    combined = "\n\n".join(state["section_summaries"])
+    prompt = """
 На основе следующих резюме создай **ОДИН связный абзац** (5-7 предложений) на русском языке.
 Абзац должен быть максимально похож на пример ниже по стилю и детализации.
 
@@ -275,34 +259,20 @@ SYNTHESIS_PROMPT = """
 
 Напиши абзац, следуя этому примеру: укажи тип документа (S2T, маппинг, ETL), проект, банк, перечисли конкретные сущности и финансовые показатели.
 """
-
-
-def synthesize(state: SummarizerState) -> SummarizerState:
-    combined = "\n\n".join(state["section_summaries"])
-    prompt = SYNTHESIS_PROMPT.format(section_summaries=combined)
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
-        Messages(role=MessagesRole.USER, content=prompt)
-    ]
-    try:
-        response = giga.chat(Chat(messages=messages))
-        final = response.choices[0].message.content.strip()
-        state["final_summary"] = final
-    except Exception as e:
-        logger.error(f"Synthesis failed: {e}")
-        state["final_summary"] = "Не удалось сформировать итоговое описание."
+    user_content = prompt.format(section_summaries=combined)
+    answer = call_gigachat_for_summary(user_content)
+    state["final_summary"] = answer
     return state
 
-
-# ------------------------------------------------------------
-# Step 5: Validation (grounding)
-# ------------------------------------------------------------
 def normalize_text(text: str) -> str:
+    # Ensure we have a string
+    if not isinstance(text, str):
+        text = str(text)
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
     return ' '.join(text.split())
 
-
+@observe()
 def validate(state: SummarizerState) -> SummarizerState:
     final = state["final_summary"]
     schema = state.get("schema", {})
@@ -311,11 +281,15 @@ def validate(state: SummarizerState) -> SummarizerState:
         normalized_summary = normalize_text(final)
         found = False
         for entity in entities:
-            norm_entity = normalize_text(entity)
+            # Ensure entity is a string
+            if isinstance(entity, dict):
+                entity_str = entity.get("name") or entity.get("entity") or str(entity)
+            else:
+                entity_str = str(entity)
+            norm_entity = normalize_text(entity_str)
             if norm_entity in normalized_summary:
                 found = True
                 break
-            # Check partial word matches
             for word in norm_entity.split():
                 if len(word) > 3 and word in normalized_summary:
                     found = True
@@ -326,13 +300,9 @@ def validate(state: SummarizerState) -> SummarizerState:
             state["validation_errors"].append(f"Summary does not mention any key entity from schema: {entities}")
             logger.warning(state["validation_errors"][-1])
         else:
-            logger.info("Validation passed: summary mentions at least one key entity")
+            logger.info("Validation passed")
     return state
 
-
-# ------------------------------------------------------------
-# Build LangGraph workflow
-# ------------------------------------------------------------
 def build_summarizer_graph():
     builder = StateGraph(SummarizerState)
     builder.add_node("extract_schema", extract_schema)
@@ -348,13 +318,9 @@ def build_summarizer_graph():
     builder.add_edge("validate", END)
     return builder.compile()
 
-
 summarizer_graph = build_summarizer_graph()
 
-
-# ------------------------------------------------------------
-# Public API
-# ------------------------------------------------------------
+@observe()
 def generate_summary(file_hash: str) -> str:
     filename, sheets, important_vals = fetch_file_data(file_hash)
     initial_state: SummarizerState = {
@@ -367,14 +333,17 @@ def generate_summary(file_hash: str) -> str:
         "final_summary": "",
         "validation_errors": []
     }
-    result = summarizer_graph.invoke(initial_state)
+    handler = get_callback_handler()
+    if handler:
+        config = {"callbacks": [handler], "run_name": f"summarize_{file_hash}"}
+        result = summarizer_graph.invoke(initial_state, config=config)
+    else:
+        result = summarizer_graph.invoke(initial_state)
     if result["validation_errors"]:
-        logger.warning(f"Validation issues for {filename}: {result['validation_errors']}")
+        logger.warning(f"Validation issues: {result['validation_errors']}")
     return result["final_summary"]
 
-
 def summarize_file(file_hash: str, save: bool = True) -> str:
-    """Generate and optionally save summary to database."""
     summary = generate_summary(file_hash)
     if save:
         update_file_summary(file_hash, summary)
