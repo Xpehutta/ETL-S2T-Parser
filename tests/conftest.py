@@ -1,8 +1,17 @@
 import sys
 import os
+import tempfile
 
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+# app.py calls init_db() at import time; use an isolated DB so a legacy local
+# excel_data.db does not break test collection.
+import storage.database as db_storage
+
+_pytest_import_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_pytest_import_db.close()
+db_storage.DB_PATH = _pytest_import_db.name
 
 import pytest
 import sqlite3
