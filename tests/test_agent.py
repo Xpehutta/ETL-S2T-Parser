@@ -295,6 +295,55 @@ def test_run_agent_graph_executes_native_tool_call_and_uses_observer():
     )
 
 
+def test_run_agent_graph_enforces_max_steps_in_router():
+    from agents.chat_graph import run_agent_graph
+
+    calls = []
+
+    def ping():
+        calls.append(True)
+        return {"ok": True}
+
+    model = _ScriptedNativeModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ping",
+                        "args": {},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ping",
+                        "args": {},
+                        "id": "call-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Готово без дополнительных инструментов."),
+        ]
+    )
+
+    out = run_agent_graph(
+        "Проверь",
+        "Системный контекст",
+        model,
+        (_as_tool(ping),),
+        max_steps=1,
+    )
+
+    assert out == "Готово без дополнительных инструментов."
+    assert calls == [True]
+
+
 def test_run_agent_graph_can_use_show_plan_as_native_tool():
     from agents.chat_graph import run_agent_graph
     from agents.tools import show_plan

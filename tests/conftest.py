@@ -5,6 +5,11 @@ import tempfile
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Disable Langfuse/OTEL export noise before project modules load dotenv.
+os.environ["LANGFUSE_PUBLIC_KEY"] = ""
+os.environ["LANGFUSE_SECRET_KEY"] = ""
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
 # app.py calls init_db() at import time; use an isolated DB so a legacy local
 # excel_data.db does not break test collection.
 import storage.database as db_storage
@@ -20,6 +25,26 @@ import io
 from flask import Flask
 from app import app as flask_app
 from storage.database import init_db, get_db_connection
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_pytest_import_db():
+    yield
+    try:
+        os.unlink(_pytest_import_db.name)
+    except OSError:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _disable_langfuse_in_tests(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "")
+    from agents import observability
+
+    monkeypatch.setattr(observability, "is_langfuse_configured", lambda: False)
+    monkeypatch.setattr(observability, "get_langfuse_client", lambda: None)
+    monkeypatch.setattr(observability, "get_callback_handler", lambda: None)
 
 
 @pytest.fixture

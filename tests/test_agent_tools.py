@@ -538,15 +538,13 @@ def test_get_file_description_uses_cached_value():
     out = get_file_description.invoke({"file_id": 31})
 
     assert out["description"] == "Cached description"
-    assert out["generated"] is False
+    assert out["description_present"] is True
     assert out["file"]["description"] == "Cached description"
 
 
-@patch("agents.summarizer_agent.ensure_file_description")
-def test_get_file_description_generates_when_missing(mock_ensure):
+def test_get_file_description_reports_missing_without_generation():
     from agents.tools import get_file_description
 
-    mock_ensure.return_value = "Generated description"
     conn = get_db_connection()
     conn.execute(
         """
@@ -560,9 +558,11 @@ def test_get_file_description_generates_when_missing(mock_ensure):
 
     out = get_file_description.invoke({"file_id": 32})
 
-    assert out["description"] == "Generated description"
-    assert out["generated"] is True
-    mock_ensure.assert_called_once_with(32, refresh=False, save=True)
+    assert out["description"] is None
+    assert out["summary"] == "Long summary"
+    assert out["missing_description"] is True
+    assert out["summary_present"] is True
+    assert "явный запрос" in out["hint"]
 
 
 def test_update_file_description_tool(mock_embeddings):

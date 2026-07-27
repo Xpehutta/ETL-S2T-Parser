@@ -510,6 +510,8 @@ Planner решил, что дополнительных инструментов
     def route_after_planner(
         state: AgentGraphState,
     ) -> Literal["prepare_tool", "responder"]:
+        if state["tool_steps"] >= state["max_steps"]:
+            return "responder"
         planner_message = state.get("planner_message")
         if planner_message is not None and planner_message.tool_calls:
             return "prepare_tool"

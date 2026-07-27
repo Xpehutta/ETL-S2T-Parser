@@ -67,43 +67,67 @@ def resolve_file(filename: str) -> Dict[str, Any]:
 
 
 @tool(parse_docstring=True)
-def get_file_description(file_id: int, regenerate: bool = False) -> Dict[str, Any]:
+def get_file_description(file_id: int) -> Dict[str, Any]:
     """
     Получить сохранённое краткое описание конкретного загруженного файла.
 
-    Читает files.description по реальному числовому file_id. Если описание ещё не
-    создано либо явно запрошена регенерация, строит его из сохранённого summary и
-    данных файла и записывает обратно. Логические имена ETL-таблиц не являются
-    идентификаторами файлов.
+    Read-only: читает files.description и files.summary по реальному числовому
+    file_id без LLM-вызовов и без записи в БД. Если описание ещё не создано,
+    сообщи об этом явно; для генерации или обновления используй мутирующие
+    инструменты после явного запроса пользователя. Логические имена ETL-таблиц
+    не являются идентификаторами файлов.
 
     Args:
         file_id: Числовой идентификатор загрузки из UI или resolve_file.
-        regenerate: Принудительно сформировать описание заново и сохранить его.
     """
-    from agents.summarizer_agent import ensure_file_description
     from storage.database import get_db_connection
 
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT file_id, filename, upload_time, description FROM files WHERE file_id = ?",
-        (file_id,),
-    )
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            """
+            SELECT file_id, filename, upload_time, summary, description
+            FROM files
+            WHERE file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
     if not row:
         return {"error": f"File not found: {file_id}", "file_id": file_id}
 
     meta = dict(row)
-    had_cached_description = bool(str(meta.get("description") or "").strip())
-    description = ensure_file_description(file_id, refresh=bool(regenerate), save=True)
-    meta["description"] = description
-    return {
+    description = str(meta.get("description") or "").strip()
+    summary = str(meta.get("summary") or "").strip()
+    meta["description"] = description or None
+    meta["summary"] = summary or None
+
+    result: Dict[str, Any] = {
         "file": meta,
         "file_id": file_id,
-        "description": description,
-        "generated": bool(regenerate) or not had_cached_description,
+        "description": description or None,
+        "summary": summary or None,
+        "description_present": bool(description),
+        "summary_present": bool(summary),
     }
+
+    if not description:
+        result["missing_description"] = True
+        if summary:
+            result["hint"] = (
+                "Краткое описание ещё не сохранено. Для генерации нужен "
+                "явный запрос пользователя на обновление описания."
+            )
+        else:
+            result["hint"] = (
+                "Краткое описание и бизнес-саммари ещё не сохранены. "
+                "Сообщи пользователю, что данные появятся после завершения "
+                "анализа файла или после явного запроса на обновление."
+            )
+
+    return result
 
 @tool(parse_docstring=True)
 def update_file_description(file_id: int, description: str) -> Dict[str, Any]:

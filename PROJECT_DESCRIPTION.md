@@ -108,7 +108,7 @@ Write-tool принимает не готовые строки от LLM, а mapp
 
 ## Chat Agent И Tools
 
-Текущий чатовый путь: Flask `/chat` -> `agent_chat` -> LangGraph (`planner -> validate_tool -> execute_tool`) -> ответ.
+Текущий чатовый путь: Flask `/chat` -> `agent_chat` -> LangGraph (`planner -> prepare_tool -> tools -> observer -> planner/responder`) -> ответ.
 
 Planner возвращает только строгий JSON одного из двух видов: `tool` или `final`.
 Инструменты представлены стандартными LangChain `BaseTool`: Pydantic-схема аргументов
