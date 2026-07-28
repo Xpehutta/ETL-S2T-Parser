@@ -12,6 +12,9 @@ _langfuse_client = None
 
 
 def is_langfuse_configured() -> bool:
+    enabled = (os.getenv("LANGFUSE_ENABLED") or "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return False
     return bool(
         (os.getenv("LANGFUSE_PUBLIC_KEY") or "").strip()
         and (os.getenv("LANGFUSE_SECRET_KEY") or "").strip()

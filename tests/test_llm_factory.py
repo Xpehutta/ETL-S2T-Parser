@@ -3,12 +3,37 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from agents.llm_factory import (
+    DEFAULT_GIGACHAT_MODEL,
+    DEFAULT_LLM_PROVIDER,
     DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     create_chat_model,
     get_chat_model_name,
+    get_llm_provider,
 )
+
+
+def test_default_llm_provider_is_gigachat(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+    assert get_llm_provider() == DEFAULT_LLM_PROVIDER
+    assert DEFAULT_LLM_PROVIDER == "gigachat"
+
+
+def test_gigachat_factory_uses_model_fallback(monkeypatch):
+    from langchain_gigachat import GigaChat
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.delenv("GIGACHAT_MODEL", raising=False)
+    monkeypatch.setenv("MODEL", "GigaChat-Pro")
+
+    model = create_chat_model(timeout=5)
+
+    assert isinstance(model, GigaChat)
+    assert model.model == "GigaChat-Pro"
+    assert get_chat_model_name() == "GigaChat-Pro"
 
 
 def test_openrouter_factory_uses_free_router_by_default(monkeypatch):

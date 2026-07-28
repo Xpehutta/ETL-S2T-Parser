@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from graph_storage import (
     close_neo4j_driver,
     create_neo4j_driver,
+    is_neo4j_configured,
     load_neo4j_settings,
 )
 from storage.database import get_db_connection
@@ -181,8 +182,14 @@ def _clear_graph_projection(tx) -> int:
     return int(summary.counters.nodes_deleted)
 
 
-def clear_graph_projection() -> Dict[str, int]:
+def clear_graph_projection() -> Dict[str, Any]:
     """Delete the complete application-owned Neo4j projection."""
+    if not is_neo4j_configured():
+        return {
+            "nodes": 0,
+            "skipped": True,
+            "reason": "Neo4j не настроен",
+        }
     settings = load_neo4j_settings()
     driver = create_neo4j_driver(settings)
     try:

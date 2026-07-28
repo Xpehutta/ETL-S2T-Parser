@@ -214,6 +214,43 @@ def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db)
     ).fetchall() == []
 
 
+def test_init_db_legacy_pre_refactor_schema_includes_recovery_hint(temp_db):
+    cursor = temp_db.cursor()
+    cursor.execute("DROP TABLE IF EXISTS files")
+    cursor.execute(
+        """
+        CREATE TABLE files (
+            file_hash TEXT PRIMARY KEY,
+            filename TEXT,
+            model_used TEXT,
+            upload_time TEXT,
+            summary TEXT,
+            result_json TEXT
+        )
+        """
+    )
+    cursor.execute("DROP TABLE IF EXISTS data")
+    cursor.execute(
+        """
+        CREATE TABLE data (
+            id INTEGER PRIMARY KEY,
+            sheet_hash TEXT,
+            row_num INTEGER,
+            column_hash TEXT,
+            value TEXT
+        )
+        """
+    )
+    temp_db.commit()
+
+    with pytest.raises(DatabaseSchemaError, match="legacy-схема") as exc_info:
+        init_db()
+
+    message = str(exc_info.value)
+    assert "files.file_hash" in message
+    assert ".legacy.bak" in message
+
+
 def test_init_db_rejects_legacy_s2t_column_names_without_mutating_data(temp_db):
     cursor = temp_db.cursor()
     cursor.execute(

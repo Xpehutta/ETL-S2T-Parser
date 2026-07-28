@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 
-from agents.llm_factory import create_chat_model, get_llm_provider
+from agents.llm_factory import create_chat_model
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from config.column_mapping import (
     add_field_aliases,
@@ -374,8 +374,6 @@ def write_s2t_transformations_from_plan(
 
 def _invoke_llm_plain_text(prompt: str) -> str:
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
-    if get_llm_provider() not in {"openrouter", "ollama"}:
-        raise RuntimeError("Useful-column extraction requires openrouter or ollama")
     return (create_chat_model() | StrOutputParser()).invoke(prompt)
 
 

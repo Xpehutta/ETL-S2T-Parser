@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def test_load_neo4j_settings_reads_explicit_environment(monkeypatch):
     from graph_storage.config import load_neo4j_settings
@@ -15,6 +17,34 @@ def test_load_neo4j_settings_reads_explicit_environment(monkeypatch):
     assert settings.username == "neo4j-user"
     assert settings.password == "secret"
     assert settings.database == "etl"
+
+
+def test_is_neo4j_configured_accepts_legacy_neo4j_user(monkeypatch):
+    from graph_storage.config import is_neo4j_configured
+
+    monkeypatch.setenv("NEO4J_URI", "bolt://localhost:7687")
+    monkeypatch.delenv("NEO4J_USERNAME", raising=False)
+    monkeypatch.setenv("NEO4J_USER", "neo4j")
+    monkeypatch.setenv("NEO4J_PASSWORD", "secret")
+    monkeypatch.delenv("NEO4J_DATABASE", raising=False)
+
+    assert is_neo4j_configured() is True
+
+
+def test_load_neo4j_settings_raises_when_env_missing(monkeypatch):
+    from graph_storage.config import Neo4jConfigurationError, load_neo4j_settings
+
+    for key in (
+        "NEO4J_URI",
+        "NEO4J_USERNAME",
+        "NEO4J_USER",
+        "NEO4J_PASSWORD",
+        "NEO4J_DATABASE",
+    ):
+        monkeypatch.setenv(key, "")
+
+    with pytest.raises(Neo4jConfigurationError, match="Neo4j не настроен"):
+        load_neo4j_settings()
 
 
 def test_create_neo4j_driver_only_builds_driver():

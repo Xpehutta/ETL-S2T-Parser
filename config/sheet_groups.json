@@ -2,12 +2,14 @@
   "change_log": [
     "Список изменений",
     "История изменений документа",
-    "change_log"
+    "change_log",
+    "Перечень изменений"
   ],
   "s2t": [
     "SourceToTarget",
     "S2T",
-    "s2t"
+    "s2t",
+    "S2T таблицы"
   ],
   "source_tables": [
     "Source tables",

@@ -11,6 +11,9 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
+DEFAULT_LLM_PROVIDER = "gigachat"
+SUPPORTED_LLM_PROVIDERS = ("gigachat", "openrouter", "ollama")
+
 DEFAULT_GIGACHAT_BASE_URL = "https://gigachat.devices.sberbank.ru/api/v1"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -62,7 +65,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def get_llm_provider() -> str:
-    return os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+    return os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
 
 
 def get_chat_model_name() -> str:
@@ -78,7 +81,7 @@ def get_chat_model_name() -> str:
         )
     raise ValueError(
         f"Unsupported LLM_PROVIDER={provider!r}. "
-        "Use 'gigachat', 'openrouter', or 'ollama'."
+        f"Use {', '.join(repr(item) for item in SUPPORTED_LLM_PROVIDERS)}."
     )
 
 
@@ -175,5 +178,5 @@ def create_chat_model(timeout: Optional[float] = None) -> BaseChatModel:
         return _create_ollama_chat_model(timeout)
     raise ValueError(
         f"Unsupported LLM_PROVIDER={provider!r}. "
-        "Use 'gigachat', 'openrouter', or 'ollama'."
+        f"Use {', '.join(repr(item) for item in SUPPORTED_LLM_PROVIDERS)}."
     )

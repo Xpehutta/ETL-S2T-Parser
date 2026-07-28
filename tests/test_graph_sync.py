@@ -259,6 +259,9 @@ def test_clear_graph_projection_deletes_all_application_nodes():
     session.execute_write.side_effect = lambda operation: operation(tx)
 
     with patch(
+        "services.graph_sync.is_neo4j_configured",
+        return_value=True,
+    ), patch(
         "services.graph_sync.load_neo4j_settings",
         return_value=settings,
     ), patch(

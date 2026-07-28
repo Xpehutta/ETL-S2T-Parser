@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from agents.agent import get_model_name
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from agents.summarizer_agent import ensure_file_description, summarize_file
+from graph_storage import is_neo4j_configured
 from processing.excel import convert_to_serializable
 from services.graph_sync import sync_file_graph
 from sheet_skills.s2t import S2TExtractionError, run_s2t_extraction_subagent
@@ -75,6 +76,14 @@ def try_refresh_s2t_transformations(
 def try_sync_file_graph(
     file_id: int,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not is_neo4j_configured():
+        message = (
+            "Neo4j не настроен: добавьте NEO4J_URI, NEO4J_USERNAME, "
+            "NEO4J_PASSWORD и NEO4J_DATABASE в .env. "
+            "SQLite-анализ сохранён; lineage в Neo4j пропущен."
+        )
+        logger.warning("Neo4j synchronization skipped for file_id=%s", file_id)
+        return None, message
     try:
         return sync_file_graph(file_id), None
     except Exception as exc:

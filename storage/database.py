@@ -264,6 +264,26 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
     )
 
 
+def _legacy_schema_recovery_hint(cursor: sqlite3.Cursor) -> str:
+    """Return actionable recovery text when a pre-refactor SQLite file is detected."""
+    files_cols = _table_columns(cursor, "files")
+    data_cols = _table_columns(cursor, "data")
+    legacy_markers: List[str] = []
+    if "file_hash" in files_cols and "file_id" not in files_cols:
+        legacy_markers.append("files.file_hash")
+    if "sheet_hash" in data_cols or "column_hash" in data_cols:
+        legacy_markers.append("data.sheet_hash/column_hash")
+    if not legacy_markers:
+        return ""
+    backup_name = f"{DB_PATH}.legacy.bak"
+    return (
+        f"Обнаружена legacy-схема ({', '.join(legacy_markers)}) "
+        "от прежней версии приложения. Автоматическая миграция недоступна. "
+        f"Сохраните копию: mv {DB_PATH} {backup_name}, "
+        "затем перезапустите приложение — база будет создана заново."
+    )
+
+
 def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
     mismatches: List[str] = []
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
@@ -327,11 +347,15 @@ def init_db() -> None:
         if existing_core_tables:
             mismatches = _schema_mismatches(cursor)
             if mismatches:
+                legacy_hint = _legacy_schema_recovery_hint(cursor)
+                suffix = f" {legacy_hint}" if legacy_hint else (
+                    ". Автоматическая миграция отключена; выполните явную "
+                    "миграцию или используйте новую базу данных."
+                )
                 raise DatabaseSchemaError(
                     f"Несовместимая схема SQLite ({DB_PATH}): "
                     + "; ".join(mismatches)
-                    + ". Автоматическая миграция отключена; выполните явную "
-                    "миграцию или используйте новую базу данных."
+                    + suffix
                 )
         else:
             _create_current_tables(cursor)

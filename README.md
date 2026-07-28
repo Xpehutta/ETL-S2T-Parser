@@ -165,7 +165,25 @@ uv run python app.py
 
 ## Настройка LLM
 
-Выберите один provider через `LLM_PROVIDER`.
+По умолчанию приложение использует **GigaChat** (`LLM_PROVIDER=gigachat`). Для другого backend задайте `LLM_PROVIDER`.
+
+### GigaChat (по умолчанию)
+
+```ini
+LLM_PROVIDER=gigachat
+GIGACHAT_API_KEY=your_key
+GIGACHAT_MODEL=GigaChat
+GIGACHAT_API_URL=https://gigachat.devices.sberbank.ru/api/v1
+GIGACHAT_SCOPE=GIGACHAT_API_PERS
+GIGACHAT_VERIFY_SSL=false
+GIGACHAT_TIMEOUT=120
+
+GIGACHAT_HEADER_TIMEOUT=20
+GIGACHAT_HEADER_RETRY_ATTEMPTS=1
+GIGACHAT_HEADER_PREVIEW_ROWS=4
+```
+
+Вместо `GIGACHAT_API_KEY` также поддерживаются `GIGACHAT_CREDENTIALS` и `GIGACHAT_EMBEDDINGS_CREDENTIALS`. Переменная `MODEL` используется как fallback для `GIGACHAT_MODEL`.
 
 ### Ollama
 
@@ -195,24 +213,6 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_TIMEOUT=120
 OPENROUTER_TEMPERATURE=0
 ```
-
-### GigaChat
-
-```ini
-LLM_PROVIDER=gigachat
-GIGACHAT_API_KEY=your_key
-GIGACHAT_MODEL=GigaChat
-GIGACHAT_API_URL=https://gigachat.devices.sberbank.ru/api/v1
-GIGACHAT_SCOPE=GIGACHAT_API_PERS
-GIGACHAT_VERIFY_SSL=false
-GIGACHAT_TIMEOUT=120
-
-GIGACHAT_HEADER_TIMEOUT=20
-GIGACHAT_HEADER_RETRY_ATTEMPTS=1
-GIGACHAT_HEADER_PREVIEW_ROWS=4
-```
-
-Вместо `GIGACHAT_API_KEY` также поддерживаются `GIGACHAT_CREDENTIALS` и `GIGACHAT_EMBEDDINGS_CREDENTIALS`.
 
 ## Настройка эмбеддингов
 

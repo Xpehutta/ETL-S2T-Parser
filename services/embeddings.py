@@ -8,14 +8,20 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
-MODEL_NAME = os.environ["EMBEDDING_MODEL"]
+
+DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+
+
+def embedding_model_name() -> str:
+    """Return configured Sentence Transformers model or the project default."""
+    return (os.getenv("EMBEDDING_MODEL") or "").strip() or DEFAULT_EMBEDDING_MODEL
 
 
 @lru_cache(maxsize=1)
 def _get_model():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(MODEL_NAME)
+    return SentenceTransformer(embedding_model_name())
 
 
 def embed_descriptions(texts: Sequence[str]) -> list[bytes]:
