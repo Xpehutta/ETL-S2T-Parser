@@ -85,3 +85,10 @@ ETL S2T Parser - приложение для разбора Excel-файлов �
 - `data` — публичная таблица для анализа и добора значений: `id`, `file_id`, `table_name`, `row_num`, `column_id`, `value`.
 - `table_name` в `data` хранит имя листа/таблицы Excel, чтобы анализировать значения без лишнего join.
 - Для обычных вопросов пользователя про таблицы, DDL или схему показывай `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `additional_objects`, `pxf_to_a`, `s2t_transformations` и `data`.
+
+## Cursor Cloud specific instructions
+
+- `app.py` создаёт LLM-модель на импорте (`agents/agent.py`), поэтому и запуск приложения, и `pytest` требуют наличия LLM-креденшелов в окружении. Конструктор модели не проверяет доступность сети — достаточно любого значения. Чтобы прогнать тесты без внешнего провайдера, задай фиктивный `GIGACHAT_API_KEY` (например `GIGACHAT_API_KEY=dummy uv run pytest tests/ -q`) или выставь `LLM_PROVIDER=ollama` (провайдеру ollama креденшелы не нужны).
+- Cloud-окружение самодостаточно: локальный Ollama с моделью `qwen2.5:7b` (native tool calling) поднимается на `http://127.0.0.1:11434`, а `LLM_PROVIDER` по умолчанию `ollama` через `.env`. Реальные секреты (`GIGACHAT_API_KEY`, `OPENROUTER_API_KEY`, `LLM_PROVIDER=...`) переопределяют `.env`, потому что `python-dotenv` не перезаписывает уже заданные переменные окружения — задавай их через Secrets, чтобы переключить провайдера.
+- Flask-приложение слушает `http://127.0.0.1:5000` (основной UI) и `http://127.0.0.1:5000/chat_app` (чат). На CPU локальная LLM медленная: полный `/upload` одного файла из `samples/` занимает несколько минут, а один запрос к chat-агенту — тоже минуты. Детерминированный разбор Excel → SQLite и read-only эндпоинты (`/summary`, `/transformations`) отрабатывают мгновенно.
+- Эмбеддинги (`intfloat/multilingual-e5-small`) и модель Ollama предварительно скачаны в образ окружения, поэтому первый вызов summary/описаний не ждёт загрузку из сети.
