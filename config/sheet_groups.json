@@ -44,6 +44,12 @@
     "K-tables",
     "k_tables"
   ],
+  "pxf_to_a": [
+    "PXF to A",
+    "PXF -> A",
+    "pxf2a",
+    "hadoop ->A"
+  ],
   "additional_objects": [
     "Additional objects",
     "Additional_Objects",
@@ -51,10 +57,6 @@
   ],
   "glossary": [
     "Глоссарий"
-  ],
-  "json_mapping": [
-    "json кап802->hadoop кап818",
-    "Метаданные для hadoop"
   ],
   "faq": [
     "FAQ"
@@ -66,29 +68,7 @@
   "dictionaries": [
     "Dictionaries"
   ],
-  "const": [
-    "Const"
-  ],
-  "integrity": [
-    "Integrity"
-  ],
-  "env": [
-    "Env"
-  ],
   "templates": [
     "templates"
-  ],
-  "sheet1": [
-    "Sheet1",
-    "Лист1"
-  ],
-  "s305_0999_enums": [
-    "s305_0999_enums"
-  ],
-  "master_inst_load": [
-    "master_inst_load"
-  ],
-  "fake_desc": [
-    "FakeDesc"
   ]
 }

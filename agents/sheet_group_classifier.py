@@ -26,7 +26,8 @@ def invoke_llm_plain_text(prompt: str) -> str:
 
 
 def _sheet_group_prompt(payload: Dict[str, str]) -> str:
-    return f"""Сопоставь имя одного листа Excel с наиболее близким существующим алиасом в схеме.
+    return f"""Определи, является ли имя одного листа Excel вариантом существующего алиаса в схеме.
+Это задача разрешения алиасов по имени, а не семантическая классификация назначения или содержимого листа.
 Используй только переданные алиасы и верни только JSON.
 
 Кандидатные алиасы:
@@ -36,10 +37,14 @@ def _sheet_group_prompt(payload: Dict[str, str]) -> str:
 {payload["sheet_json"]}
 
 Правила:
-- Выбирай алиас только для опечатки, варианта написания, перевода или очень близкого синонима.
+- Имя листа — главный критерий. Непустой результат допустим только тогда, когда имя листа и существующий алиас обозначают один и тот же тип объекта с теми же направлением, уровнем, областью и назначением.
+- Допустимые различия: регистр, разделители, пробелы, опечатка, перестановка слов без изменения смысла, общепринятое сокращение, транслитерация, перевод или грамматическая форма.
+- Колонки можно использовать только как дополнительную проверку уже установленной эквивалентности имён. Сходство колонок, структуры, данных или бизнес-смысла само по себе никогда не является основанием для выбора группы.
+- Если имя содержит отличительные слова, меняющие тип объекта, направление, уровень, область или назначение относительно алиаса, верни null.
+- Не сопоставляй разные виды таблиц, маппингов или метаданных только потому, что они относятся к одному процессу или содержат похожие поля.
 - Не придумывай алиасы и группы.
-- Колонки — только слабый контекст при неоднозначном имени.
-- Если близкого алиаса нет, верни null.
+- Если эквивалентность имён неоднозначна, требует догадки по содержимому или уверенность ниже high, верни group=null и matched_alias=null.
+- Перед непустым ответом проверь: можно ли заменить имя листа на matched_alias без изменения смысла, типа объекта, направления и уровня. Если нельзя — верни null.
 
 Формат:
 {{
@@ -113,8 +118,6 @@ def _result(
         "method": method,
         "reason": reason,
     }
-    if sheet.get("sheet_id") is not None:
-        result["sheet_id"] = sheet["sheet_id"]
     return result
 
 
@@ -399,7 +402,6 @@ class SheetGroupResolverSubagent:
                 ):
                     added.extend(
                         {
-                            "sheet_id": result.get("sheet_id"),
                             "sheet_name": result["sheet_name"],
                             "group": result["group"],
                             "alias": alias,
@@ -453,7 +455,7 @@ def load_file_sheets_for_grouping(file_id: int) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT sheet_id, sheet_name
+            SELECT sheet_name
             FROM file_sheet_headers
             WHERE file_id = ? AND IFNULL(skipped, 0) = 0
             ORDER BY sheet_name
@@ -464,11 +466,10 @@ def load_file_sheets_for_grouping(file_id: int) -> List[Dict[str, Any]]:
         conn.close()
     return [
         {
-            "sheet_id": row["sheet_id"],
             "sheet_name": row["sheet_name"],
             "columns": [
                 column["column_name_flat"]
-                for column in get_columns_by_sheet(row["sheet_id"])
+                for column in get_columns_by_sheet(file_id, row["sheet_name"])
                 if column.get("column_name_flat")
             ],
         }

@@ -87,28 +87,3 @@ def add_field_aliases(sheet_group: str, field_name: str, aliases: Iterable[Any],
             f.write("\n")
         clear_column_mapping_cache()
     return added
-
-
-def get_all_aliases(sheet_group: str, path: Optional[str] = None) -> List[str]:
-    out: List[str] = []
-    for aliases in get_sheet_column_mapping(sheet_group, path).values():
-        if isinstance(aliases, str):
-            out.append(aliases)
-        elif isinstance(aliases, list):
-            out.extend(str(alias) for alias in aliases if alias is not None and str(alias).strip())
-    return out
-
-
-def header_matches_alias(header: Iterable[Any], flat_name: str, aliases: Iterable[str]) -> bool:
-    alias_set = {
-        normalize_column_alias(alias)
-        for alias in aliases
-        if normalize_column_alias(alias)
-    }
-    if not alias_set:
-        return False
-
-    header_parts = list(header or [])
-    candidates = [flat_name, " ".join(str(part) for part in header_parts)]
-    candidates.extend(header_parts)
-    return any(normalize_column_alias(candidate) in alias_set for candidate in candidates)

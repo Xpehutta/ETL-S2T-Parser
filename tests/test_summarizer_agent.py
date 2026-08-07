@@ -73,11 +73,10 @@ def test_build_summary_payload_uses_semantic_catalog():
     assert "S2T-строки" in SUMMARY_OUTPUT_REQUIREMENTS
 
 
-def test_fetch_file_data_extracts_descriptions_from_sheets(temp_db, sample_excel_bytes):
+def test_fetch_file_data_extracts_descriptions_from_sheets(temp_db):
     from storage.database import store_excel_data
 
     file_id = store_excel_data(
-        sample_excel_bytes,
         "summary.xlsx",
         "model",
         [
@@ -157,11 +156,10 @@ def test_fetch_file_data_extracts_descriptions_from_sheets(temp_db, sample_excel
     ]
 
 
-def test_fetch_file_data_includes_skipped_sheet_when_rows_exist(temp_db, sample_excel_bytes):
+def test_fetch_file_data_includes_skipped_sheet_when_rows_exist(temp_db):
     from storage.database import store_excel_data
 
     file_id = store_excel_data(
-        sample_excel_bytes,
         "summary.xlsx",
         "model",
         [

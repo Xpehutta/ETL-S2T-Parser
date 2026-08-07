@@ -209,6 +209,28 @@
             overflow-x: auto;
             white-space: pre;
         }
+        .sql-lineage-visualization {
+            width: min(1180px, 88vw);
+            margin-top: 10px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            overflow: hidden;
+            background: #fff;
+            white-space: normal;
+        }
+        .sql-lineage-visualization-header {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--line);
+            background: #eef4fb;
+            font-size: 0.86rem;
+        }
+        .sql-lineage-visualization iframe {
+            display: block;
+            width: 100%;
+            height: 560px;
+            border: 0;
+            background: #fff;
+        }
         .composer {
             background: var(--panel);
             border-top: 1px solid var(--line);
@@ -311,7 +333,6 @@
             <div class="status-label mt-3">S2T transformations</div>
             <div id="currentTransformations" class="status-value text-muted">-</div>
             <div class="d-grid gap-2 mt-3">
-                <button id="rebuildTransformationsBtn" class="btn btn-outline-secondary btn-sm" type="button">Пересобрать трансформации</button>
                 <button id="clearAllDataBtn" class="btn btn-outline-danger btn-sm" type="button">Очистить все данные</button>
             </div>
         </div>
@@ -375,7 +396,6 @@
     const currentFileNameEl = document.getElementById('currentFileName');
     const currentFileIdEl = document.getElementById('currentFileId');
     const currentTransformationsEl = document.getElementById('currentTransformations');
-    const rebuildTransformationsBtn = document.getElementById('rebuildTransformationsBtn');
     const clearAllDataBtn = document.getElementById('clearAllDataBtn');
     const quickActionButtons = document.querySelectorAll('[data-prompt]');
     const analysisProgress = document.getElementById('analysisProgress');
@@ -394,7 +414,6 @@
         fileInput.disabled = value;
         includeHiddenRows.disabled = value;
         uploadSubmitBtn.disabled = value;
-        rebuildTransformationsBtn.disabled = value || !currentFileId;
         clearAllDataBtn.disabled = value;
         quickActionButtons.forEach((button) => {
             button.disabled = value;
@@ -417,7 +436,6 @@
         currentFileNameEl.textContent = currentFileName || 'Файл не загружен';
         currentFileIdEl.textContent = currentFileId || '-';
         currentTransformationsEl.textContent = currentFileId ? `${currentTransformationsCount} строк` : '-';
-        rebuildTransformationsBtn.disabled = busy || !currentFileId;
         clearAllDataBtn.disabled = busy;
     }
 
@@ -491,7 +509,6 @@
 
     sendBtn.addEventListener('click', sendChat);
     clearChatHistoryBtn.addEventListener('click', clearChatHistory);
-    rebuildTransformationsBtn.addEventListener('click', rebuildTransformations);
     clearAllDataBtn.addEventListener('click', clearAllData);
     chatInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
@@ -616,24 +633,6 @@
         addMessage('system', 'История очищена. Новые сообщения сохраняются только в этой вкладке браузера.');
     }
 
-    async function rebuildTransformations() {
-        if (!currentFileId || busy) return;
-        setBusy(true, 'Пересобираю таблицу трансформаций...');
-        try {
-            const response = await fetch(`/transformations/${encodeURIComponent(currentFileId)}/refresh`, { method: 'POST' });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to rebuild transformations');
-            currentTransformationsCount = Number(data.count || 0);
-            currentTransformationsEl.textContent = `${currentTransformationsCount} строк`;
-            const s2tError = data.s2t_transformations_error ? `\nОшибка S2T extraction: ${data.s2t_transformations_error}` : '';
-            addMessage('agent', `Таблица s2t_transformations пересобрана: ${currentTransformationsCount} строк.${s2tError}\nМожно спросить: "Покажи таблицу трансформаций".`);
-        } catch (error) {
-            addMessage('agent', `Ошибка пересборки: ${error.message}`);
-        } finally {
-            setBusy(false);
-        }
-    }
-
     async function clearAllData() {
         if (busy) return;
         if (!window.confirm(
@@ -666,7 +665,7 @@
         const node = document.createElement('div');
         node.className = `message message-${role}`;
         node.innerHTML = renderMessage(text || '');
-        if (node.querySelector('.table-responsive')) {
+        if (node.querySelector('.table-responsive, .sql-lineage-visualization')) {
             node.classList.add('message-wide');
         }
         messages.appendChild(node);
@@ -792,12 +791,34 @@
     function renderMessage(text) {
         const blocks = String(text).split(/(```[\s\S]*?```)/g);
         return blocks.map((block) => {
+            if (block.startsWith('```table')) {
+                return renderCompactTableBlock(block);
+            }
             if (block.startsWith('```')) {
                 const inner = block.replace(/^```[a-zA-Z0-9_-]*\n?/, '').replace(/```$/, '');
                 return `<pre><code>${escapeHtml(inner)}</code></pre>`;
             }
             return renderMarkdownTables(block);
         }).join('');
+    }
+
+    function renderCompactTableBlock(block) {
+        const inner = block
+            .replace(/^```table\s*\n?/, '')
+            .replace(/```$/, '')
+            .trim();
+        try {
+            const matrix = JSON.parse(inner);
+            if (!Array.isArray(matrix) || matrix.length === 0) throw new Error('empty table');
+            if (!matrix.every((row) => Array.isArray(row))) throw new Error('rows must be arrays');
+            const width = matrix[0].length;
+            if (width === 0 || !matrix.every((row) => row.length === width)) {
+                throw new Error('table rows must have equal width');
+            }
+            return tableHtml(matrix[0], matrix.slice(1));
+        } catch (error) {
+            return `<pre><code>${escapeHtml(inner)}</code></pre>`;
+        }
     }
 
     function renderMarkdownTables(text) {
@@ -839,6 +860,14 @@
 
     function renderInline(text) {
         let html = escapeHtml(text);
+        html = html.replace(
+            /\[([^\]]+)\]\((\/exports\/(?:sql-lineage|s2t-graphs)\/[A-Za-z0-9_.%-]+\.html)\)/g,
+            '<div class="sql-lineage-visualization"><div class="sql-lineage-visualization-header"><a href="$2" target="_blank" rel="noopener">$1 ↗</a></div><iframe src="$2" title="Интерактивный граф связей" loading="lazy" sandbox="allow-scripts"></iframe></div>'
+        );
+        html = html.replace(
+            /\[([^\]]+)\]\((\/exports\/s2t-graphs\/[A-Za-z0-9_.%-]+\.json)\)/g,
+            '<a href="$2" target="_blank" rel="noopener">$1</a>'
+        );
         html = html.replace(
             /\[([^\]]+)\]\((\/exports\/sql\/[A-Za-z0-9_.%-]+\.csv)\)/g,
             '<a href="$2" target="_blank" rel="noopener">$1</a>'

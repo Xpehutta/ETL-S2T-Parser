@@ -1,6 +1,6 @@
 """Runtime prompt and SQLite schema context for the chat agent."""
 
-from typing import Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from .common import PROJECT_ROOT
 
@@ -25,11 +25,9 @@ def get_sqlite_schema_cheatsheet() -> str:
     """Собрать блок схемы SQLite для prompt-ов агентов из storage/database.py."""
     from storage.database import (
         INTERNAL_TABLES,
-        LEGACY_TABLES,
-        REMOVED_WORKBOOK_TABLES,
         STORAGE_SCHEMA_COLUMNS,
         STORAGE_SCHEMA_TABLE_ORDER,
-        S2T_FIELDS,
+        S2T_RECORD_FIELDS,
         USER_FACING_TABLES,
     )
 
@@ -50,10 +48,7 @@ def get_sqlite_schema_cheatsheet() -> str:
         if INTERNAL_TABLES
         else ""
     )
-    removed_tables = ", ".join(
-        f"`{name}`" for name in (LEGACY_TABLES + REMOVED_WORKBOOK_TABLES)
-    )
-    s2t_display_columns = _format_backtick_list(("row_num", *S2T_FIELDS))
+    s2t_display_columns = _format_backtick_list(("row_num", *S2T_RECORD_FIELDS))
     return (
         "\n\n---\n\n"
         "## Актуальная схема SQLite\n\n"
@@ -68,13 +63,44 @@ def get_sqlite_schema_cheatsheet() -> str:
         + internal_guidance
         + f"- Для `s2t_transformations` по умолчанию показывай только {s2t_display_columns}, если пользователь явно не просит сырой DDL.\n"
         "- Не перечисляй `sqlite_master` и служебные таблицы, если пользователь прямо не спрашивает про внутреннюю реализацию БД.\n"
-        f"- Устаревшие catalog/lineage-таблицы удалены: {removed_tables}.\n"
     )
 
 
-def load_skills() -> str:
-    """Загрузить runtime skills из каталога prompts."""
-    return _prompt_text("skills.md")
+def load_skills(sections: Optional[Iterable[str]] = None) -> str:
+    """Загрузить все либо только выбранные разделы runtime skills."""
+    text = _prompt_text("skills.md")
+    if sections is None or not text:
+        return text
+
+    requested = {section.strip().casefold() for section in sections}
+    lines = text.splitlines()
+    preamble: List[str] = []
+    blocks: List[Tuple[str, List[str]]] = []
+    current_name: Optional[str] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        if line.startswith("## "):
+            if current_name is not None:
+                blocks.append((current_name, current_lines))
+            current_name = line[3:].strip()
+            current_lines = [line]
+        elif current_name is None:
+            preamble.append(line)
+        else:
+            current_lines.append(line)
+
+    if current_name is not None:
+        blocks.append((current_name, current_lines))
+
+    selected_lines = list(preamble)
+    for name, block_lines in blocks:
+        if name.casefold() in requested:
+            if selected_lines and selected_lines[-1] != "":
+                selected_lines.append("")
+            selected_lines.extend(block_lines)
+
+    return "\n".join(selected_lines).strip()
 
 
 def load_chat_agent_context() -> str:

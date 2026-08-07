@@ -13,10 +13,13 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.utils.json import parse_json_markdown
 
 from .chat_graph import run_agent_graph
+from .header_classifier import predict_header_row
 from .llm_factory import create_chat_model, get_chat_model_name
+from .tools.routing import select_chat_route as _select_chat_route
 from .tools import (
     get_sqlite_schema_cheatsheet,
     get_tools,
+    get_tools_for_names,
     load_chat_agent_context,
     load_skills,
 )
@@ -90,7 +93,6 @@ header_chat_model_with_retry = header_chat_model.with_retry(
 )
 
 
-SKILLS = load_skills()
 CHAT_AGENT_CONTEXT = load_chat_agent_context()
 SQLITE_SCHEMA_CONTEXT = get_sqlite_schema_cheatsheet()
 
@@ -135,51 +137,6 @@ ANALYSIS_PROMPT = """
 Предпросмотр:
 {preview_json}
 """.strip()
-
-
-def is_long_text(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and (len(value) > 100 or "\n" in value)
-    )
-
-
-def looks_like_data(value: Any) -> bool:
-    if value is None:
-        return False
-
-    if isinstance(value, (int, float)):
-        return True
-
-    if not isinstance(value, str):
-        return False
-
-    text = value.strip()
-
-    if not text:
-        return False
-
-    if text.isdigit():
-        return True
-
-    upper_text = text.upper()
-
-    if any(
-        keyword in upper_text
-        for keyword in ("SELECT", "FROM", "WHERE", "JOIN")
-    ):
-        return True
-
-    if len(text) > 50:
-        return True
-
-    return bool(
-        re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*",
-            text,
-        )
-        and not text.isalpha()
-    )
 
 
 def _header_completion_messages(
@@ -255,35 +212,6 @@ def _parse_header_response(answer: str) -> Dict[str, Any]:
     return result
 
 
-def _fallback_header_decision(
-    preview_rows: List[List[Any]],
-) -> Tuple[int, int, bool]:
-    if len(preview_rows) >= 2:
-        first_row_has_short_values = any(
-            value is not None and not is_long_text(value)
-            for value in preview_rows[0]
-        )
-
-        second_row_has_short_values = any(
-            value is not None and not is_long_text(value)
-            for value in preview_rows[1]
-        )
-
-        second_row_looks_like_header = not any(
-            looks_like_data(value)
-            for value in preview_rows[1]
-        )
-
-        if (
-            first_row_has_short_values
-            and second_row_has_short_values
-            and second_row_looks_like_header
-        ):
-            return 0, 2, True
-
-    return 0, 1, False
-
-
 @observe()
 def get_header_decision(
     sheet_name: str,
@@ -294,6 +222,20 @@ def get_header_decision(
     """
     preview_limit = max(1, HEADER_PREVIEW_ROWS)
     limited_preview = preview_rows[:preview_limit]
+
+    try:
+        start_row = predict_header_row(preview_rows)
+        logger.info(
+            "CatBoost header decision for %r: start_row=%s",
+            sheet_name,
+            start_row,
+        )
+        return start_row, 1, False
+    except Exception:
+        logger.exception(
+            "CatBoost header analysis failed for %r; using LLM",
+            sheet_name,
+        )
 
     preview_json = json.dumps(
         limited_preview,
@@ -312,97 +254,22 @@ def get_header_decision(
             SYSTEM_PROMPT,
             user_prompt,
         )
-
         result = _parse_header_response(answer)
-
-        start_row = max(
-            0,
-            int(result.get("header_start_row", 0)),
-        )
-
-        header_rows = max(
-            1,
-            min(
-                int(result.get("header_rows", 1)),
-                5,
-            ),
-        )
-
-        nested = bool(
-            result.get(
-                "nested",
-                header_rows >= 2,
-            )
-        )
-
-        logger.info(
-            "Header decision for %r: "
-            "start_row=%s, header_rows=%s, nested=%s",
-            sheet_name,
-            start_row,
-            header_rows,
-            nested,
-        )
-
-        if header_rows == 2 and len(preview_rows) >= 2:
-            second_row = [
-                value
-                for value in preview_rows[1]
-                if value is not None
-            ]
-
-            if second_row:
-                data_ratio = sum(
-                    1
-                    for value in second_row
-                    if looks_like_data(value)
-                ) / len(second_row)
-
-                if data_ratio > 0.3:
-                    header_rows = 1
-                    nested = False
-
-        if (
-            header_rows == 1
-            and start_row == 0
-            and len(preview_rows) >= 2
-        ):
-            first_row_has_short_values = any(
-                value is not None
-                and not is_long_text(value)
-                for value in preview_rows[0]
-            )
-
-            second_row_has_short_values = any(
-                value is not None
-                and not is_long_text(value)
-                for value in preview_rows[1]
-            )
-
-            second_row_looks_like_header = not any(
-                looks_like_data(value)
-                for value in preview_rows[1]
-            )
-
-            if (
-                first_row_has_short_values
-                and second_row_has_short_values
-                and second_row_looks_like_header
-            ):
-                header_rows = 2
-                nested = True
-
-        return start_row, header_rows, nested
-
+        start_row = max(0, int(result.get("header_start_row", 0)))
+        header_rows = max(1, min(int(result.get("header_rows", 1)), 5))
+        nested = bool(result.get("nested", header_rows >= 2))
     except Exception:
-        logger.exception(
-            "LLM header analysis failed for %r",
-            sheet_name,
-        )
+        logger.exception("LLM header analysis failed for %r", sheet_name)
+        raise
 
-        return _fallback_header_decision(
-            preview_rows
-        )
+    logger.info(
+        "Header decision for %r: start_row=%s, header_rows=%s, nested=%s",
+        sheet_name,
+        start_row,
+        header_rows,
+        nested,
+    )
+    return start_row, header_rows, nested
 
 
 def get_model_name() -> str:
@@ -446,30 +313,31 @@ def agent_chat(
         else None
     )
 
-    system_prompt = f"""
-Ты ассистент по анализу данных и S2T-маппингов.
+    callbacks = _get_langfuse_callbacks()
+    available_tools = get_tools()
+    route = _select_chat_route(
+        clean_query,
+        history,
+        model=chat_model,
+        available_tools=available_tools,
+        callbacks=callbacks,
+    )
+    selected_tools = get_tools_for_names(route.tools)
+    selected_skills = load_skills(tuple(route.skills))
 
-Контекст выполнения:
+    logger.info(
+        "Chat routed tools=%s skills=%s",
+        [tool.name for tool in selected_tools],
+        route.skills,
+    )
+
+    system_prompt = f"""
 {CHAT_AGENT_CONTEXT}
 
 Навыки:
-{SKILLS}
+{selected_skills}
 
-Актуальная схема SQLite:
 {SQLITE_SCHEMA_CONTEXT}
-
-Правила:
-- используй только инструменты, реально переданные через tool calling;
-- не выдумывай результаты инструментов;
-- считай результаты ToolMessage единственным источником фактов о данных;
-- если инструмент вернул ошибку, исправь аргументы, выбери другой инструмент
-  либо честно сообщи об ошибке;
-- не изменяй данные;
-- Excel-строки находятся в `data`;
-- `data.table_name` означает имя физического Excel-листа;
-- логические ETL-таблицы находятся в `s2t_transformations`;
-- при поиске логической таблицы проверяй обе роли:
-  `source_table` и `target_table`.
 """.strip()
 
     trace_metadata: Dict[str, Any] = {}
@@ -481,13 +349,13 @@ def agent_chat(
         user_query=clean_query,
         system_prompt=system_prompt,
         model=chat_model,
-        tools=TOOLS,
+        tools=selected_tools,
         max_steps=max_steps,
         history=history,
         file_id=active_file_id,
         session_id=session_id,
         user_id=user_id,
-        callbacks=_get_langfuse_callbacks(),
+        callbacks=callbacks,
         trace_tags=["chat"],
         trace_metadata=trace_metadata,
     )

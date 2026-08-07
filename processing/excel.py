@@ -216,35 +216,6 @@ def build_nested_columns(header_data: pd.DataFrame, header_rows: int) -> List[Li
     ]
 
 
-def _is_header_like(cell: Any) -> bool:
-    if is_blank_header_value(cell) or _is_generated_on_value(cell):
-        return False
-    if isinstance(cell, str):
-        return len(cell.strip()) <= 100 and "\n" not in cell.strip()
-    return not isinstance(
-        cell,
-        (int, float, np.integer, np.floating, datetime.datetime, datetime.date),
-    )
-
-
-def _header_like_cell_count(row: List[Any]) -> int:
-    return sum(_is_header_like(cell) for cell in row)
-
-
-def infer_header_from_untitled_preview(
-    preview_rows: List[List[Any]],
-) -> Optional[Tuple[int, int, bool]]:
-    if len(preview_rows) < 2:
-        return None
-    first, second = preview_rows[:2]
-    blanks = sum(
-        is_blank_header_value(cell) or _is_generated_on_value(cell) for cell in first
-    )
-    if blanks < 2 or _header_like_cell_count(second) < 2:
-        return None
-    return (0, 2, True) if _header_like_cell_count(first) else (1, 1, False)
-
-
 def is_empty_or_irrelevant(preview_rows: List[List[Any]]) -> Tuple[bool, str]:
     if not preview_rows:
         return True, "Sheet is completely empty"
@@ -266,89 +237,18 @@ def _rows_empty(frame: pd.DataFrame, num_rows: int = 5) -> bool:
     return sample.empty or not bool(sample.notna().to_numpy().any())
 
 
-def are_rows_empty(
-    file_bytes: bytes,
-    sheet_name: str,
-    skiprows: int,
-    num_rows: int = 5,
-) -> bool:
-    """Compatibility helper; the main parser checks its already loaded frame."""
-    try:
-        frame = pd.read_excel(
-            io.BytesIO(file_bytes),
-            sheet_name=sheet_name,
-            header=None,
-            skiprows=skiprows,
-            nrows=num_rows,
-        )
-        return _rows_empty(frame, num_rows)
-    except Exception as exc:
-        logger.warning("Error checking data rows for sheet '%s': %s", sheet_name, exc)
-        return True
-
-
-def get_preview_headers(
-    file_bytes: bytes,
-    sheet_name: str,
-    start_row: int,
-    header_rows: int,
-) -> List:
-    """Compatibility/API helper for an explicit header preview request."""
-    if header_rows == 0:
-        return []
-    try:
-        frame = pd.read_excel(
-            io.BytesIO(file_bytes),
-            sheet_name=sheet_name,
-            header=None,
-            skiprows=start_row,
-            nrows=header_rows,
-        )
-        return (
-            build_single_header_row(frame)
-            if header_rows == 1
-            else build_nested_columns(frame, header_rows)
-        )
-    except Exception as exc:
-        logger.error("Preview headers failed: %s", exc)
-        return []
-
-
 def _resolve_header_decision(
     sheet_name: str,
     preview_rows: List[List[Any]],
-    correction: Optional[Dict[str, Any]],
 ) -> Tuple[int, int, bool]:
-    if correction:
-        start = correction["header_start_row"]
-        count = correction["header_rows_count"]
-        logger.info("Using correction for %s: start_row=%s, header_rows=%s", sheet_name, start, count)
-        return start, count, count >= 2
-
-    inferred = infer_header_from_untitled_preview(preview_rows)
-    if inferred is not None:
-        logger.info(
-            "Untitled/Unnamed header heuristic for %s: start_row=%s, header_rows=%s, nested=%s",
-            sheet_name,
-            *inferred,
-        )
-        return inferred
-    try:
-        decision = get_header_decision(sheet_name, preview_rows)
-        logger.info(
-            "AI decision for %s: start_row=%s, header_rows=%s",
-            sheet_name,
-            decision[0],
-            decision[1],
-        )
-        return decision
-    except Exception as exc:
-        logger.error(
-            "AI header decision failed for %s: %s. Using default (first row as header).",
-            sheet_name,
-            exc,
-        )
-        return 0, 1, False
+    decision = get_header_decision(sheet_name, preview_rows)
+    logger.info(
+        "Header decision for %s: start_row=%s, header_rows=%s",
+        sheet_name,
+        decision[0],
+        decision[1],
+    )
+    return decision
 
 
 def _emit_progress(
@@ -424,7 +324,6 @@ def _columns_from_frame(
 def _parse_loaded_sheet(
     frame: pd.DataFrame,
     sheet_name: str,
-    correction: Optional[Dict[str, Any]],
     merged_ranges: Optional[List[MergedRange]] = None,
     hidden_rows: Optional[Set[int]] = None,
     include_hidden_rows: bool = False,
@@ -434,9 +333,7 @@ def _parse_loaded_sheet(
     if irrelevant:
         return {"skip_reason": reason}
 
-    start, header_rows, nested = _resolve_header_decision(
-        sheet_name, preview, correction
-    )
+    start, header_rows, nested = _resolve_header_decision(sheet_name, preview)
     data_start = start + header_rows
 
     columns, error = _columns_from_frame(frame, start, header_rows)
@@ -469,7 +366,6 @@ def _parse_loaded_sheet(
                 "nested": nested,
             },
             "columns": columns,
-            "preview_rows": preview,
             "data_rows": rows,
             "data_row_numbers": [
                 position - data_start for position in data_positions
@@ -480,13 +376,10 @@ def _parse_loaded_sheet(
 
 def parse_excel_with_decisions(
     file_bytes: bytes,
-    corrections: Optional[Dict[str, Dict]] = None,
-    skip_sheets: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     include_hidden_rows: bool = False,
 ):
     sheets: List[Dict[str, Any]] = []
-    skip_sheets = skip_sheets or []
 
     excel_options = (
         {
@@ -526,15 +419,6 @@ def parse_excel_with_decisions(
                 sheet_name,
             )
 
-            if sheet_name in skip_sheets:
-                _skip_sheet(
-                    sheets,
-                    *progress_args,
-                    "Manually skipped by user",
-                    sheet_name,
-                )
-                continue
-
             logger.info("Processing sheet: %s", sheet_name)
             frame = pd.read_excel(
                 excel_file,
@@ -545,7 +429,6 @@ def parse_excel_with_decisions(
             parsed = _parse_loaded_sheet(
                 frame,
                 sheet_name,
-                (corrections or {}).get(sheet_name),
                 merged_ranges=_merged_ranges(excel_file, sheet_name),
                 hidden_rows=_hidden_rows(excel_file, sheet_name),
                 include_hidden_rows=include_hidden_rows,
@@ -575,13 +458,10 @@ def parse_excel_with_decisions(
 __all__ = [
     "ALLOWED_EXTENSIONS",
     "allowed_file",
-    "are_rows_empty",
     "build_nested_columns",
     "build_single_header_row",
     "clean_header_values",
     "convert_to_serializable",
-    "get_preview_headers",
-    "infer_header_from_untitled_preview",
     "is_blank_header_value",
     "is_empty_or_irrelevant",
     "parse_excel_with_decisions",

@@ -3,20 +3,13 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AI Excel Parser – Human Correction + S2T Chat</title>
+    <title>AI Excel Parser + S2T Chat</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding-top: 2rem; }
         .card { margin-top: 2rem; }
-        .sheet-card { margin-bottom: 1rem; border-left: 4px solid #0d6efd; }
         pre { background: #f4f4f4; padding: 0.5rem; border-radius: 0.25rem; overflow-x: auto; }
-        .decision-badge { font-size: 0.8rem; }
-        .header-preview { font-family: monospace; background: #e9ecef; padding: 0.5rem; border-radius: 0.25rem; margin-top: 0.5rem; }
-        .skip-checkbox { margin-right: 1rem; }
         .alert-success { margin-top: 1rem; }
-        .data-preview-table { font-size: 0.85rem; background: #fff; }
-        .data-preview-table td { vertical-align: middle; white-space: nowrap; max-width: 280px;
-            overflow: hidden; text-overflow: ellipsis; }
         .chat-container {
             background: #f8f9fc;
             border: 1px solid #dee2e6;
@@ -87,7 +80,7 @@
         <div class="col-md-10">
             <div class="card shadow-sm">
                 <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction + S2T Chat</h4>
+                    <h4 class="mb-0">🤖 AI Excel Parser + S2T Chat</h4>
                 </div>
                 <div class="card-body">
                     <!-- File upload area (unchanged) -->
@@ -104,7 +97,7 @@
                         <button type="button" id="resetBtn" class="btn btn-secondary">🔄 New File</button>
                         <button type="button" id="toggleChatBtn" class="btn btn-info">💬 Show Chat</button>
                         <a href="/chat_app" class="btn btn-outline-dark">Chat-first app</a>
-                        <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing headers... ⏳</div>
+                        <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing the workbook... ⏳</div>
                     </form>
 
                     <!-- Business summary (summarizer agent) -->
@@ -130,7 +123,6 @@
                                 </div>
                                 <div class="btn-group btn-group-sm" role="group">
                                     <button type="button" id="loadTransformationsBtn" class="btn btn-outline-primary">Load</button>
-                                    <button type="button" id="rebuildTransformationsBtn" class="btn btn-outline-secondary">Rebuild</button>
                                     <button type="button" id="clearAllDataBtn" class="btn btn-outline-danger">Clear all data</button>
                                 </div>
                             </div>
@@ -144,13 +136,6 @@
                                 </div>
                             </div>
                         </div>
-                    </div>
-
-                    <!-- Correction area (unchanged) -->
-                    <div id="correctionArea" class="mt-4" style="display: none;">
-                        <h5>📝 Review and correct AI decisions</h5>
-                        <div id="sheetsContainer"></div>
-                        <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections</button>
                     </div>
 
                     <!-- Error area (unchanged) -->
@@ -176,17 +161,13 @@
 
 <script>
     let currentFileId = null;
-    let currentSheets = [];
 
     const form = document.getElementById('uploadForm');
     const fileInput = document.getElementById('fileInput');
     const includeHiddenRows = document.getElementById('includeHiddenRows');
     const loadingDiv = document.getElementById('loading');
-    const correctionArea = document.getElementById('correctionArea');
-    const sheetsContainer = document.getElementById('sheetsContainer');
     const errorArea = document.getElementById('errorArea');
     const errorMessage = document.getElementById('errorMessage');
-    const submitBtn = document.getElementById('submitCorrectionsBtn');
     const resetBtn = document.getElementById('resetBtn');
     const toggleChatBtn = document.getElementById('toggleChatBtn');
     const chatArea = document.getElementById('chatArea');
@@ -201,18 +182,14 @@
     const transformationsContent = document.getElementById('transformationsContent');
     const transformationsSearch = document.getElementById('transformationsSearch');
     const loadTransformationsBtn = document.getElementById('loadTransformationsBtn');
-    const rebuildTransformationsBtn = document.getElementById('rebuildTransformationsBtn');
     const clearAllDataBtn = document.getElementById('clearAllDataBtn');
     const searchTransformationsBtn = document.getElementById('searchTransformationsBtn');
 
     // Reset UI but keep the selected file (used before upload)
     function resetUI() {
-        correctionArea.style.display = 'none';
         errorArea.style.display = 'none';
-        sheetsContainer.innerHTML = '';
         errorMessage.textContent = '';
         currentFileId = null;
-        currentSheets = [];
         summaryArea.style.display = 'none';
         summaryContent.textContent = '';
         transformationsArea.style.display = 'none';
@@ -314,7 +291,6 @@
         if (q) params.set('q', q);
         transformationsContent.innerHTML = '<span class="text-muted">Loading transformations...</span>';
         loadTransformationsBtn.disabled = true;
-        rebuildTransformationsBtn.disabled = true;
         clearAllDataBtn.disabled = true;
         searchTransformationsBtn.disabled = true;
         try {
@@ -327,29 +303,8 @@
             transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
         } finally {
             loadTransformationsBtn.disabled = false;
-            rebuildTransformationsBtn.disabled = false;
             clearAllDataBtn.disabled = false;
             searchTransformationsBtn.disabled = false;
-        }
-    }
-
-    async function rebuildTransformations() {
-        if (!currentFileId) return;
-        transformationsContent.innerHTML = '<span class="text-muted">Rebuilding transformations...</span>';
-        rebuildTransformationsBtn.disabled = true;
-        try {
-            const response = await fetch(`/transformations/${encodeURIComponent(currentFileId)}/refresh`, { method: 'POST' });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Failed to rebuild transformations');
-            transformationsCount.textContent = `(${data.count} rows)`;
-            await loadTransformations();
-            if (data.s2t_transformations_error) {
-                transformationsContent.innerHTML = `<div class="alert alert-warning mb-2">S2T extraction error: ${escapeHtml(data.s2t_transformations_error)}</div>` + transformationsContent.innerHTML;
-            }
-        } catch (err) {
-            transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
-        } finally {
-            rebuildTransformationsBtn.disabled = false;
         }
     }
 
@@ -384,8 +339,10 @@
             <thead>
                 <tr>
                     <th>#</th>
+                    <th>Target layer</th>
                     <th>Target table</th>
                     <th>Target field</th>
+                    <th>Source layer</th>
                     <th>Source table</th>
                     <th>Source field</th>
                     <th>Transformation</th>
@@ -396,8 +353,10 @@
             const rulePreview = previewCellText(row.transformation_rule || '').slice(0, 500);
             html += `<tr>
                 <td>${escapeHtml(previewCellText(row.row_num))}</td>
+                <td>${escapeHtml(previewCellText(row.target_layer))}</td>
                 <td title="${escapeAttr(previewCellText(row.target_table))}">${escapeHtml(previewCellText(row.target_table))}</td>
                 <td title="${escapeAttr(previewCellText(row.target_field))}">${escapeHtml(previewCellText(row.target_field))}</td>
+                <td>${escapeHtml(previewCellText(row.source_layer))}</td>
                 <td title="${escapeAttr(previewCellText(row.source_table))}">${escapeHtml(previewCellText(row.source_table))}</td>
                 <td title="${escapeAttr(previewCellText(row.source_field))}">${escapeHtml(previewCellText(row.source_field))}</td>
                 <td class="transformations-sql" title="${escapeAttr(rulePreview)}">${escapeHtml(rulePreview)}</td>
@@ -408,7 +367,6 @@
     }
 
     loadTransformationsBtn.addEventListener('click', loadTransformations);
-    rebuildTransformationsBtn.addEventListener('click', rebuildTransformations);
     clearAllDataBtn.addEventListener('click', clearAllData);
     searchTransformationsBtn.addEventListener('click', loadTransformations);
     transformationsSearch.addEventListener('keypress', (e) => {
@@ -443,11 +401,8 @@
             if (!response.ok) throw new Error(data.error || 'Unknown error');
 
             currentFileId = data.file_id;
-            currentSheets = data.sheets;
             showSummary(data.summary, data.summary_error);
             showTransformationsPanel(data.s2t_transformations_count);
-            renderCorrectionUI(data.sheets);
-            correctionArea.style.display = 'block';
         } catch (err) {
             errorMessage.textContent = err.message;
             errorArea.style.display = 'block';
@@ -461,170 +416,6 @@
         if (typeof v === 'object') return JSON.stringify(v);
         return String(v);
     }
-
-    /** data_preview: first three data rows from the API */
-    function renderDataPreviewTable(rows) {
-        if (!rows || !rows.length) {
-            return '<p class="text-muted small mb-0"><em>No data rows to preview.</em></p>';
-        }
-        let maxCols = 0;
-        for (let i = 0; i < rows.length; i++) {
-            const r = rows[i];
-            if (Array.isArray(r)) maxCols = Math.max(maxCols, r.length);
-        }
-        let html = '<div class="table-responsive"><table class="table table-sm table-bordered mb-0 data-preview-table">';
-        html += '<tbody>';
-        for (let ri = 0; ri < rows.length; ri++) {
-            const r = rows[ri];
-            const cells = Array.isArray(r) ? r : [];
-            html += '<tr>';
-            for (let ci = 0; ci < maxCols; ci++) {
-                html += '<td title="' + escapeAttr(previewCellText(cells[ci])) + '">' +
-                    escapeHtml(previewCellText(cells[ci])) + '</td>';
-            }
-            html += '</tr>';
-        }
-        html += '</tbody></table></div>';
-        return html;
-    }
-
-    async function updateHeaderPreview(sheetName, option, previewDivId) {
-        try {
-            const response = await fetch('/preview_headers', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    file_id: currentFileId,
-                    sheet_name: sheetName,
-                    option: option
-                })
-            });
-            const data = await response.json();
-            if (response.ok && data.headers) {
-                const previewDiv = document.getElementById(previewDivId);
-                previewDiv.innerHTML = '<strong>Preview headers:</strong><br>' +
-                    data.headers.map(h => `&nbsp;&nbsp;• ${h}`).join('<br>');
-            }
-        } catch (err) {
-            console.error("Preview error:", err);
-        }
-    }
-
-    function renderCorrectionUI(sheets) {
-        sheetsContainer.innerHTML = '';
-        for (let sheet of sheets) {
-            if (sheet.skip_reason) continue;
-            const header = sheet.header;
-            const currentStartRow = header.start_row;
-            const currentRows = header.row_count;
-
-            let selectedOption = "";
-            if (currentStartRow === 0 && currentRows === 1) selectedOption = "1";
-            else if (currentStartRow === 1 && currentRows === 1) selectedOption = "2";
-            else if (currentStartRow === 0 && currentRows === 2) selectedOption = "12";
-            else selectedOption = "1";
-
-            const previewId = `preview-${sheet.sheet_name.replace(/\s/g, '_')}`;
-
-            const card = document.createElement('div');
-            card.className = 'card sheet-card p-3';
-            card.innerHTML = `
-                <h6>📄 Sheet: <strong>${escapeHtml(sheet.sheet_name)}</strong></h6>
-                <div class="row">
-                    <div class="col-md-4">
-                        <div class="form-check">
-                            <input class="form-check-input skip-checkbox" type="checkbox" data-sheet="${sheet.sheet_name}" id="skip-${sheet.sheet_name.replace(/\s/g, '_')}">
-                            <label class="form-check-label" for="skip-${sheet.sheet_name.replace(/\s/g, '_')}">
-                                Skip this sheet (do not store data)
-                            </label>
-                        </div>
-                    </div>
-                    <div class="col-md-8">
-                        <label class="form-label">Header selection:</label>
-                        <select class="form-select header-select" data-sheet="${sheet.sheet_name}" data-preview="${previewId}" id="select-${sheet.sheet_name.replace(/\s/g, '_')}">
-                            <option value="1" ${selectedOption === "1" ? "selected" : ""}>First row only (header_start_row=0, rows=1)</option>
-                            <option value="2" ${selectedOption === "2" ? "selected" : ""}>Second row only (skip first row, rows=1)</option>
-                            <option value="12" ${selectedOption === "12" ? "selected" : ""}>First and second row concatenated (multi‑level)</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="mt-2">
-                    <div id="${previewId}" class="header-preview">
-                        <em>Loading preview...</em>
-                    </div>
-                </div>
-                <div class="mt-2">
-                    <small class="d-block mb-1">Data preview (first 3 rows):</small>
-                    ${renderDataPreviewTable(sheet.data_preview || [])}
-                </div>
-            `;
-            sheetsContainer.appendChild(card);
-
-            updateHeaderPreview(sheet.sheet_name, selectedOption, previewId);
-
-            const skipCheckbox = card.querySelector('.skip-checkbox');
-            const headerSelect = card.querySelector('.header-select');
-            skipCheckbox.addEventListener('change', (e) => {
-                headerSelect.disabled = e.target.checked;
-            });
-        }
-
-        document.querySelectorAll('.header-select').forEach(select => {
-            select.addEventListener('change', (e) => {
-                const sheetName = select.getAttribute('data-sheet');
-                const previewId = select.getAttribute('data-preview');
-                const option = select.value;
-                updateHeaderPreview(sheetName, option, previewId);
-            });
-        });
-    }
-
-    submitBtn.addEventListener('click', async () => {
-        const corrections = [];
-        for (let sheet of currentSheets) {
-            if (sheet.skip_reason) continue;
-            const select = document.getElementById(`select-${sheet.sheet_name.replace(/\s/g, '_')}`);
-            const skipCheckbox = document.getElementById(`skip-${sheet.sheet_name.replace(/\s/g, '_')}`);
-            const skipped = skipCheckbox ? skipCheckbox.checked : false;
-            let start_row = 0, rows = 1;
-            if (!skipped && select) {
-                const value = select.value;
-                if (value === "1") { start_row = 0; rows = 1; }
-                else if (value === "2") { start_row = 1; rows = 1; }
-                else if (value === "12") { start_row = 0; rows = 2; }
-            }
-            corrections.push({
-                sheet_name: sheet.sheet_name,
-                skipped: skipped,
-                header_start_row: start_row,
-                header_rows_count: rows
-            });
-        }
-
-        loadingDiv.classList.remove('d-none');
-        try {
-            const response = await fetch('/apply_corrections', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    file_id: currentFileId,
-                    corrections: corrections,
-                    include_hidden_rows: includeHiddenRows.checked
-                })
-            });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error);
-
-            showSummary(data.summary, data.summary_error);
-            showTransformationsPanel(data.s2t_transformations_count);
-            correctionArea.style.display = 'none';
-        } catch (err) {
-            errorMessage.textContent = err.message;
-            errorArea.style.display = 'block';
-        } finally {
-            loadingDiv.classList.add('d-none');
-        }
-    });
 
     function escapeHtml(str) {
         if (!str) return '';

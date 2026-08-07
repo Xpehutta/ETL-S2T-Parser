@@ -1,7 +1,7 @@
 """Shared helpers for agent tools."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -12,6 +12,23 @@ def clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(parsed, maximum))
+
+
+def normalize_column_reference(
+    table_name: str,
+    column_name: Optional[str],
+) -> Optional[str]:
+    """Return a bare column name for an exact table.column reference."""
+    if column_name is None:
+        return None
+    clean_column = str(column_name).strip()
+    if not clean_column:
+        return None
+
+    prefix = f"{str(table_name).strip()}."
+    if clean_column.casefold().startswith(prefix.casefold()):
+        return clean_column[len(prefix):].strip()
+    return clean_column
 
 
 def file_meta(file_id: int) -> dict[str, Any]:

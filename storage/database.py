@@ -24,11 +24,9 @@ FILES_COLUMNS = (
     "upload_time",
     "summary",
     "description",
-    "result_json",
     "description_embedding",
 )
 FILE_SHEET_HEADER_COLUMNS = (
-    "sheet_id",
     "file_id",
     "sheet_name",
     "skipped",
@@ -38,12 +36,10 @@ FILE_SHEET_HEADER_COLUMNS = (
     "nested_structure",
     "columns_count",
     "headers_json",
-    "headers_flat",
 )
 EXTRACTION_METADATA_COLUMNS = (
     "id",
     "file_id",
-    "sheet_id",
     "sheet_name",
     "row_num",
 )
@@ -53,19 +49,29 @@ SOURCE_TABLE_FIELDS = tuple(
 TARGET_TABLE_FIELDS = tuple(
     get_usefull_col_extraction_target("target_tables")["fields"]
 )
+ADDITIONAL_OBJECT_FIELDS = tuple(
+    get_usefull_col_extraction_target("additional_objects")["fields"]
+)
+PXF_TO_A_FIELDS = tuple(
+    get_usefull_col_extraction_target("pxf_to_a")["fields"]
+)
 S2T_FIELDS = tuple(
     get_usefull_col_extraction_target("s2t_transformations")["fields"]
 )
+S2T_LAYER_FIELDS = ("source_layer", "target_layer")
+S2T_RECORD_FIELDS = S2T_FIELDS + S2T_LAYER_FIELDS
 SOURCE_TABLE_COLUMNS = (
     EXTRACTION_METADATA_COLUMNS + SOURCE_TABLE_FIELDS + ("description_embedding",)
 )
 TARGET_TABLE_COLUMNS = (
     EXTRACTION_METADATA_COLUMNS + TARGET_TABLE_FIELDS + ("description_embedding",)
 )
-S2T_TRANSFORMATION_COLUMNS = EXTRACTION_METADATA_COLUMNS + S2T_FIELDS + ("raw_json",)
+ADDITIONAL_OBJECT_COLUMNS = EXTRACTION_METADATA_COLUMNS + ADDITIONAL_OBJECT_FIELDS
+PXF_TO_A_COLUMNS = EXTRACTION_METADATA_COLUMNS + PXF_TO_A_FIELDS
+S2T_TRANSFORMATION_COLUMNS = EXTRACTION_METADATA_COLUMNS + S2T_RECORD_FIELDS
 DATA_COLUMNS = (
     "id",
-    "sheet_id",
+    "file_id",
     "table_name",
     "row_num",
     "column_id",
@@ -77,23 +83,17 @@ CORE_TABLES = (
     "file_sheet_headers",
     "source_tables",
     "target_tables",
+    "additional_objects",
+    "pxf_to_a",
     "s2t_transformations",
-)
-LEGACY_TABLES = (
-    "relationships",
-    "embeddings",
-    "column_mappings",
-    "additions",
-)
-REMOVED_WORKBOOK_TABLES = (
-    "sheets",
-    "columns",
 )
 USER_FACING_TABLES = (
     "files",
     "file_sheet_headers",
     "source_tables",
     "target_tables",
+    "additional_objects",
+    "pxf_to_a",
     "s2t_transformations",
     "data",
 )
@@ -104,6 +104,8 @@ STORAGE_SCHEMA_COLUMNS = {
     "file_sheet_headers": FILE_SHEET_HEADER_COLUMNS,
     "source_tables": SOURCE_TABLE_COLUMNS,
     "target_tables": TARGET_TABLE_COLUMNS,
+    "additional_objects": ADDITIONAL_OBJECT_COLUMNS,
+    "pxf_to_a": PXF_TO_A_COLUMNS,
     "s2t_transformations": S2T_TRANSFORMATION_COLUMNS,
     "data": DATA_COLUMNS,
 }
@@ -159,7 +161,11 @@ def _json_list(raw: Optional[str]) -> List[Any]:
     return parsed if isinstance(parsed, list) else []
 
 
-def _header_rows_to_column_rows(sheet_id: int, headers_json: Optional[str]) -> List[Dict[str, Any]]:
+def _header_rows_to_column_rows(
+    file_id: int,
+    sheet_name: str,
+    headers_json: Optional[str],
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in _json_list(headers_json):
         if not isinstance(item, dict):
@@ -178,7 +184,8 @@ def _header_rows_to_column_rows(sheet_id: int, headers_json: Optional[str]) -> L
         rows.append(
             {
                 "column_id": column_index + 1,
-                "sheet_id": int(sheet_id),
+                "file_id": int(file_id),
+                "sheet_name": sheet_name,
                 "column_index": column_index,
                 "column_name_flat": flat,
                 "column_header": json.dumps(path, ensure_ascii=False, default=str),
@@ -198,7 +205,6 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             upload_time TEXT,
             summary TEXT,
             description TEXT,
-            result_json TEXT,
             description_embedding BLOB
         )
         """
@@ -206,9 +212,8 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {names['file_sheet_headers']} (
-            sheet_id INTEGER PRIMARY KEY,
-            file_id INTEGER,
-            sheet_name TEXT,
+            file_id INTEGER NOT NULL,
+            sheet_name TEXT NOT NULL,
             skipped INTEGER DEFAULT 0,
             skip_reason TEXT,
             header_start_row INTEGER,
@@ -216,7 +221,7 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             nested_structure INTEGER,
             columns_count INTEGER DEFAULT 0,
             headers_json TEXT,
-            headers_flat TEXT
+            PRIMARY KEY (file_id, sheet_name)
         )
         """
     )
@@ -224,7 +229,7 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
         f"""
         CREATE TABLE IF NOT EXISTS {names['data']} (
             id INTEGER PRIMARY KEY,
-            sheet_id INTEGER,
+            file_id INTEGER,
             table_name TEXT,
             row_num INTEGER,
             column_id INTEGER,
@@ -240,7 +245,6 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             CREATE TABLE IF NOT EXISTS {names[table_name]} (
                 id INTEGER PRIMARY KEY,
                 file_id INTEGER,
-                sheet_id INTEGER,
                 sheet_name TEXT,
                 row_num INTEGER,
                 {fields_sql},
@@ -248,20 +252,34 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             )
             """
         )
-    s2t_fields_sql = _text_columns_sql(S2T_FIELDS, "            ")
+    for table_name, fields in (
+        ("additional_objects", ADDITIONAL_OBJECT_FIELDS),
+        ("pxf_to_a", PXF_TO_A_FIELDS),
+    ):
+        fields_sql = _text_columns_sql(fields, "                ")
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {names[table_name]} (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER,
+                sheet_name TEXT,
+                row_num INTEGER,
+                {fields_sql}
+            )
+            """
+        )
+    s2t_fields_sql = _text_columns_sql(S2T_RECORD_FIELDS, "            ")
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {names['s2t_transformations']} (
             id INTEGER PRIMARY KEY,
             file_id INTEGER,
-            sheet_id INTEGER,
             sheet_name TEXT,
             row_num INTEGER,
-            {s2t_fields_sql},
-            raw_json TEXT
+            {s2t_fields_sql}
         )
         """
-    )
+        )
 
 
 def _legacy_schema_recovery_hint(cursor: sqlite3.Cursor) -> str:
@@ -295,10 +313,11 @@ def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
             )
     integer_primary_keys = {
         "files": "file_id",
-        "file_sheet_headers": "sheet_id",
         "data": "id",
         "source_tables": "id",
         "target_tables": "id",
+        "additional_objects": "id",
+        "pxf_to_a": "id",
         "s2t_transformations": "id",
     }
     for table_name, key_name in integer_primary_keys.items():
@@ -308,6 +327,20 @@ def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
             mismatches.append(
                 f"{table_name}.{key_name}: expected INTEGER PRIMARY KEY"
             )
+    headers_info = {
+        str(row[1]): row for row in _table_info(cursor, "file_sheet_headers")
+    }
+    file_key = headers_info.get("file_id")
+    name_key = headers_info.get("sheet_name")
+    if (
+        file_key is None
+        or name_key is None
+        or int(file_key[5]) != 1
+        or int(name_key[5]) != 2
+    ):
+        mismatches.append(
+            "file_sheet_headers: expected PRIMARY KEY (file_id, sheet_name)"
+        )
     data_info = {str(row[1]): row for row in _table_info(cursor, "data")}
     column_id = data_info.get("column_id")
     if column_id is None or str(column_id[2]).upper() != "INTEGER":
@@ -316,7 +349,10 @@ def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
 
 
 def _create_indexes(cursor: sqlite3.Cursor) -> None:
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_data_sheet_row ON data(sheet_id, row_num)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_data_file_sheet_row "
+        "ON data(file_id, table_name, row_num)"
+    )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_data_table_name ON data(table_name)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_sheet_headers_file ON file_sheet_headers(file_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_s2t_transformations_file ON s2t_transformations(file_id)")
@@ -333,6 +369,10 @@ def _create_indexes(cursor: sqlite3.Cursor) -> None:
     for table_name in ("source_tables", "target_tables"):
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)")
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(table_name)")
+    for table_name in ("additional_objects", "pxf_to_a"):
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)"
+        )
 
 
 def init_db() -> None:
@@ -360,8 +400,6 @@ def init_db() -> None:
         else:
             _create_current_tables(cursor)
         _create_indexes(cursor)
-        for table_name in LEGACY_TABLES + REMOVED_WORKBOOK_TABLES:
-            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -371,35 +409,67 @@ def init_db() -> None:
     logger.info("Database initialized with the current schema")
 
 
+def migrate_s2t_layer_columns() -> Dict[str, Any]:
+    """Explicitly add nullable source/target layer columns to the prior schema."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        actual_columns = _table_columns(cursor, "s2t_transformations")
+        previous_columns = list(EXTRACTION_METADATA_COLUMNS + S2T_FIELDS)
+        current_columns = list(S2T_TRANSFORMATION_COLUMNS)
+        if actual_columns == current_columns:
+            conn.commit()
+            return {"changed": False, "columns_added": []}
+        if actual_columns != previous_columns:
+            raise DatabaseSchemaError(
+                "Нельзя добавить ETL-слои: s2t_transformations не соответствует "
+                "предыдущей поддерживаемой схеме"
+            )
+        for field in S2T_LAYER_FIELDS:
+            cursor.execute(
+                f"ALTER TABLE s2t_transformations ADD COLUMN {_sql_identifier(field)} TEXT"
+            )
+        conn.commit()
+        return {"changed": True, "columns_added": list(S2T_LAYER_FIELDS)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def clear_all_data() -> Dict[str, int]:
-    """Delete every row from all current application tables."""
-    deletion_order = (
-        "data",
-        "s2t_transformations",
-        "source_tables",
-        "target_tables",
-        "file_sheet_headers",
-        "files",
-    )
+    """Drop all application tables and recreate the current empty schema."""
+    deletion_order = tuple(reversed(STORAGE_SCHEMA_TABLE_ORDER))
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
         deleted = {
-            table_name: int(
-                cursor.execute(
-                    f"SELECT COUNT(*) FROM {_sql_identifier(table_name)}"
-                ).fetchone()[0]
+            table_name: (
+                int(
+                    cursor.execute(
+                        f"SELECT COUNT(*) FROM {_sql_identifier(table_name)}"
+                    ).fetchone()[0]
+                )
+                if _table_exists(cursor, table_name)
+                else 0
             )
-            for table_name in deletion_order
-        }
-        for table_name in deletion_order:
-            cursor.execute(f"DELETE FROM {_sql_identifier(table_name)}")
-        conn.commit()
-        return {
-            table_name: deleted[table_name]
             for table_name in USER_FACING_TABLES
         }
+        for table_name in deletion_order:
+            cursor.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table_name)}")
+        _create_current_tables(cursor)
+        _create_indexes(cursor)
+        mismatches = _schema_mismatches(cursor)
+        if mismatches:
+            raise DatabaseSchemaError(
+                "Failed to recreate the current SQLite schema: "
+                + "; ".join(mismatches)
+            )
+        conn.commit()
+        return deleted
     except Exception:
         conn.rollback()
         raise
@@ -408,54 +478,25 @@ def clear_all_data() -> Dict[str, int]:
 
 
 def store_excel_data(
-    file_bytes: bytes,
     filename: str,
     model_used: str,
     sheets: List[Dict[str, Any]],
     max_rows_per_sheet: int = 1000,
-    file_id: Optional[int] = None,
 ) -> int:
     """Store one workbook upload; equal files and equal rows remain separate records."""
-    _ = file_bytes
     upload_time = datetime.now().isoformat()
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
-        if file_id is None:
-            cursor.execute(
-                """
-                INSERT INTO files (filename, model_used, upload_time)
-                VALUES (?, ?, ?)
-                """,
-                (filename, model_used, upload_time),
-            )
-            current_file_id = int(cursor.lastrowid)
-        else:
-            current_file_id = int(file_id)
-            existing = cursor.execute(
-                "SELECT 1 FROM files WHERE file_id = ?",
-                (current_file_id,),
-            ).fetchone()
-            if not existing:
-                raise ValueError(f"File not found: {current_file_id}")
-            cursor.execute(
-                """
-                UPDATE files
-                SET filename = ?, model_used = ?, upload_time = ?
-                WHERE file_id = ?
-                """,
-                (filename, model_used, upload_time, current_file_id),
-            )
-            cursor.execute(
-                "DELETE FROM data WHERE sheet_id IN "
-                "(SELECT sheet_id FROM file_sheet_headers WHERE file_id = ?)",
-                (current_file_id,),
-            )
-            cursor.execute("DELETE FROM file_sheet_headers WHERE file_id = ?", (current_file_id,))
-            cursor.execute("DELETE FROM source_tables WHERE file_id = ?", (current_file_id,))
-            cursor.execute("DELETE FROM target_tables WHERE file_id = ?", (current_file_id,))
-            cursor.execute("DELETE FROM s2t_transformations WHERE file_id = ?", (current_file_id,))
+        cursor.execute(
+            """
+            INSERT INTO files (filename, model_used, upload_time)
+            VALUES (?, ?, ?)
+            """,
+            (filename, model_used, upload_time),
+        )
+        current_file_id = int(cursor.lastrowid)
 
         for sheet in sheets:
             sheet_name = str(sheet["sheet_name"])
@@ -465,8 +506,8 @@ def store_excel_data(
                     """
                     INSERT INTO file_sheet_headers
                     (file_id, sheet_name, skipped, skip_reason, columns_count,
-                     headers_json, headers_flat)
-                    VALUES (?, ?, 1, ?, 0, '[]', '')
+                     headers_json)
+                    VALUES (?, ?, 1, ?, 0, '[]')
                     """,
                     (current_file_id, sheet_name, sheet.get("skip_reason", "")),
                 )
@@ -488,8 +529,8 @@ def store_excel_data(
                 INSERT INTO file_sheet_headers
                 (file_id, sheet_name, skipped, skip_reason, header_start_row,
                  header_rows_count, nested_structure, columns_count,
-                 headers_json, headers_flat)
-                VALUES (?, ?, 0, '', ?, ?, ?, ?, ?, ?)
+                 headers_json)
+                VALUES (?, ?, 0, '', ?, ?, ?, ?, ?)
                 """,
                 (
                     current_file_id,
@@ -499,10 +540,8 @@ def store_excel_data(
                     1 if header["nested"] else 0,
                     len(header_rows),
                     json.dumps(header_rows, ensure_ascii=False, default=str),
-                    "\n".join(row["flat"] for row in header_rows),
                 ),
             )
-            sheet_id = int(cursor.lastrowid)
             rows_to_insert: List[tuple[Any, ...]] = []
             data_rows = sheet.get("data_rows", [])
             data_row_numbers = sheet.get("data_row_numbers")
@@ -523,11 +562,17 @@ def store_excel_data(
                     if value is None:
                         continue
                     rows_to_insert.append(
-                        (sheet_id, sheet_name, row_num, column_index + 1, str(value)[:1000])
+                        (
+                            current_file_id,
+                            sheet_name,
+                            row_num,
+                            column_index + 1,
+                            str(value),
+                        )
                     )
             cursor.executemany(
                 """
-                INSERT INTO data (sheet_id, table_name, row_num, column_id, value)
+                INSERT INTO data (file_id, table_name, row_num, column_id, value)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
@@ -551,18 +596,6 @@ def get_file(file_id: int) -> Optional[Dict[str, Any]]:
             (int(file_id),),
         ).fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def update_file_result_json(file_id: int, result_json: str) -> None:
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            "UPDATE files SET result_json = ? WHERE file_id = ?",
-            (result_json, int(file_id)),
-        )
-        conn.commit()
     finally:
         conn.close()
 
@@ -598,108 +631,21 @@ def update_file_description(file_id: int, description: str) -> None:
         conn.close()
 
 
-def _norm_header_token(value: str) -> str:
-    return " ".join((value or "").split()).lower()
-
-
-def _header_segments(column_name_flat: str) -> List[str]:
-    if not column_name_flat:
-        return []
-    return [
-        _norm_header_token(part)
-        for part in re.split(r"\s*>\s*", column_name_flat.strip())
-        if part.strip()
-    ]
-
-
-def get_column_id_by_name(sheet_id: int, column_name: str) -> Optional[int]:
-    """Find a numeric column ID by flat or nested header name."""
-    if sheet_id is None or not column_name:
-        return None
-    key = _norm_header_token(column_name)
-    if not key:
-        return None
-    key_loose = key.replace("_", " ")
-    segment_hits: List[tuple[int, int]] = []
-    loose_segment_hits: List[tuple[int, int]] = []
-    substring_hits: List[tuple[int, int]] = []
-
-    for row in get_columns_by_sheet(int(sheet_id)):
-        flat = row["column_name_flat"] or ""
-        column_id = int(row["column_id"])
-        column_index = int(row["column_index"])
-        normalized_flat = _norm_header_token(flat)
-        if normalized_flat in {key, key_loose}:
-            return column_id
-        segments = _header_segments(flat)
-        if key in segments or key_loose in segments:
-            segment_hits.append((column_index, column_id))
-            continue
-        if any(key_loose == segment.replace("_", " ") for segment in segments):
-            loose_segment_hits.append((column_index, column_id))
-            continue
-        if len(key) >= 5 and (
-            key in normalized_flat or key_loose in normalized_flat.replace("_", " ")
-        ):
-            substring_hits.append((column_index, column_id))
-
-    for matches in (segment_hits, loose_segment_hits, substring_hits):
-        if matches:
-            matches.sort(key=lambda item: item[0])
-            return matches[0][1]
-    return None
-
-
-def get_sheet_id(file_id: int, sheet_name: str) -> Optional[int]:
+def get_columns_by_sheet(file_id: int, sheet_name: str) -> List[Dict[str, Any]]:
     conn = get_db_connection()
     try:
         row = conn.execute(
             """
-            SELECT sheet_id
+            SELECT headers_json
             FROM file_sheet_headers
-            WHERE file_id = ? AND sheet_name = ?
-            ORDER BY sheet_id
-            LIMIT 1
+            WHERE file_id = ? AND sheet_name = ? COLLATE NOCASE
             """,
-            (int(file_id), sheet_name),
-        ).fetchone()
-        return int(row["sheet_id"]) if row else None
-    finally:
-        conn.close()
-
-
-def get_all_files() -> List[Dict[str, Any]]:
-    conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            "SELECT file_id, filename, upload_time FROM files ORDER BY upload_time DESC, file_id DESC"
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-def get_sheets_by_file(file_id: int) -> List[str]:
-    conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            "SELECT sheet_name FROM file_sheet_headers WHERE file_id = ? ORDER BY sheet_id",
-            (int(file_id),),
-        ).fetchall()
-        return [str(row["sheet_name"]) for row in rows]
-    finally:
-        conn.close()
-
-
-def get_columns_by_sheet(sheet_id: int) -> List[Dict[str, Any]]:
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            "SELECT headers_json FROM file_sheet_headers WHERE sheet_id = ?",
-            (int(sheet_id),),
+            (int(file_id), str(sheet_name)),
         ).fetchone()
         if not row:
             return []
-        return _header_rows_to_column_rows(int(sheet_id), row["headers_json"])
+        return _header_rows_to_column_rows(
+            int(file_id), str(sheet_name), row["headers_json"]
+        )
     finally:
         conn.close()

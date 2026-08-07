@@ -1,4 +1,3 @@
-import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -9,7 +8,8 @@ from graph_storage import is_neo4j_configured
 from processing.excel import convert_to_serializable
 from services.graph_sync import sync_file_graph
 from sheet_skills.s2t import S2TExtractionError, run_s2t_extraction_subagent
-from storage.database import update_file_result_json
+from sheet_skills.structured_metadata import extract_structured_metadata
+from sheet_skills.table_catalog import extract_table_catalogs
 
 
 logger = logging.getLogger(__name__)
@@ -55,15 +55,22 @@ def try_generate_description(
         return None, str(exc)
 
 
-def try_refresh_s2t_transformations(
+def try_extract_s2t_transformations(
     file_id: int,
     sheet_group_analysis: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Optional[str], Dict[str, Any]]:
     try:
+        table_catalogs = extract_table_catalogs(file_id, sheet_group_analysis)
+        structured_metadata = extract_structured_metadata(
+            file_id,
+            sheet_group_analysis,
+        )
         report = run_s2t_extraction_subagent(
             file_id,
             sheet_group_analysis=sheet_group_analysis,
         )
+        report["table_catalogs"] = table_catalogs
+        report["structured_metadata"] = structured_metadata
         return int(report.get("verification", {}).get("count", 0)), None, report
     except S2TExtractionError as exc:
         logger.error("Useful-column extraction subagent failed: %s", exc)
@@ -138,7 +145,7 @@ def finish_analysis(
         detail=file_id,
         file_id=file_id,
     )
-    count, extraction_error, extraction_report = try_refresh_s2t_transformations(
+    count, extraction_error, extraction_report = try_extract_s2t_transformations(
         file_id,
         sheet_group_analysis=sheet_group_analysis,
     )
@@ -153,11 +160,10 @@ def finish_analysis(
         file_id=file_id,
     )
     summary, summary_error = try_generate_summary(file_id)
-    description, description_error = try_generate_description(
-        file_id,
-        summary=summary,
-        refresh=True,
-    )
+    if summary is None:
+        description, description_error = None, summary_error
+    else:
+        description, description_error = try_generate_description(file_id)
     response_sheets = _public_sheets(sheets)
     response = convert_to_serializable(
         {
@@ -178,7 +184,6 @@ def finish_analysis(
     graph_sync_report, graph_sync_error = try_sync_file_graph(file_id)
     response["graph_sync_report"] = graph_sync_report
     response["graph_sync_error"] = graph_sync_error
-    update_file_result_json(file_id, json.dumps(response, ensure_ascii=False))
     _emit_progress(
         progress_callback,
         status="done",

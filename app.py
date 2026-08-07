@@ -5,21 +5,19 @@ import datetime
 from threading import Lock
 from typing import List, Any, Dict, Optional
 from flask import Flask, request, jsonify, render_template, send_from_directory
+from services.logging_setup import configure_logging
 from agents.agent import get_model_name, agent_chat
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from services.analysis import (
     finish_analysis,
     try_generate_description,
     try_generate_summary,
-    try_refresh_s2t_transformations,
-    try_sync_file_graph,
 )
 from services.graph_sync import clear_graph_projection
 from storage.database import clear_all_data, get_file, init_db, store_excel_data
 from processing.excel import (
     allowed_file,
     convert_to_serializable,
-    get_preview_headers,
     parse_excel_with_decisions,
 )
 from storage.s2t import (
@@ -27,11 +25,12 @@ from storage.s2t import (
     list_s2t_transformations,
 )
 
+LOG_FILE_PATH = configure_logging()
+logger = logging.getLogger(__name__)
+logger.info("File logging enabled: %s", LOG_FILE_PATH)
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 CHAT_HISTORY_MAX_MESSAGES = 12
 CHAT_HISTORY_MAX_MESSAGE_CHARS = 8000
@@ -47,12 +46,6 @@ PROGRESS_EVENT_FIELDS = (
     "sheet_index",
     "sheet_count",
 )
-HEADER_PREVIEW_OPTIONS = {
-    "1": (0, 1),
-    "2": (1, 1),
-    "3": (0, 2),
-}
-file_bytes_cache: Dict[int, bytes] = {}
 analysis_progress = {}
 analysis_progress_lock = Lock()
 
@@ -211,7 +204,6 @@ def upload_file():
         )
         sheets = parse_excel_with_decisions(
             file_bytes,
-            corrections=None,
             progress_callback=lambda update: _set_analysis_progress(upload_id, **update),
             include_hidden_rows=include_hidden_rows,
         )
@@ -224,8 +216,7 @@ def upload_file():
             message="Сохраняю структуру и данные в SQLite...",
             detail=file.filename,
         )
-        file_id = store_excel_data(file_bytes, file.filename, get_model_name(), sheets)
-        file_bytes_cache[file_id] = file_bytes
+        file_id = store_excel_data(file.filename, get_model_name(), sheets)
         response = finish_analysis(
             file_id,
             file.filename,
@@ -248,95 +239,6 @@ def upload_file():
             detail=str(e),
         )
         return jsonify({'error': f'Failed to parse Excel file: {str(e)}'}), 400
-
-@app.route('/apply_corrections', methods=['POST'])
-def apply_corrections():
-    data = request.get_json()
-    try:
-        file_id = int(data.get("file_id"))
-    except (TypeError, ValueError):
-        file_id = None
-    corrections = data.get("corrections", [])
-    include_hidden_rows = data.get("include_hidden_rows") is True
-
-    if not file_id:
-        return jsonify({"error": "Missing file_id"}), 400
-
-    if file_id not in file_bytes_cache:
-        return jsonify({"error": "File bytes not found. Please re-upload."}), 404
-
-    file_bytes = file_bytes_cache[file_id]
-    file_record = get_file(file_id)
-    if file_record is None:
-        return jsonify({"error": "File not found"}), 404
-    original_filename = file_record["filename"] or "unknown.xlsx"
-
-    skipped_sheets = []
-    header_corrections = {}
-    for corr in corrections:
-        sheet_name = corr["sheet_name"]
-        if corr.get("skipped", False):
-            skipped_sheets.append(sheet_name)
-        else:
-            header_corrections[sheet_name] = {
-                "header_start_row": corr["header_start_row"],
-                "header_rows_count": corr["header_rows_count"]
-            }
-
-    try:
-        sheets = parse_excel_with_decisions(
-            file_bytes,
-            corrections=header_corrections,
-            skip_sheets=skipped_sheets,
-            include_hidden_rows=include_hidden_rows,
-        )
-        store_excel_data(
-            file_bytes,
-            original_filename,
-            get_model_name(),
-            sheets,
-            file_id=file_id,
-        )
-        response = finish_analysis(
-            file_id,
-            original_filename,
-            sheets,
-        )
-        return jsonify(response), 200
-
-    except Exception as e:
-        logger.exception("Error applying corrections")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/preview_headers', methods=['POST'])
-def preview_headers():
-    data = request.get_json()
-    try:
-        file_id = int(data.get("file_id"))
-    except (TypeError, ValueError):
-        file_id = None
-    sheet_name = data.get("sheet_name")
-    option = data.get("option")
-
-    if not file_id or not sheet_name or not option:
-        return jsonify({"error": "Missing parameters"}), 400
-
-    if file_id not in file_bytes_cache:
-        return jsonify({"error": "File not found"}), 404
-
-    file_bytes = file_bytes_cache[file_id]
-
-    if option not in HEADER_PREVIEW_OPTIONS:
-        return jsonify({"error": "Invalid option"}), 400
-    start_row, header_rows = HEADER_PREVIEW_OPTIONS[option]
-
-    headers = get_preview_headers(file_bytes, sheet_name, start_row, header_rows)
-    if headers and isinstance(headers[0], list):
-        flat = [" > ".join(str(p) for p in col if p) for col in headers]
-    else:
-        flat = [str(h) if h is not None else "" for h in headers]
-
-    return jsonify({"headers": flat}), 200
 
 @app.route('/summary/<int:file_id>', methods=['GET'])
 def get_summary(file_id: int):
@@ -392,8 +294,6 @@ def delete_all_storage():
     try:
         graph_deleted = clear_graph_projection()
         sqlite_deleted = clear_all_data()
-        cached_files = len(file_bytes_cache)
-        file_bytes_cache.clear()
         with analysis_progress_lock:
             progress_entries = len(analysis_progress)
             analysis_progress.clear()
@@ -402,36 +302,12 @@ def delete_all_storage():
                 "sqlite_deleted": sqlite_deleted,
                 "neo4j_deleted": graph_deleted,
                 "memory_deleted": {
-                    "file_bytes": cached_files,
                     "progress_entries": progress_entries,
                 },
             }
         ), 200
     except Exception as e:
         logger.exception("Failed to clear all application storage")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/transformations/<int:file_id>/refresh', methods=['POST'])
-def refresh_transformations(file_id: int):
-    try:
-        count, extraction_error, extraction_report = try_refresh_s2t_transformations(file_id)
-        graph_sync_report, graph_sync_error = (
-            try_sync_file_graph(file_id)
-            if extraction_error is None
-            else (None, None)
-        )
-        return jsonify({
-            "file_id": file_id,
-            "count": count,
-            "s2t_transformations_count": count,
-            "s2t_transformations_error": extraction_error,
-            "s2t_extraction_report": extraction_report,
-            "graph_sync_report": graph_sync_report,
-            "graph_sync_error": graph_sync_error,
-        }), 200
-    except Exception as e:
-        logger.exception("Failed to rebuild S2T transformations")
         return jsonify({"error": str(e)}), 500
 
 
@@ -462,6 +338,27 @@ def download_sql_export(filename):
     )
 
 
+@app.route('/exports/sql-lineage/<path:filename>', methods=['GET'])
+def show_sql_lineage_export(filename):
+    from agents.tools.sql_lineage import SQL_LINEAGE_EXPORT_DIR
+
+    return send_from_directory(
+        str(SQL_LINEAGE_EXPORT_DIR),
+        filename,
+        mimetype="text/html",
+    )
+
+
+@app.route('/exports/s2t-graphs/<path:filename>', methods=['GET'])
+def show_s2t_table_graph_export(filename):
+    from agents.tools.s2t_graph import S2T_TABLE_GRAPH_EXPORT_DIR
+
+    return send_from_directory(
+        str(S2T_TABLE_GRAPH_EXPORT_DIR),
+        filename,
+    )
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     """Natural language query endpoint."""
@@ -482,6 +379,13 @@ def chat():
                 raise ValueError("file_id must be a positive integer")
         session_id = _normalize_chat_session_id(data.get("session_id"))
         history = _normalize_chat_history(data.get("history"))
+        logger.info(
+            "Chat request session_id=%s file_id=%s history_messages=%s query=%s",
+            session_id,
+            file_id,
+            len(history),
+            query.strip()[:1000],
+        )
         agent_kwargs: Dict[str, Any] = {}
         if file_id:
             agent_kwargs["file_id"] = file_id

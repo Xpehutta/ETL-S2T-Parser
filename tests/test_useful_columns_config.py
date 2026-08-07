@@ -46,6 +46,31 @@ def test_usefull_col_extraction_config_defines_table_catalog_targets(target_name
     }
 
 
+@pytest.mark.parametrize(
+    "target_name, fields",
+    [
+        ("additional_objects", ["name", "sql"]),
+        (
+            "pxf_to_a",
+            [
+                "external_a_table",
+                "materialized_storage",
+                "replica_table",
+                "sod",
+            ],
+        ),
+    ],
+)
+def test_usefull_col_extraction_config_defines_structured_metadata_targets(
+    target_name,
+    fields,
+):
+    assert get_usefull_col_extraction_target(target_name) == {
+        "sheet_group": target_name,
+        "fields": fields,
+    }
+
+
 def test_usefull_col_extraction_config_validates_fields_against_sheet_group_mapping(
     tmp_path, monkeypatch
 ):
@@ -200,3 +225,21 @@ def test_usefull_col_extraction_config_rejects_old_fields_object(tmp_path):
 
     with pytest.raises(ValueError, match="must define fields as a list"):
         get_usefull_col_extraction_target("s2t_transformations", path=str(config_path))
+
+
+def test_usefull_col_extraction_config_requires_explicit_sheet_group(tmp_path):
+    config_path = tmp_path / "usefull_col_extraction.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "source_tables": {
+                    "fields": ["table_name", "description"],
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must define sheet_group"):
+        get_usefull_col_extraction_target("source_tables", path=str(config_path))

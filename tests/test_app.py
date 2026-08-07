@@ -1,8 +1,69 @@
+import logging
+
 import pytest
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from storage.database import init_db, get_db_connection
 import io
+
+
+def test_console_streams_are_reconfigured_to_utf8():
+    from services.logging_setup import _configure_utf8_console_streams
+
+    class FakeStream:
+        def __init__(self):
+            self.calls = []
+
+        def reconfigure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    stdout = FakeStream()
+    stderr = FakeStream()
+    _configure_utf8_console_streams((stdout, stderr, object()))
+
+    assert stdout.calls == [
+        {"encoding": "utf-8", "errors": "backslashreplace"}
+    ]
+    assert stderr.calls == [
+        {"encoding": "utf-8", "errors": "backslashreplace"}
+    ]
+
+
+def test_file_logging_is_utf8_rotating_and_idempotent(tmp_path):
+    from services.logging_setup import configure_logging
+
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    original_handlers = list(root_logger.handlers)
+    log_path = tmp_path / "agent.log"
+    try:
+        assert configure_logging(
+            log_path,
+            level="INFO",
+            max_bytes=1024,
+            backup_count=2,
+        ) == log_path.resolve()
+        configure_logging(
+            log_path,
+            level="INFO",
+            max_bytes=1024,
+            backup_count=2,
+        )
+        handlers = [
+            handler
+            for handler in root_logger.handlers
+            if getattr(handler, "_etls2t_log_path", None) == str(log_path.resolve())
+        ]
+        assert len(handlers) == 1
+
+        logging.getLogger("tests.file_logging").info("Проверка UTF-8 лога")
+        handlers[0].flush()
+        assert "Проверка UTF-8 лога" in log_path.read_text(encoding="utf-8")
+    finally:
+        for handler in list(root_logger.handlers):
+            if handler not in original_handlers:
+                root_logger.removeHandler(handler)
+                handler.close()
+        root_logger.setLevel(original_level)
 
 
 @pytest.fixture(autouse=True)
@@ -10,14 +71,8 @@ def mock_graph_sync():
     with patch(
         "services.analysis.try_sync_file_graph",
         side_effect=lambda file_id: ({"file_id": int(file_id)}, None),
-    ) as analysis_sync, patch(
-        "app.try_sync_file_graph",
-        side_effect=lambda file_id: ({"file_id": int(file_id)}, None),
-    ) as route_sync:
-        yield {
-            "analysis": analysis_sync,
-            "route": route_sync,
-        }
+    ) as analysis_sync:
+        yield {"analysis": analysis_sync}
 
 
 # Override DB_PATH for the test session (will be set per test)
@@ -28,11 +83,9 @@ def use_temp_db(tmp_path):
     original_path = db_storage.DB_PATH
     db_storage.DB_PATH = str(tmp_path / "app_test.db")
     init_db()
-    app_module.file_bytes_cache.clear()
     with app_module.analysis_progress_lock:
         app_module.analysis_progress.clear()
     yield
-    app_module.file_bytes_cache.clear()
     with app_module.analysis_progress_lock:
         app_module.analysis_progress.clear()
     db_storage.DB_PATH = original_path
@@ -49,7 +102,6 @@ def test_index(client):
     assert 'id="includeHiddenRows"' in body
     assert "Учитывать скрытые строки" in body
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
-    assert "include_hidden_rows: includeHiddenRows.checked" in body
 
 
 def test_chat_app_single_user_no_session_cookie(client):
@@ -72,6 +124,12 @@ def test_chat_app_has_loading_indicators(client):
     assert "startProgressPolling" in body
     assert "/analysis_progress/" in body
     assert "\\/exports\\/sql\\/" in body
+    assert "sql-lineage|s2t-graphs" in body
+    assert "sql-lineage-visualization" in body
+    assert 'sandbox="allow-scripts"' in body
+    assert "renderCompactTableBlock" in body
+    assert "const matrix = JSON.parse(inner)" in body
+    assert "return tableHtml(matrix[0], matrix.slice(1))" in body
     assert "window.sessionStorage" in body
     assert "clearChatHistoryBtn" in body
     assert "sessionStorage.getItem(CHAT_SESSION_ID_STORAGE_KEY)" in body
@@ -86,18 +144,59 @@ def test_chat_app_has_loading_indicators(client):
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
 
 
+def test_sql_lineage_export_route(client, tmp_path, monkeypatch):
+    import agents.tools.sql_lineage as sql_lineage_module
+
+    monkeypatch.setattr(sql_lineage_module, "SQL_LINEAGE_EXPORT_DIR", tmp_path)
+    (tmp_path / "sql_lineage_test.html").write_text(
+        "<!doctype html><title>Graph</title>",
+        encoding="utf-8",
+    )
+
+    response = client.get("/exports/sql-lineage/sql_lineage_test.html")
+
+    assert response.status_code == 200
+    assert response.mimetype == "text/html"
+    assert b"<title>Graph</title>" in response.data
+
+
+def test_s2t_table_graph_export_route(client, tmp_path, monkeypatch):
+    import agents.tools.s2t_graph as graph_module
+
+    monkeypatch.setattr(graph_module, "S2T_TABLE_GRAPH_EXPORT_DIR", tmp_path)
+    (tmp_path / "s2t_table_graph_test.html").write_text(
+        "<!doctype html><title>S2T Graph</title>",
+        encoding="utf-8",
+    )
+    (tmp_path / "s2t_table_graph_test.json").write_text(
+        '{"edges": []}',
+        encoding="utf-8",
+    )
+
+    html_response = client.get(
+        "/exports/s2t-graphs/s2t_table_graph_test.html"
+    )
+    json_response = client.get(
+        "/exports/s2t-graphs/s2t_table_graph_test.json"
+    )
+
+    assert html_response.status_code == 200
+    assert html_response.mimetype == "text/html"
+    assert b"<title>S2T Graph</title>" in html_response.data
+    assert json_response.status_code == 200
+    assert json_response.mimetype == "application/json"
+
+
 @patch('app.parse_excel_with_decisions')
 @patch('app.store_excel_data')
 @patch('services.analysis.summarize_file')
 @patch('services.analysis.try_generate_description')
-@patch('services.analysis.update_file_result_json')
-def test_upload(mock_update_json, mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings, mock_graph_sync):
+def test_upload(mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings, mock_graph_sync):
     mock_parse.return_value = [{
         "sheet_name": "Sheet1",
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
         "columns": ["Name"],
-        "preview_rows": [],
         "data_rows": [],
     }]
     mock_store.return_value = 101
@@ -132,14 +231,12 @@ def test_upload(mock_update_json, mock_generate_description, mock_summarize, moc
 @patch('app.store_excel_data')
 @patch('services.analysis.summarize_file')
 @patch('services.analysis.try_generate_description')
-@patch('services.analysis.update_file_result_json')
-def test_upload_records_analysis_progress(mock_update_json, mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings):
+def test_upload_records_analysis_progress(mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings):
     mock_parse.return_value = [{
         "sheet_name": "Sheet1",
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
         "columns": ["Name"],
-        "preview_rows": [],
         "data_rows": [],
     }]
     mock_store.return_value = 102
@@ -176,14 +273,12 @@ def test_analysis_progress_missing(client):
 @patch('app.store_excel_data')
 @patch('services.analysis.summarize_file')
 @patch('services.analysis.try_generate_description')
-@patch('services.analysis.update_file_result_json')
-def test_upload_returns_summary_error(mock_update_json, mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings):
+def test_upload_returns_summary_error(mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings):
     mock_parse.return_value = [{
         "sheet_name": "Sheet1",
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
         "columns": ["Name"],
-        "preview_rows": [],
         "data_rows": [],
     }]
     mock_store.return_value = 103
@@ -201,78 +296,6 @@ def test_upload_returns_summary_error(mock_update_json, mock_generate_descriptio
     assert "getaddrinfo failed" in json_data['description_error']
     assert json_data['s2t_transformations_count'] == 0
     assert json_data['s2t_transformations_error'] is None
-
-@patch('app.parse_excel_with_decisions')
-@patch('app.store_excel_data')
-@patch('services.analysis.summarize_file')
-@patch('services.analysis.try_generate_description')
-@patch('services.analysis.update_file_result_json')
-def test_apply_corrections(mock_update_json, mock_generate_description, mock_summarize, mock_store, mock_parse, client, sample_excel_bytes, mock_embeddings):
-    import app
-    # Store file bytes in cache
-    app.file_bytes_cache[104] = sample_excel_bytes
-    mock_parse.return_value = [{
-        "sheet_name": "Sheet1",
-        "skip_reason": None,
-        "header": {"start_row": 0, "row_count": 1, "nested": False},
-        "columns": ["Name"],
-        "preview_rows": [],
-        "data_rows": [],
-    }]
-    mock_summarize.return_value = "Updated summary"
-    mock_generate_description.return_value = ("Updated description", None)
-    # Insert a file record manually with the same numeric ID.
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # Use INSERT OR IGNORE to avoid duplicate
-    cursor.execute("INSERT OR IGNORE INTO files (file_id, filename, upload_time, model_used) VALUES (?, ?, ?, ?)",
-                   (104, "test.xlsx", "2025-01-01", "model"))
-    conn.commit()
-    conn.close()
-    payload = {
-        "file_id": 104,
-        "include_hidden_rows": True,
-        "corrections": [
-            {"sheet_name": "Sheet1", "skipped": False, "header_start_row": 0, "header_rows_count": 1}
-        ]
-    }
-    response = client.post('/apply_corrections', json=payload)
-    assert response.status_code == 200
-    data = response.get_json()
-    assert data['filename'] == 'test.xlsx'
-    assert data['summary_error'] is None
-    assert data['description'] == 'Updated description'
-    assert data['description_error'] is None
-    assert data['s2t_transformations_count'] == 0
-    assert mock_parse.call_args.kwargs["include_hidden_rows"] is True
-
-def test_preview_headers(client, sample_excel_bytes):
-    import app
-    app.file_bytes_cache[105] = sample_excel_bytes
-    payload = {
-        "file_id": 105,
-        "sheet_name": "Sheet1",
-        "option": "1"
-    }
-    response = client.post('/preview_headers', json=payload)
-    assert response.status_code == 200
-    data = response.get_json()
-    assert 'headers' in data
-    assert isinstance(data['headers'], list)
-
-
-def test_preview_headers_rejects_unknown_option(client, sample_excel_bytes):
-    import app
-
-    app.file_bytes_cache[105] = sample_excel_bytes
-    response = client.post(
-        "/preview_headers",
-        json={"file_id": 105, "sheet_name": "Sheet1", "option": "unknown"},
-    )
-
-    assert response.status_code == 400
-    assert response.get_json() == {"error": "Invalid option"}
-
 
 @patch("app.agent_chat")
 def test_chat_success(mock_agent, client):
@@ -426,14 +449,13 @@ def test_get_transformations(client):
     cursor.execute(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table, target_field,
-         source_table, source_field, transformation_rule)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, file_id, sheet_name, row_num, target_table, target_field,
+         source_table, source_field, transformation_rule, source_layer, target_layer)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             301,
             203,
-            204,
             "S2T",
             1,
             "t_customer",
@@ -441,6 +463,8 @@ def test_get_transformations(client):
             "src_customer",
             "id",
             "direct",
+            "B",
+            "T",
         ),
     )
     conn.commit()
@@ -455,6 +479,8 @@ def test_get_transformations(client):
     assert body["rows"][0]["target_field"] == "customer_id"
     assert body["rows"][0]["source_table"] == "src_customer"
     assert body["rows"][0]["source_field"] == "id"
+    assert body["rows"][0]["source_layer"] == "B"
+    assert body["rows"][0]["target_layer"] == "T"
     assert body["rows"][0]["transformation_rule"] == "direct"
     assert "target_type" not in body["rows"][0]
     assert "target_table_description" not in body["rows"][0]
@@ -467,13 +493,13 @@ def test_get_transformations_filter(client):
     cursor.executemany(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table, target_field,
+        (id, file_id, sheet_name, row_num, target_table, target_field,
          source_table, source_field)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
-            (302, 205, 206, "S2T", 1, "t_customer", "customer_id", "src_customer", "id"),
-            (303, 205, 206, "S2T", 2, "t_order", "order_id", "src_order", "id"),
+            (302, 205, "S2T", 1, "t_customer", "customer_id", "src_customer", "id"),
+            (303, 205, "S2T", 2, "t_order", "order_id", "src_order", "id"),
         ],
     )
     conn.commit()
@@ -501,13 +527,13 @@ def test_delete_transformations(client):
     cursor.executemany(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (id, file_id, sheet_name, row_num, target_table)
+        VALUES (?, ?, ?, ?, ?)
         """,
         [
-            (304, 207, 209, "S2T", 1, "t1"),
-            (305, 207, 209, "S2T", 2, "t2"),
-            (306, 208, 210, "S2T", 1, "t3"),
+            (304, 207, "S2T", 1, "t1"),
+            (305, 207, "S2T", 2, "t2"),
+            (306, 208, "S2T", 1, "t3"),
         ],
     )
     conn.commit()
@@ -543,42 +569,55 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
     )
     cursor.execute(
         """
+        INSERT INTO additional_objects
+        (id, file_id, sheet_name, row_num, name, sql)
+        VALUES (407, 401, 'Additional objects', 0, 'view_a', 'SELECT 1')
+        """
+    )
+    cursor.execute(
+        """
+        INSERT INTO pxf_to_a
+        (id, file_id, sheet_name, row_num, external_a_table)
+        VALUES (408, 401, 'pxf_to_a', 0, 'ext_a')
+        """
+    )
+    cursor.execute(
+        """
         INSERT INTO file_sheet_headers
-        (sheet_id, file_id, sheet_name, skipped, columns_count)
-        VALUES (402, 401, 'S2T', 0, 1)
+        (file_id, sheet_name, skipped, columns_count)
+        VALUES (401, 'S2T', 0, 1)
         """
     )
     cursor.execute(
         """
         INSERT INTO data
-        (id, sheet_id, table_name, row_num, column_id, value)
-        VALUES (403, 402, 'S2T', 0, 1, 'value')
+        (id, file_id, table_name, row_num, column_id, value)
+        VALUES (403, 401, 'S2T', 0, 1, 'value')
         """
     )
     cursor.execute(
         """
         INSERT INTO source_tables
-        (id, file_id, sheet_id, sheet_name, row_num, table_name)
-        VALUES (404, 401, 402, 'Source', 0, 'src')
+        (id, file_id, sheet_name, row_num, table_name)
+        VALUES (404, 401, 'Source', 0, 'src')
         """
     )
     cursor.execute(
         """
         INSERT INTO target_tables
-        (id, file_id, sheet_id, sheet_name, row_num, table_name)
-        VALUES (405, 401, 402, 'Target', 0, 'tgt')
+        (id, file_id, sheet_name, row_num, table_name)
+        VALUES (405, 401, 'Target', 0, 'tgt')
         """
     )
     cursor.execute(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table)
-        VALUES (406, 401, 402, 'S2T', 0, 'tgt')
+        (id, file_id, sheet_name, row_num, target_table)
+        VALUES (406, 401, 'S2T', 0, 'tgt')
         """
     )
     conn.commit()
     conn.close()
-    app_module.file_bytes_cache[401] = b"xlsx"
     with app_module.analysis_progress_lock:
         app_module.analysis_progress["upload-401"] = {"status": "done"}
 
@@ -591,12 +630,13 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers": 1,
             "source_tables": 1,
             "target_tables": 1,
+            "additional_objects": 1,
+            "pxf_to_a": 1,
             "s2t_transformations": 1,
             "data": 1,
         },
         "neo4j_deleted": {"nodes": 4},
         "memory_deleted": {
-            "file_bytes": 1,
             "progress_entries": 1,
         },
     }
@@ -608,6 +648,8 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers",
             "source_tables",
             "target_tables",
+            "additional_objects",
+            "pxf_to_a",
             "s2t_transformations",
             "data",
         ):
@@ -616,7 +658,6 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             ).fetchone()[0] == 0
     finally:
         conn.close()
-    assert app_module.file_bytes_cache == {}
     with app_module.analysis_progress_lock:
         assert app_module.analysis_progress == {}
 
@@ -650,25 +691,10 @@ def test_delete_all_storage_keeps_sqlite_when_neo4j_fails(
         conn.close()
 
 
-@patch("app.try_refresh_s2t_transformations")
-def test_refresh_transformations_endpoint(mock_refresh, client, mock_graph_sync):
-    report = {"status": "ok", "verification": {"count": 12}}
-    mock_refresh.return_value = (12, None, report)
-
+def test_refresh_transformations_endpoint_is_removed(client):
     response = client.post("/transformations/211/refresh")
 
-    assert response.status_code == 200
-    assert response.get_json() == {
-        "file_id": 211,
-        "count": 12,
-        "s2t_transformations_count": 12,
-        "s2t_transformations_error": None,
-        "s2t_extraction_report": report,
-        "graph_sync_report": {"file_id": 211},
-        "graph_sync_error": None,
-    }
-    mock_refresh.assert_called_once_with(211)
-    mock_graph_sync["route"].assert_called_once_with(211)
+    assert response.status_code == 404
 
 
 def test_classify_sheet_groups_endpoint_without_llm(client):
@@ -681,11 +707,11 @@ def test_classify_sheet_groups_endpoint_without_llm(client):
     cursor.execute(
         """
         INSERT INTO file_sheet_headers
-        (file_id, sheet_id, sheet_name, skipped, header_start_row,
-         header_rows_count, nested_structure, columns_count, headers_json, headers_flat)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (file_id, sheet_name, skipped, header_start_row,
+         header_rows_count, nested_structure, columns_count, headers_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (212, 213, "S2T", 0, 0, 1, 0, 0, "[]", ""),
+        (212, "S2T", 0, 0, 1, 0, 0, "[]"),
     )
     conn.commit()
     conn.close()

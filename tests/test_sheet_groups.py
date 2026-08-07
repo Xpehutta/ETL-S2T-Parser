@@ -24,6 +24,7 @@ def test_sheet_group_aliases_include_source_tables_and_s2t():
 
 def test_group_for_sheet_resolves_common_aliases():
     assert group_for_sheet("Additional_Objects") == "additional_objects"
+    assert group_for_sheet("PXF -> A") == "pxf_to_a"
     assert group_for_sheet("История изменений документа") == "change_log"
     assert group_for_sheet("Target Colums") == "target_columns"
 
@@ -36,12 +37,13 @@ def test_find_sheet_group_alias_returns_matched_alias():
     assert match["alias"] == "source_tables"
 
 
-def test_layer_transition_names_are_not_sheet_groups():
+def test_unconfigured_layer_transition_names_are_not_sheet_groups():
     groups = load_sheet_groups()
 
-    for group in ("pxf_to_a", "a_to_b", "b_to_s", "a_to_b_to_s"):
+    assert "pxf_to_a" in groups
+    for group in ("a_to_b", "b_to_s", "a_to_b_to_s"):
         assert group not in groups
-    for sheet_name in ("PXF->A", "a2b_columns", "b2s", "A=B-S"):
+    for sheet_name in ("a2b_columns", "b2s", "A=B-S"):
         assert group_for_sheet(sheet_name) is None
 
 def test_sheet_group_aliases_do_not_collide():

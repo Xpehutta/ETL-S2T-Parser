@@ -12,7 +12,11 @@ from agents.sheet_group_classifier import (
 def test_sheet_group_prompt_is_russian():
     prompt = _sheet_group_prompt({"aliases_json": "[]", "sheet_json": "{}"})
 
-    assert prompt.startswith("Сопоставь имя одного листа Excel")
+    assert prompt.startswith("Определи, является ли имя одного листа Excel")
+    assert "не семантическая классификация" in prompt
+    assert "само по себе никогда не является основанием" in prompt
+    assert "уверенность ниже high" in prompt
+    assert "без изменения смысла, типа объекта, направления и уровня" in prompt
     assert "You resolve one Excel sheet" not in prompt
 
 

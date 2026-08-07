@@ -6,6 +6,7 @@ import pytest
 import config.column_mapping as column_mapping_config
 import storage.database as db_storage
 import config.sheet_groups as sheet_groups
+from config.table_layers import resolve_sheet_layers
 from sheet_skills.s2t import (
     S2T_FIELDS,
     S2TExtractionError,
@@ -17,11 +18,17 @@ from sheet_skills.s2t import (
     verify_s2t_transformations,
     write_s2t_transformations_from_plan,
 )
+from agents.sheet_group_classifier import classify_file_sheet_groups
+from sheet_skills.additional_objects import (
+    _parse_object,
+    extract_additional_object_transformations,
+)
+from sheet_skills.structured_metadata import extract_structured_metadata
+from sheet_skills.table_catalog import extract_table_catalogs
 from storage.database import get_db_connection, init_db, store_excel_data
 from storage.s2t import (
     clear_s2t_transformations,
     list_s2t_transformations,
-    refresh_s2t_transformations,
 )
 
 
@@ -50,6 +57,16 @@ def s2t_db(tmp_path, monkeypatch, mock_embeddings):
                     "table_name": ["Table Name"],
                     "description": ["Table Entity Definition"],
                 },
+                "additional_objects": {
+                    "name": ["name", "Название объекта", "Имя объекта для S2T"],
+                    "sql": ["sql", "SQL"],
+                },
+                "pxf_to_a": {
+                    "external_a_table": ["Название внешней A-таблицы"],
+                    "materialized_storage": ["Название таблицы в Hadoop"],
+                    "replica_table": ["Название таблицы реплики"],
+                    "sod": ["СОД"],
+                },
             },
             ensure_ascii=False,
         ),
@@ -77,7 +94,6 @@ def _store_s2t(columns, rows, sheet_name="S2T"):
         }
     ]
     return store_excel_data(
-        b"s2t-agent-bytes",
         "s2t_agent.xlsx",
         "model",
         sheets,
@@ -102,10 +118,42 @@ def _store_table_catalogs(source_rows, target_rows):
         },
     ]
     return store_excel_data(
-        b"table-catalog-bytes",
         "table_catalogs.xlsx",
         "model",
         sheets,
+    )
+
+
+def _store_structured_metadata():
+    return store_excel_data(
+        "structured_metadata.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "Additional objects",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["Имя объекта для S2T", "SQL"],
+                "data_rows": [
+                    ["view_orders", "SELECT * FROM raw.orders"],
+                    ["view_orders", "SELECT * FROM raw.orders"],
+                ],
+            },
+            {
+                "sheet_name": "pxf_to_a",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Название внешней A-таблицы",
+                    "Название таблицы в Hadoop",
+                    "Название таблицы реплики",
+                    "СОД",
+                ],
+                "data_rows": [
+                    ["ext_orders", "mat_orders", "replica_orders", "SOD-1"],
+                ],
+            },
+        ],
     )
 
 
@@ -127,6 +175,20 @@ def _evidence(field, column_id, method="llm", matched_header_candidate=None):
             "method": method,
             "reason": "test evidence",
         }
+    }
+
+
+def test_table_layer_rules_use_sheet_group_instead_of_table_names():
+    expected = {"source_layer": "B", "target_layer": "T"}
+    assert resolve_sheet_layers("S2T") == expected
+    assert resolve_sheet_layers("SourceToTarget") == expected
+    assert resolve_sheet_layers("Additional objects") == {
+        "source_layer": None,
+        "target_layer": "B",
+    }
+    assert resolve_sheet_layers("Unconfigured sheet") == {
+        "source_layer": None,
+        "target_layer": None,
     }
 
 
@@ -271,7 +333,46 @@ def test_s2t_subagent_exact_multilevel_headers_write_minimal_rows(s2t_db):
         "source_table": "src_customer",
         "source_field": "id",
         "transformation_rule": "cast(id as uuid)",
+        "source_layer": "B",
+        "target_layer": "T",
     }
+
+
+def test_s2t_upload_pipeline_assigns_source_and_target_layers(s2t_db):
+    file_id = _store_s2t(
+        [
+            "Target Table",
+            "Target Column",
+            "Source Table",
+            "Source Column",
+            "SQL Transform",
+        ],
+        [
+            [
+                "target_without_layer_prefix",
+                "customer_id",
+                "source_without_layer_prefix",
+                "id",
+                "copy",
+            ],
+            [
+                "another_target",
+                "agreement_id",
+                "another_source, second_source",
+                "id",
+                "copy",
+            ],
+        ],
+    )
+
+    report = run_s2t_extraction_subagent(file_id)
+
+    assert report["written"] == 2
+    rows = list_s2t_transformations(file_id)["rows"]
+    assert [(row["source_layer"], row["target_layer"]) for row in rows] == [
+        ("B", "T"),
+        ("B", "T"),
+    ]
 
 
 def test_s2t_subagent_uses_deterministic_fuzzy_header_mapping(s2t_db):
@@ -315,6 +416,8 @@ def test_s2t_subagent_uses_deterministic_fuzzy_header_mapping(s2t_db):
         "source_table": "src_fuzzy",
         "source_field": "id",
         "transformation_rule": "trim(id)",
+        "source_layer": "B",
+        "target_layer": "T",
     }
 
 
@@ -371,57 +474,7 @@ def test_s2t_subagent_uses_llm_mapping_for_unmatched_multilevel_headers(s2t_db):
     assert verify_s2t_transformations(file_id)["rows"][0]["target_table"] == "t_order"
 
 
-def test_s2t_subagent_returns_rejection_reason_to_llm_and_accepts_correction(s2t_db):
-    file_id = _store_s2t(
-        [
-            ["Receiver", "Physical destination"],
-            ["Receiver", "Destination attribute"],
-            ["Provider", "Physical source"],
-            ["Provider", "Source attribute"],
-            ["Rule", "Expression"],
-        ],
-        [["t_retry", "retry_id", "src_retry", "id", "direct"]],
-    )
-    inspection = _inspect_candidate_sheets(file_id)
-    sheet = inspection["sheets"][0]
-    good_roles = _column_roles_for_sheet(
-        sheet,
-        {
-            "target_table": "Receiver > Physical destination",
-            "target_field": "Receiver > Destination attribute",
-            "source_table": "Provider > Physical source",
-            "source_field": "Provider > Source attribute",
-            "transformation_rule": "Rule > Expression",
-        },
-    )
-    bad_roles = json.loads(json.dumps(good_roles, ensure_ascii=False))
-    bad_roles["column_roles"][0]["mapping_field"] = "transformation_rule"
-
-    with patch(
-        "sheet_skills.s2t._invoke_llm_plain_text",
-        side_effect=[
-            json.dumps(bad_roles, ensure_ascii=False),
-            json.dumps(good_roles, ensure_ascii=False),
-        ],
-    ) as mock_llm:
-        report = run_s2t_extraction_subagent(file_id)
-
-    assert mock_llm.call_count == 2
-    correction_prompt = mock_llm.call_args_list[1].args[0]
-    assert "Предыдущий ответ отклонён валидатором" in correction_prompt
-    assert "mapping_field transformation_rule is assigned to multiple columns" in correction_prompt
-    assert str(sheet["sheet_id"]) not in correction_prompt
-    assert str(file_id) not in correction_prompt
-    assert report["attempts"] == 2
-    assert report["sheets"][0] == {
-        "sheet_name": "S2T",
-        "method": "llm",
-        "attempts": 2,
-    }
-    assert report["verification"]["count"] == 1
-
-
-def test_s2t_subagent_bad_json_makes_correction_request_and_does_not_write(s2t_db):
+def test_s2t_subagent_bad_json_fails_after_one_request_and_does_not_write(s2t_db):
     file_id = _store_s2t(
         [["Receiver", "Physical destination"], ["Receiver", "Destination attribute"]],
         [["t_retry", "retry_id"]],
@@ -433,12 +486,12 @@ def test_s2t_subagent_bad_json_makes_correction_request_and_does_not_write(s2t_d
         with pytest.raises(S2TExtractionError) as exc:
             run_s2t_extraction_subagent(file_id)
 
-    assert mock_llm.call_count == 2
-    assert exc.value.report["attempts"] == 2
+    assert mock_llm.call_count == 1
+    assert exc.value.report["attempts"] == 1
     assert verify_s2t_transformations(file_id)["count"] == 0
 
 
-def test_s2t_subagent_incomplete_llm_response_makes_correction_request_and_does_not_write(s2t_db):
+def test_s2t_subagent_incomplete_llm_response_fails_after_one_request(s2t_db):
     file_id = _store_s2t(
         ["Target Table", "Target Column", "Ignored"],
         [["t_retry_columns", "retry_id", "not_s2t"]],
@@ -462,8 +515,8 @@ def test_s2t_subagent_incomplete_llm_response_makes_correction_request_and_does_
         with pytest.raises(S2TExtractionError) as exc:
             run_s2t_extraction_subagent(file_id)
 
-    assert mock_llm.call_count == 2
-    assert exc.value.report["attempts"] == 2
+    assert mock_llm.call_count == 1
+    assert exc.value.report["attempts"] == 1
     assert verify_s2t_transformations(file_id)["count"] == 0
 
 
@@ -485,7 +538,6 @@ def test_s2t_subagent_calls_llm_once_per_s2t_sheet(s2t_db):
         },
     ]
     file_id = store_excel_data(
-        b"s2t-two-sheets",
         "two_s2t_sheets.xlsx",
         "model",
         sheets,
@@ -531,7 +583,6 @@ def test_s2t_subagent_calls_llm_only_for_incomplete_s2t_sheet(s2t_db):
         },
     ]
     file_id = store_excel_data(
-        b"s2t-mixed-complete-incomplete",
         "mixed_s2t_sheets.xlsx",
         "model",
         sheets,
@@ -575,7 +626,7 @@ def test_s2t_subagent_bad_response_returns_error_without_fallback_write(s2t_db):
             run_s2t_extraction_subagent(file_id)
 
     assert exc.value.report["status"] == "error"
-    assert exc.value.report["attempts"] == 2
+    assert exc.value.report["attempts"] == 1
     assert verify_s2t_transformations(file_id)["count"] == 0
 
 
@@ -592,11 +643,11 @@ def test_write_tool_rejects_duplicate_column_field_and_keeps_existing_rows(s2t_d
         },
     )
     with _patch_llm_roles(column_roles):
-        assert refresh_s2t_transformations(file_id) == 1
+        assert run_s2t_extraction_subagent(file_id)["verification"]["count"] == 1
     sheet, column_ids = _column_ids(file_id)
     duplicate_column_id = column_ids["Target > Target Table"]
     bad_mapping = {
-        "sheet_id": sheet["sheet_id"],
+        "sheet_name": sheet["sheet_name"],
         "field_column_ids": {
             "target_table": duplicate_column_id,
             "target_field": duplicate_column_id,
@@ -622,7 +673,7 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     target_table_id = column_ids["Target Table"]
     target_field_id = column_ids["Target Column"]
     mapping = {
-        "sheet_id": sheet["sheet_id"],
+        "sheet_name": sheet["sheet_name"],
         "field_column_ids": {
             "target_table": target_table_id,
             "target_field": target_field_id,
@@ -636,8 +687,8 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     conn.execute(
         """
         INSERT INTO s2t_transformations
-        (file_id, sheet_id, sheet_name, row_num, target_table, target_field)
-        VALUES (777, 777, 'old', 7, 'old_target', 'old_column')
+        (file_id, sheet_name, row_num, target_table, target_field)
+        VALUES (777, 'old', 7, 'old_target', 'old_column')
         """
     )
     conn.commit()
@@ -650,7 +701,6 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     assert exc.value.report["validation_errors"] == [
         {
             "file_id": file_id,
-            "sheet_id": sheet["sheet_id"],
             "sheet_name": "S2T",
             "row_num": 0,
             "field": "target_table",
@@ -665,7 +715,7 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     assert dict(old_row) == {"target_table": "old_target", "target_field": "old_column"}
 
 
-def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplicates(s2t_db):
+def test_s2t_extraction_appends_without_deleting_stored_rows(s2t_db):
     file_id = _store_s2t(
         ["Target Table", "Target Column", "Source Table", "Source Column", "SQL Transform"],
         [
@@ -678,16 +728,16 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
     conn.execute(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table, target_field)
-        VALUES (999, ?, 999, 'S2T', 99, 'old', 'old')
+        (id, file_id, sheet_name, row_num, target_table, target_field)
+        VALUES (999, ?, 'S2T', 99, 'old', 'old')
         """,
         (file_id,),
     )
     conn.execute(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table, target_field)
-        VALUES (1000, 777, 777, 'S2T', 7, 'foreign', 'foreign')
+        (id, file_id, sheet_name, row_num, target_table, target_field)
+        VALUES (1000, 777, 'S2T', 7, 'foreign', 'foreign')
         """
     )
     conn.commit()
@@ -704,8 +754,10 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
         },
     )
     with _patch_llm_roles(column_roles):
-        assert refresh_s2t_transformations(file_id) == 3
+        report = run_s2t_extraction_subagent(file_id)
 
+    assert report["written"] == 3
+    assert report["verification"]["count"] == 4
     rows = verify_s2t_transformations(file_id, limit=10)["rows"]
     assert rows == [
         {
@@ -715,6 +767,8 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
             "source_table": "src",
             "source_field": "src_c",
             "transformation_rule": "copy",
+            "source_layer": "B",
+            "target_layer": "T",
         },
         {
             "row_num": 1,
@@ -723,6 +777,8 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
             "source_table": "src",
             "source_field": "src_c",
             "transformation_rule": "copy",
+            "source_layer": "B",
+            "target_layer": "T",
         },
         {
             "row_num": 2,
@@ -731,6 +787,18 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
             "source_table": "src",
             "source_field": "src_c2",
             "transformation_rule": "copy",
+            "source_layer": "B",
+            "target_layer": "T",
+        },
+        {
+            "row_num": 99,
+            "target_table": "old",
+            "target_field": "old",
+            "source_table": None,
+            "source_field": None,
+            "transformation_rule": None,
+            "source_layer": None,
+            "target_layer": None,
         },
     ]
 
@@ -739,7 +807,7 @@ def test_refresh_s2t_transformations_rebuilds_global_table_and_preserves_duplica
         "SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = 777"
     ).fetchone()["n"]
     conn.close()
-    assert foreign_rows == 0
+    assert foreign_rows == 1
 
 
 def test_table_catalog_extraction_writes_name_description_and_preserves_duplicates(s2t_db):
@@ -753,13 +821,23 @@ def test_table_catalog_extraction_writes_name_description_and_preserves_duplicat
             ["t_same", "Same description"],
         ],
     )
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO s2t_transformations
+        (file_id, sheet_name, row_num, target_table, target_field)
+        VALUES (777, 'existing', 7, 'existing_target', 'existing_field')
+        """
+    )
+    conn.commit()
+    conn.close()
 
-    report = run_s2t_extraction_subagent(file_id)
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    report = extract_table_catalogs(file_id, analysis)
 
     assert report["status"] == "ok"
-    assert report["verification"]["count"] == 0
-    assert report["table_catalogs"]["targets"]["source_tables"]["count"] == 2
-    assert report["table_catalogs"]["targets"]["target_tables"]["count"] == 2
+    assert report["targets"]["source_tables"]["count"] == 2
+    assert report["targets"]["target_tables"]["count"] == 2
 
     conn = get_db_connection()
     source_rows = [
@@ -786,8 +864,12 @@ def test_table_catalog_extraction_writes_name_description_and_preserves_duplicat
             (file_id,),
         ).fetchall()
     ]
+    existing_s2t_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = 777"
+    ).fetchone()["n"]
     conn.close()
 
+    assert existing_s2t_rows == 1
     assert source_rows == [
         {
             "row_num": 0,
@@ -818,18 +900,664 @@ def test_table_catalog_extraction_writes_name_description_and_preserves_duplicat
     ]
 
 
+def test_structured_metadata_extraction_writes_configured_fields_and_duplicates(
+    s2t_db,
+):
+    file_id = _store_structured_metadata()
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    report = extract_structured_metadata(file_id, analysis)
+
+    metadata_report = report["targets"]
+    assert metadata_report["additional_objects"]["count"] == 2
+    assert metadata_report["pxf_to_a"]["count"] == 1
+    etl_report = metadata_report["additional_objects"]["etl_transformations"]
+    assert etl_report["dialect"] == "greenplum"
+    assert etl_report["object_count"] == 2
+    assert etl_report["written"] == 2
+
+    conn = get_db_connection()
+    try:
+        additional_rows = [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT row_num, name, sql
+                FROM additional_objects
+                WHERE file_id = ?
+                ORDER BY row_num, id
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+        pxf_rows = [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT row_num, external_a_table, materialized_storage,
+                       replica_table, sod
+                FROM pxf_to_a
+                WHERE file_id = ?
+                ORDER BY row_num, id
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+        etl_rows = [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT target_table, target_field, source_table, source_field,
+                       transformation_rule, source_layer, target_layer
+                FROM s2t_transformations
+                WHERE file_id = ?
+                ORDER BY id
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert additional_rows == [
+        (0, "view_orders", "SELECT * FROM raw.orders"),
+        (1, "view_orders", "SELECT * FROM raw.orders"),
+    ]
+    assert pxf_rows == [
+        (0, "ext_orders", "mat_orders", "replica_orders", "SOD-1")
+    ]
+    assert etl_rows == [
+        ("view_orders", "*", "raw.orders", "*", "*", None, "B"),
+        ("view_orders", "*", "raw.orders", "*", "*", None, "B"),
+    ]
+
+
+def test_additional_objects_parse_greenplum_comments_and_keep_valid_objects(s2t_db):
+    file_id = store_excel_data(
+        "additional_lineage.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "Additional objects",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["name", "SQL"],
+                "data_rows": [
+                    [
+                        "b_orders",
+                        "DROP VIEW IF EXISTS mart.b_orders; "
+                        "CREATE VIEW mart.b_orders AS "
+                        "SELECT o.id, -- id comment\n"
+                        "UPPER(o.name) AS normalized_name, "
+                        "1::bigint AS constant FROM raw.orders o",
+                    ],
+                    ["broken_object", "SELECT ("],
+                ],
+            }
+        ],
+    )
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    with patch(
+        "sheet_skills.additional_objects._repair_sql_with_llm",
+        return_value="SELECT (",
+    ) as repair_sql:
+        report = extract_structured_metadata(file_id, analysis)
+    etl_report = report["targets"]["additional_objects"]["etl_transformations"]
+
+    assert etl_report["status"] == "partial"
+    assert etl_report["object_count"] == 2
+    assert etl_report["parsed_object_count"] == 1
+    assert etl_report["error_count"] == 1
+    assert etl_report["repair_attempt_count"] == 1
+    assert etl_report["repaired_object_count"] == 0
+    assert etl_report["repair_error_count"] == 1
+    assert etl_report["written"] == 3
+    assert etl_report["objects"][0]["select_count"] == 1
+    assert etl_report["objects"][0]["statement_count"] == 2
+    broken_report = etl_report["objects"][1]
+    assert broken_report["llm_repair_attempted"] is True
+    assert broken_report["llm_repair_status"] == "retry_parse_error"
+    assert broken_report["initial_parse_error"]
+    assert broken_report["retry_parse_error"]
+    repair_sql.assert_called_once()
+
+    conn = get_db_connection()
+    try:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT target_table, target_field, source_table, source_field,
+                       transformation_rule, source_layer, target_layer
+                FROM s2t_transformations
+                WHERE file_id = ?
+                ORDER BY id
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert rows == [
+        {
+            "target_table": "mart.b_orders",
+            "target_field": "id",
+            "source_table": "raw.orders",
+            "source_field": "id",
+            "transformation_rule": "o.id /* id comment */",
+            "source_layer": None,
+            "target_layer": "B",
+        },
+        {
+            "target_table": "mart.b_orders",
+            "target_field": "normalized_name",
+            "source_table": "raw.orders",
+            "source_field": "name",
+            "transformation_rule": "UPPER(o.name)",
+            "source_layer": None,
+            "target_layer": "B",
+        },
+        {
+            "target_table": "mart.b_orders",
+            "target_field": "constant",
+            "source_table": None,
+            "source_field": None,
+            "transformation_rule": "CAST(1 AS BIGINT)",
+            "source_layer": None,
+            "target_layer": "B",
+        },
+    ]
+
+
+def test_additional_objects_repair_invalid_sql_and_retry_sqlglot(s2t_db):
+    original_sql = "SELECT ( -- незавершённое выражение"
+    repaired_sql = "SELECT o.id FROM raw.orders AS o -- исходные заказы"
+    file_id = store_excel_data(
+        "additional_repair.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "Additional objects",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["name", "SQL"],
+                "data_rows": [["mart.repaired", original_sql]],
+            }
+        ],
+    )
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    with patch(
+        "sheet_skills.additional_objects._repair_sql_with_llm",
+        return_value=repaired_sql,
+    ) as repair_sql:
+        report = extract_structured_metadata(file_id, analysis)
+
+    etl_report = report["targets"]["additional_objects"]["etl_transformations"]
+    object_report = etl_report["objects"][0]
+    assert etl_report["status"] == "ok"
+    assert etl_report["repair_attempt_count"] == 1
+    assert etl_report["repaired_object_count"] == 1
+    assert etl_report["repair_error_count"] == 0
+    assert etl_report["written"] == 1
+    assert object_report["status"] == "ok"
+    assert object_report["llm_repair_attempted"] is True
+    assert object_report["llm_repair_status"] == "success"
+    assert object_report["initial_parse_error"]
+    assert object_report["retry_parse_error"] is None
+    repair_sql.assert_called_once()
+    assert repair_sql.call_args.args[0] == original_sql
+    assert repair_sql.call_args.args[1] == object_report["initial_parse_error"]
+
+    conn = get_db_connection()
+    try:
+        stored_sql = conn.execute(
+            "SELECT sql FROM additional_objects WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()["sql"]
+        raw_sql = conn.execute(
+            """
+            SELECT value
+            FROM data
+            WHERE file_id = ? AND table_name = ? AND value = ?
+            """,
+            (file_id, "Additional objects", original_sql),
+        ).fetchone()
+        lineage_row = dict(
+            conn.execute(
+                """
+                SELECT target_table, target_field, source_table, source_field,
+                       transformation_rule, source_layer, target_layer
+                FROM s2t_transformations
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+
+    assert stored_sql == original_sql
+    assert raw_sql["value"] == original_sql
+    assert lineage_row == {
+        "target_table": "mart.repaired",
+        "target_field": "id",
+        "source_table": "raw.orders",
+        "source_field": "id",
+        "transformation_rule": "o.id",
+        "source_layer": None,
+        "target_layer": "B",
+    }
+
+
+def test_additional_objects_preserve_cte_scope_lineage(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 7,
+            "name": "mart.result",
+            "sql": """
+                WITH src AS (
+                    SELECT o.id, o.name FROM raw.orders o
+                ), norm AS (
+                    SELECT id, UPPER(name) AS name FROM src
+                )
+                SELECT id, name FROM norm
+            """,
+        }
+    )
+
+    assert report["select_count"] == 3
+    assert report["scope_count"] == 3
+    assert report["intermediate_scope_count"] == 2
+    assert report["written"] == 6
+    assert {
+        (
+            row["source_table"],
+            row["source_field"],
+            row["target_table"],
+            row["target_field"],
+        )
+        for row in rows
+    } == {
+        ("raw.orders", "id", "mart.result::cte::src", "id"),
+        ("raw.orders", "name", "mart.result::cte::src", "name"),
+        (
+            "mart.result::cte::src",
+            "id",
+            "mart.result::cte::norm",
+            "id",
+        ),
+        (
+            "mart.result::cte::src",
+            "name",
+            "mart.result::cte::norm",
+            "name",
+        ),
+        ("mart.result::cte::norm", "id", "mart.result", "id"),
+        ("mart.result::cte::norm", "name", "mart.result", "name"),
+    }
+    norm_name = next(
+        row
+        for row in rows
+        if row["target_table"] == "mart.result::cte::norm"
+        and row["target_field"] == "name"
+    )
+    assert norm_name["transformation_rule"] == "UPPER(src.name)"
+    assert all(row["source_layer"] is None for row in rows)
+    assert all(
+        row["target_layer"]
+        == ("B" if row["target_table"] == "mart.result" else None)
+        for row in rows
+    )
+
+
+def test_additional_objects_keep_wildcard_between_scopes(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 8,
+            "name": "mart.wild",
+            "sql": """
+                WITH src AS (SELECT * FROM raw.orders),
+                     pass AS (SELECT * FROM src)
+                SELECT * FROM pass
+            """,
+        }
+    )
+
+    assert report["written"] == 3
+    assert [
+        (row["source_table"], row["target_table"])
+        for row in rows
+    ] == [
+        ("raw.orders", "mart.wild::cte::src"),
+        ("mart.wild::cte::src", "mart.wild::cte::pass"),
+        ("mart.wild::cte::pass", "mart.wild"),
+    ]
+    assert all(row["source_field"] == "*" for row in rows)
+    assert all(row["target_field"] == "*" for row in rows)
+
+
+def test_additional_objects_name_union_scopes_and_insert_columns(s2t_db):
+    union_rows, union_report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 9,
+            "name": "mart.union_result",
+            "sql": "SELECT id FROM raw.a UNION ALL SELECT id FROM raw.b",
+        }
+    )
+    insert_rows, _insert_report = _parse_object(
+        {
+            "id": 2,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 10,
+            "name": "fallback_name",
+            "sql": (
+                "INSERT INTO mart.target (target_id) "
+                "SELECT id FROM raw.a"
+            ),
+        }
+    )
+
+    assert union_report["select_count"] == 2
+    assert union_report["scope_count"] == 3
+    assert {
+        (row["source_table"], row["target_table"])
+        for row in union_rows
+    } == {
+        ("raw.a", "mart.union_result::branch::1"),
+        ("raw.b", "mart.union_result::branch::2"),
+        ("mart.union_result::branch::1", "mart.union_result"),
+        ("mart.union_result::branch::2", "mart.union_result"),
+    }
+    assert insert_rows[0]["target_table"] == "mart.target"
+    assert insert_rows[0]["target_field"] == "target_id"
+
+
+def test_additional_objects_preserve_sqlglot_set_operation_tree(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 11,
+            "name": "mart.mixed_union",
+            "sql": (
+                "SELECT id FROM raw.a "
+                "UNION ALL SELECT id FROM raw.b "
+                "UNION SELECT id FROM raw.c "
+                "UNION ALL SELECT id FROM raw.d"
+            ),
+        }
+    )
+
+    assert report["sqlglot_scope_count"] == 7
+    assert report["scope_count"] == report["sqlglot_scope_count"]
+    set_rows = [row for row in rows if row["transformation_rule"].startswith("UNION")]
+    assert len(set_rows) == 6
+    assert sum(row["transformation_rule"] == "UNION ALL" for row in set_rows) == 4
+    assert sum(row["transformation_rule"] == "UNION" for row in set_rows) == 2
+    assert {
+        (row["source_table"], row["target_table"], row["transformation_rule"])
+        for row in set_rows
+        if row["source_table"] in {
+            "mart.mixed_union::union::1",
+            "mart.mixed_union::union::2",
+        }
+    } == {
+        (
+            "mart.mixed_union::union::1",
+            "mart.mixed_union::union::2",
+            "UNION",
+        ),
+        (
+            "mart.mixed_union::union::2",
+            "mart.mixed_union",
+            "UNION ALL",
+        ),
+    }
+
+
+def test_additional_objects_preserve_sqlglot_except_tree(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 12,
+            "name": "mart.except_result",
+            "sql": (
+                "SELECT id FROM raw.a "
+                "EXCEPT SELECT id FROM raw.b "
+                "EXCEPT SELECT id FROM raw.c"
+            ),
+        }
+    )
+
+    assert report["sqlglot_scope_count"] == 5
+    assert report["scope_count"] == report["sqlglot_scope_count"]
+    set_rows = [row for row in rows if row["transformation_rule"] == "EXCEPT"]
+    assert len(set_rows) == 4
+    assert {
+        row["target_table"] for row in set_rows
+    } == {"mart.except_result::except::1", "mart.except_result"}
+
+
+def test_additional_objects_consume_union_scope_once(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 13,
+            "name": "mart.cte_union",
+            "sql": (
+                "WITH u AS ("
+                "SELECT a_id AS id FROM raw.a "
+                "UNION ALL SELECT b_id AS other FROM raw.b"
+                ") SELECT id FROM u"
+            ),
+        }
+    )
+
+    assert report["scope_count"] == report["sqlglot_scope_count"] == 4
+    final_rows = [row for row in rows if row["target_table"] == "mart.cte_union"]
+    assert [
+        (row["source_table"], row["source_field"], row["target_field"])
+        for row in final_rows
+    ] == [("mart.cte_union::cte::u", "id", "id")]
+
+
+def test_additional_objects_do_not_treat_cte_as_union_operand(s2t_db):
+    rows, report = _parse_object(
+        {
+            "id": 1,
+            "file_id": 1,
+            "sheet_name": "Additional objects",
+            "row_num": 14,
+            "name": "mart.union_with_cte",
+            "sql": (
+                "WITH src AS (SELECT id FROM raw.a) "
+                "SELECT id FROM src "
+                "UNION ALL SELECT id FROM raw.b"
+            ),
+        }
+    )
+
+    assert report["scope_count"] == report["sqlglot_scope_count"] == 4
+    assert any(
+        row["source_table"] == "mart.union_with_cte::cte::src"
+        and row["target_table"] == "mart.union_with_cte::branch::1"
+        for row in rows
+    )
+    assert not any(
+        row["source_table"] == "mart.union_with_cte"
+        and row["target_table"] != "mart.union_with_cte"
+        for row in rows
+    )
+
+
+def test_additional_object_refresh_replaces_previous_generated_rows(s2t_db):
+    file_id = _store_structured_metadata()
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+
+    first = extract_structured_metadata(file_id, analysis)
+    second_etl = extract_additional_object_transformations(file_id)
+
+    first_etl = first["targets"]["additional_objects"]["etl_transformations"]
+    assert first_etl["written"] == 2
+    assert first_etl["replaced"] == 0
+    assert second_etl["written"] == 2
+    assert second_etl["replaced"] == 2
+    conn = get_db_connection()
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM s2t_transformations WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 2
+
+
+def test_missing_structured_metadata_sheet_does_not_change_its_target(s2t_db):
+    file_id = store_excel_data(
+        "additional_only.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "Additional objects",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["name", "sql"],
+                "data_rows": [["view_new", "SELECT 2"]],
+            }
+        ],
+    )
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO pxf_to_a
+        (file_id, sheet_name, row_num, external_a_table)
+        VALUES (?, 'existing', 99, 'ext_existing')
+        """,
+        (file_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    report = extract_structured_metadata(file_id, analysis)
+
+    assert report["targets"]["additional_objects"]["count"] == 1
+    assert report["targets"]["pxf_to_a"]["count"] == 0
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM pxf_to_a WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    (
+        "sheet_name",
+        "columns",
+        "data_row",
+        "present_target",
+        "missing_target",
+    ),
+    [
+        (
+            "Source tables",
+            ["Название таблицы-источника", "Описание таблицы-источника"],
+            ["src_only", "Source description"],
+            "source_tables",
+            "target_tables",
+        ),
+        (
+            "Target tables",
+            ["Table Name", "Table Entity Definition"],
+            ["t_only", "Target description"],
+            "target_tables",
+            "source_tables",
+        ),
+    ],
+)
+def test_missing_catalog_sheet_does_not_change_its_target(
+    s2t_db,
+    sheet_name,
+    columns,
+    data_row,
+    present_target,
+    missing_target,
+):
+    file_id = store_excel_data(
+        "one_catalog_sheet.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": sheet_name,
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": columns,
+                "data_rows": [data_row],
+            }
+        ],
+    )
+    conn = get_db_connection()
+    conn.execute(
+        f"""
+        INSERT INTO {missing_target}
+        (file_id, sheet_name, row_num, table_name, description)
+        VALUES (?, 'existing', 99, 'existing_table', 'existing description')
+        """,
+        (file_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    report = extract_table_catalogs(file_id, analysis)
+
+    assert report["targets"][present_target]["count"] == 1
+    assert report["targets"][missing_target]["sheet_count"] == 0
+    assert report["targets"][missing_target]["count"] == 0
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            f"SELECT COUNT(*) AS n FROM {missing_target} WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
 def test_clear_s2t_transformations_deletes_only_current_file(s2t_db):
     conn = get_db_connection()
     conn.executemany(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (id, file_id, sheet_name, row_num, target_table)
+        VALUES (?, ?, ?, ?, ?)
         """,
         [
-            (1, 10, 100, "S2T", 1, "t1"),
-            (2, 10, 100, "S2T", 2, "t2"),
-            (3, 20, 200, "S2T", 1, "t3"),
+            (1, 10, "S2T", 1, "t1"),
+            (2, 10, "S2T", 2, "t2"),
+            (3, 20, "S2T", 1, "t3"),
         ],
     )
     conn.commit()
@@ -851,12 +1579,12 @@ def test_list_s2t_transformations_without_file_id_reads_global_table(s2t_db):
     conn.executemany(
         """
         INSERT INTO s2t_transformations
-        (id, file_id, sheet_id, sheet_name, row_num, target_table)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (id, file_id, sheet_name, row_num, target_table)
+        VALUES (?, ?, ?, ?, ?)
         """,
         [
-            (11, 10, 100, "S2T", 1, "t_first"),
-            (12, 20, 200, "S2T", 2, "t_second"),
+            (11, 10, "S2T", 1, "t_first"),
+            (12, 20, "S2T", 2, "t_second"),
         ],
     )
     conn.commit()
@@ -871,3 +1599,26 @@ def test_list_s2t_transformations_without_file_id_reads_global_table(s2t_db):
         "t_second",
     ]
     assert "file_id" not in result
+
+
+def test_list_s2t_transformations_selects_columns(s2t_db):
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, target_table, transformation_rule)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (13, 10, "S2T", 3, "t_target", "source.value"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_transformations(
+        file_id=None,
+        limit=10,
+        columns=["transformation_rule"],
+    )
+
+    assert result["columns"] == ["transformation_rule"]
+    assert result["rows"] == [{"transformation_rule": "source.value"}]

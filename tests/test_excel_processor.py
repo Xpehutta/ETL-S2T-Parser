@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
-import pytest
 from openpyxl import Workbook
 
 from processing.excel import (
@@ -13,7 +12,6 @@ from processing.excel import (
     build_nested_columns,
     clean_header_values,
     convert_to_serializable,
-    infer_header_from_untitled_preview,
     is_blank_header_value,
     is_empty_or_irrelevant,
     parse_excel_with_decisions,
@@ -100,24 +98,6 @@ def test_is_blank_header_value_accepts_untitled_and_unnamed():
     assert is_blank_header_value("Real column") is False
 
 
-def test_infer_header_from_untitled_preview_uses_nested_when_upper_has_groups():
-    preview_rows = [
-        ["Target", "Untitled: 1", "Source", "Untitled: 3"],
-        ["table", "column", "table", "column"],
-        ["T_CLIENT", "CLIENT_ID", "SRC", "ID"],
-    ]
-    assert infer_header_from_untitled_preview(preview_rows) == (0, 2, True)
-
-
-def test_infer_header_from_untitled_preview_uses_second_row_when_upper_is_empty():
-    preview_rows = [
-        ["Untitled: 0", None, "Unnamed: 2"],
-        ["table", "column", "description"],
-        ["T_CLIENT", "CLIENT_ID", "Client identifier"],
-    ]
-    assert infer_header_from_untitled_preview(preview_rows) == (1, 1, False)
-
-
 def test_is_empty_or_irrelevant_empty_list():
     ok, reason = is_empty_or_irrelevant([])
     assert ok is True
@@ -153,6 +133,30 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
     assert sheets[0]["data_rows"] == [["Alice", 30], ["Bob", 25]]
 
 
+def test_parser_uses_automatic_header_decision_for_untitled_rows():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Automatic"
+    sheet.append(["Untitled: 0", None, "Unnamed: 2"])
+    sheet.append(["table", "column", "description"])
+    sheet.append(["T_CLIENT", "CLIENT_ID", "Client identifier"])
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(1, 1, False),
+    ) as get_decision:
+        sheets = parse_excel_with_decisions(output.getvalue())
+
+    get_decision.assert_called_once()
+    assert sheets[0]["header"] == {
+        "start_row": 1,
+        "row_count": 1,
+        "nested": False,
+    }
+
+
 def test_parser_expands_only_real_merged_data_cells():
     workbook = Workbook()
     sheet = workbook.active
@@ -167,15 +171,11 @@ def test_parser_expands_only_real_merged_data_cells():
     output = io.BytesIO()
     workbook.save(output)
 
-    sheets = parse_excel_with_decisions(
-        output.getvalue(),
-        corrections={
-            "S2T": {
-                "header_start_row": 0,
-                "header_rows_count": 2,
-            }
-        },
-    )
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(0, 2, True),
+    ):
+        sheets = parse_excel_with_decisions(output.getvalue())
 
     assert sheets[0]["data_rows"] == [
         ["T_TEST", "FIELD_A", "shared rule"],
@@ -201,22 +201,15 @@ def test_parser_excludes_hidden_rows_by_default_and_preserves_row_numbers():
     sheet.row_dimensions[5].hidden = True
     output = io.BytesIO()
     workbook.save(output)
-    corrections = {
-        "S2T": {
-            "header_start_row": 0,
-            "header_rows_count": 2,
-        }
-    }
-
-    visible_sheets = parse_excel_with_decisions(
-        output.getvalue(),
-        corrections=corrections,
-    )
-    all_sheets = parse_excel_with_decisions(
-        output.getvalue(),
-        corrections=corrections,
-        include_hidden_rows=True,
-    )
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(0, 2, True),
+    ):
+        visible_sheets = parse_excel_with_decisions(output.getvalue())
+        all_sheets = parse_excel_with_decisions(
+            output.getvalue(),
+            include_hidden_rows=True,
+        )
 
     assert visible_sheets[0]["data_rows"] == [
         ["T_TEST", "FIELD_B", "shared rule"],
@@ -230,19 +223,3 @@ def test_parser_excludes_hidden_rows_by_default_and_preserves_row_numbers():
         ["T_TEST", "FIELD_D", None],
     ]
     assert all_sheets[0]["data_row_numbers"] == [0, 1, 2, 3]
-
-
-def test_parser_returns_minimal_skipped_sheet(sample_excel_bytes):
-    with patch("processing.excel.pd.read_excel", wraps=pd.read_excel) as read_excel:
-        sheets = parse_excel_with_decisions(
-            sample_excel_bytes,
-            skip_sheets=["Sheet1"],
-        )
-
-    assert read_excel.call_count == 0
-    assert sheets == [
-        {
-            "sheet_name": "Sheet1",
-            "skip_reason": "Manually skipped by user",
-        }
-    ]

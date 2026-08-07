@@ -1,5 +1,3 @@
-import pytest
-import os
 from agents.tools import load_skills
 
 
@@ -12,27 +10,63 @@ def test_load_skills(tmp_path):
     assert isinstance(load_skills(), str)  # May be empty if file not found
 
 
-def test_load_skills_includes_s2t_transformations_query_skill():
+def test_load_skills_contains_tool_orchestration_and_domain_context():
     text = load_skills()
-    assert "Табличные запросы по S2T-трансформациям" in text
-    assert "Выбор подмножества полей в ответе" in text
-    assert "Сопоставление листов и колонок с конфигами" in text
+    assert "S2T-строки" in text
     assert "s2t_transformations" in text
-    assert "search_s2t_transformations" in text
-    assert "run_sql" in text
-    assert "Сценарий: SQLite и `run_sql`" in text
-    assert "Сценарий: Neo4j и `run_cypher`" in text
-    assert "trace_neo4j_lineage" in text
-    assert "impact analysis" in text
-    assert "Не используй Cypher для чтения сырых Excel-строк" in text
-    assert "Не используй SQL для многошагового обхода графа" in text
-    assert "отсутствие узла" not in text.lower()
-    assert "Определение заголовков Excel" not in text
-    assert "Schema Matching" not in text
-    for db_column_name in (
-        "row_num",
-        "target_field",
-        "source_field",
-        "transformation_rule",
+    assert "Neo4j" in text
+    assert "ETLColumn" in text
+    assert "TABLE_TRANSFORMS_TO" in text
+    for tool_name in (
+        "run_sql",
+        "trace_neo4j_lineage",
+        "search_excel_values",
+        "semantic_search_descriptions",
+        "trace_transformation_path",
     ):
-        assert db_column_name not in text
+        assert tool_name in text
+    assert "Атомарные контракты tools" in text
+    assert "Извлечение полезных колонок" not in text
+    assert "update_file_description" not in text
+    assert len(text) < 10000
+
+
+def test_s2t_skill_routes_table_name_set_operations_to_domain_tool():
+    text = load_skills(["S2T-строки"])
+
+    assert "list_s2t_table_names" in text
+    assert "принадлежность имени" in text
+    assert "run_sql" in text
+    assert "нестандартной агрегации" in text
+    assert "JOIN, EXISTS, NOT EXISTS" not in text
+
+
+def test_load_skills_includes_transformation_path_analysis_skill():
+    text = load_skills()
+    assert "Путь S2T-преобразования" in text
+    assert "прямую трансформацию" in text
+    assert "Отсутствие подтверждения Neo4j не отменяет факты SQLite" in text
+    assert "source_table.source_field → target_table.target_field" in text
+    assert "перенеси её дословно" in text
+    assert "не отсутствие" in text
+
+
+def test_load_skills_can_select_one_section():
+    text = load_skills(["SQL lineage"])
+
+    assert "## SQL lineage" in text
+    assert "parse_sql_column_lineage" in text
+    assert "visualize_sql_lineage" in text
+    assert "диалект SQLGlot" in text
+    assert "## S2T-строки" not in text
+    assert "## Neo4j" not in text
+
+
+def test_load_skills_can_select_sql_execution_section():
+    text = load_skills(["SQLite SQL"])
+
+    assert "## SQLite SQL" in text
+    assert "run_sql" in text
+    assert "не физические ETL-таблицы" in text
+    assert "source_table" in text
+    assert "## SQL lineage" not in text

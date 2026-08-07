@@ -22,5 +22,21 @@
       "table_name",
       "description"
     ]
+  },
+  "additional_objects": {
+    "sheet_group": "additional_objects",
+    "fields": [
+      "name",
+      "sql"
+    ]
+  },
+  "pxf_to_a": {
+    "sheet_group": "pxf_to_a",
+    "fields": [
+      "external_a_table",
+      "materialized_storage",
+      "replica_table",
+      "sod"
+    ]
   }
 }

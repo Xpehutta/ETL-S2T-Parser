@@ -3,18 +3,21 @@
 Architecture:
 
     planner (native tool calling)
-        ├─ tool_calls -> ToolNode -> observer (structured output) -> planner
+        ├─ tool_calls -> ToolNode -> observer (plain text) -> planner
         └─ no tool_calls -> responder -> END
 
-The planner alone decides whether another tool is needed. The observer only
-interprets the latest tool result. The responder produces the final user-facing
-answer without access to tools.
+Raw ToolMessage content is visible to the observer, subsequent planner calls
+and responder, so a later tool can use exact values returned by an earlier one.
+The planner also receives compact plain-text observations and produces a
+bounded handoff when no more tools are needed. The responder uses that handoff
+together with exact tool outputs, without duplicate observer messages.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
 
 from langchain_core.messages import (
@@ -33,6 +36,92 @@ from pydantic import BaseModel, ConfigDict, Field
 from .observability import get_callback_handler, langfuse_trace_context
 
 logger = logging.getLogger(__name__)
+
+_VISUALIZATION_URL = re.compile(
+    r"^/exports/(?:sql-lineage|s2t-graphs)/[A-Za-z0-9_.-]+\.html$"
+)
+_S2T_GRAPH_DATA_URL = re.compile(
+    r"^/exports/s2t-graphs/[A-Za-z0-9_.-]+\.json$"
+)
+_OBSERVATION_SUMMARY_MAX_CHARS = 1200
+_OBSERVATION_FACT_MAX_CHARS = 300
+_OBSERVATION_FACTS_MAX_COUNT = 8
+_OBSERVATION_LIMITATIONS_MAX_COUNT = 4
+_PLANNER_HANDOFF_MAX_CHARS = 12000
+_COMPLETION_AUDIT_PROMPT = """
+Аудит завершения planner. Ещё раз сопоставь исходный запрос пользователя со всеми
+фактически завершёнными ToolMessage. Проверь каждую запрошенную часть отдельно.
+Считай часть подтверждённой только завершённым ToolMessage инструмента, description
+которого непосредственно покрывает эту операцию. Результат предварительного tool,
+включая найденное имя, агрегированные счётчики или данные для аргументов следующего
+шага, не доказывает, что следующий шаг уже выполнен. Выжимка observer также не
+является отдельным инструментальным результатом.
+Отдельно сравни явные числовые ограничения исходного запроса с фактическими
+аргументами и результатом tool. Если пользователь указал N, а tool получил другой
+limit, количество или глубину, задача не завершена: повтори подходящий tool с N.
+Если хотя бы одна часть требует доступного инструмента и ещё не подтверждена его
+результатом, вызови этот tool сейчас: ответ без tool_calls завершит весь граф.
+Если все части уже подтверждены, верни компактную самодостаточную выжимку для
+responder без обещаний будущих действий. Не повторяй успешный одинаковый вызов без
+новой причины и не выдумывай отсутствующие значения.
+""".strip()
+_COMPLETION_AUDIT_RETRY_PROMPT = """
+Повтори аудит в последний раз. Предыдущий ответ был обычным текстом и поэтому не
+выполнил ни одного нового действия. Если ты установил, что часть исходного запроса
+ещё не подтверждена и для неё есть доступный tool, не описывай намерение и не пиши
+«вызываю»: верни нативный tool_call прямо сейчас. Обычный текст допустим только если
+каждая часть запроса уже подтверждена фактическими ToolMessage.
+""".strip()
+_BOUNDED_ARGUMENT_NAMES = frozenset({"limit", "preview_limit", "max_depth"})
+
+
+def _completed_tool_names(messages: Sequence[BaseMessage]) -> List[str]:
+    return [
+        str(message.name or "unknown_tool")
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+
+
+def _enforce_single_numeric_constraint(
+    reply: AIMessage,
+    user_query: str,
+) -> AIMessage:
+    """Copy one unambiguous numeric request into one bounded tool argument."""
+    requested_numbers = re.findall(
+        r"(?<![\w.])([1-9]\d{0,3})(?![\w.])",
+        str(user_query or ""),
+    )
+    if len(requested_numbers) != 1:
+        return reply
+
+    bounded_arguments: List[tuple[int, str]] = []
+    for call_index, call in enumerate(reply.tool_calls):
+        args = call.get("args") or {}
+        if not isinstance(args, Mapping):
+            continue
+        for argument_name in _BOUNDED_ARGUMENT_NAMES.intersection(args.keys()):
+            bounded_arguments.append((call_index, argument_name))
+    if len(bounded_arguments) != 1:
+        return reply
+
+    requested_value = int(requested_numbers[0])
+    call_index, argument_name = bounded_arguments[0]
+    current_value = reply.tool_calls[call_index].get("args", {}).get(argument_name)
+    if current_value == requested_value:
+        return reply
+
+    corrected_calls = [dict(call) for call in reply.tool_calls]
+    corrected_args = dict(corrected_calls[call_index].get("args") or {})
+    corrected_args[argument_name] = requested_value
+    corrected_calls[call_index]["args"] = corrected_args
+    logger.info(
+        "Planner numeric contract corrected %s from %r to %s",
+        argument_name,
+        current_value,
+        requested_value,
+    )
+    return reply.model_copy(update={"tool_calls": corrected_calls})
 
 
 class ChatHistoryMessage(TypedDict):
@@ -72,7 +161,7 @@ class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
     planner_message: Optional[AIMessage]
-    observation: Optional[Observation]
+    observations: List[Observation]
     tool_steps: int
     max_steps: int
     active_file_id: Optional[int]
@@ -131,7 +220,40 @@ def _history_messages(
     return result
 
 
-def _runtime_context(state: AgentGraphState) -> Optional[SystemMessage]:
+def _clip_text(value: Any, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _compact_observation(observation: Observation) -> Observation:
+    return Observation(
+        summary=_clip_text(
+            observation.summary,
+            _OBSERVATION_SUMMARY_MAX_CHARS,
+        ),
+        has_error=observation.has_error,
+        important_facts=[
+            _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
+            for item in observation.important_facts[
+                :_OBSERVATION_FACTS_MAX_COUNT
+            ]
+        ],
+        limitations=[
+            _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
+            for item in observation.limitations[
+                :_OBSERVATION_LIMITATIONS_MAX_COUNT
+            ]
+        ],
+    )
+
+
+def _runtime_context(
+    state: AgentGraphState,
+    *,
+    include_observations: bool = True,
+) -> Optional[str]:
     parts: List[str] = []
 
     active_file_id = state.get("active_file_id")
@@ -143,68 +265,71 @@ def _runtime_context(state: AgentGraphState) -> Optional[SystemMessage]:
             "s2t_transformations и её list/search/summarize tools."
         )
 
-    observation = state.get("observation")
-    if observation is not None:
-        parts.append(f"Вывод observer:\n{observation.summary}")
-
-        if observation.important_facts:
-            parts.append(
-                "Важные факты:\n- " + "\n- ".join(observation.important_facts)
-            )
-
-        if observation.limitations:
-            parts.append(
-                "Ограничения и неоднозначности:\n- "
-                + "\n- ".join(observation.limitations)
-            )
-
-        if observation.has_error:
-            parts.append(
-                "Последний инструментальный шаг содержал ошибку. "
-                "Самостоятельно реши: исправить аргументы, выбрать другой "
-                "инструмент или перейти к ответу с честным указанием ограничения."
-            )
+    if include_observations:
+        for index, observation in enumerate(
+            state.get("observations") or [],
+            start=1,
+        ):
+            observation_parts = [
+                f"Выжимка observer для шага {index}:\n{observation.summary}"
+            ]
+            if observation.important_facts:
+                observation_parts.append(
+                    "Важные факты:\n- "
+                    + "\n- ".join(observation.important_facts)
+                )
+            if observation.limitations:
+                observation_parts.append(
+                    "Ограничения и неоднозначности:\n- "
+                    + "\n- ".join(observation.limitations)
+                )
+            if observation.has_error:
+                observation_parts.append(
+                    "Этот инструментальный шаг содержал ошибку. Реши, нужно ли "
+                    "исправить аргументы, выбрать другой инструмент или завершить "
+                    "работу с честным указанием ограничения."
+                )
+            parts.append("\n".join(observation_parts))
 
     if not parts:
         return None
 
-    return SystemMessage(content="\n\n".join(parts))
+    return "\n\n".join(parts)
 
 
-def _planner_messages(state: AgentGraphState) -> List[BaseMessage]:
+def _planner_instruction(available_tool_names: Sequence[str]) -> str:
+    available = ", ".join(available_tool_names) or "нет"
+    return (
+        "Ты planner read-only агента. Выбери tool call либо не вызывай tool, "
+        "если проверенных фактов уже достаточно. Не пиши окончательный ответ "
+        "и не повторяй уже успешный одинаковый вызов без новой причины. "
+        f"Используй только доступные tools: {available}. Перед вызовом читай "
+        "description и схему аргументов выбранного tool: они являются его "
+        "контрактом. Не переноси правила и аргументы одного tool на другой, не "
+        "выдумывай значения. Сохраняй явные числовые ограничения пользователя: "
+        "если запрос содержит максимум, глубину или количество N и tool имеет "
+        "соответствующий аргумент, передай ровно N, не заменяя его значением по "
+        "умолчанию или границей диапазона. Не описывай будущий вызов словами: если для "
+        "незавершённой части запроса нужен доступный tool, верни его tool_call "
+        "в этом же сообщении. Текст о намерении вызвать tool без tool_call не "
+        "считается выполнением шага. Если следующий tool не нужен, верни не "
+        "пользовательский ответ, а компактную самодостаточную выжимку для "
+        "responder: сохрани точные имена, числа, результаты, ссылки и ограничения "
+        "из всех выжимок observer, убрав повторы и служебные детали. В истории "
+        "находятся реальные завершённые ToolMessage: используй их точные значения "
+        "для аргументов следующего шага. Если предыдущий ToolMessage или observer "
+        "сообщает об ошибке, не считай задачу выполненной: выясни причину, исправь "
+        "аргументы и снова вызови подходящий доступный tool. Повтор того же tool "
+        "после ошибки разрешён; те же args повторяй только при явно временном сбое."
+    )
+
+
+def _planner_messages(
+    state: AgentGraphState,
+    available_tool_names: Sequence[str] = (),
+) -> List[BaseMessage]:
     limit_reached = state["tool_steps"] >= state["max_steps"]
-
-    planner_instruction = """
-Ты planner многошагового read-only агента.
-
-Твоя задача — выбрать ровно один следующий шаг:
-- вызови ровно один доступный инструмент, если нужны дополнительные факты;
-- вызови show_plan, если в многошаговой задаче перед следующим действием нужно
-  явно зафиксировать, что уже сделано и что осталось сделать;
-- не вызывай инструмент, если фактов уже достаточно и можно формировать ответ.
-
-Перед каждым tool call сначала выбери ровно один сценарий результата:
-
-1. TABULAR_SQLITE — пользователь просит таблицу трансформаций, строки,
-   S2T-маппинги, правила преобразования, обычные связи source → target,
-   фильтрацию, подсчёт или агрегацию. Используй только
-   list_s2t_transformations, search_s2t_transformations, summarize_s2t_tables
-   или run_sql. s2t_transformations является глобальной таблицей: никогда не
-   передавай и не добавляй file_id для её просмотра, поиска, суммаризации или
-   SQL-фильтрации. Не вызывай Neo4j-tools для этого сценария.
-
-2. GRAPH_NEO4J — пользователь просит lineage, графовый путь, цепочку,
-   upstream, downstream, что от чего зависит, соседние узлы или impact analysis.
-   Используй trace_neo4j_lineage для непосредственного lineage и run_cypher
-   для сложного графового обхода. В Neo4j есть только колонки ETLColumn и связи
-   TRANSFORMS_TO. Остальные факты получай из SQLite.
-   Не вызывай SQLite-tools для обхода графа и не подменяй ими Cypher-путь.
-
-Не формулируй окончательный ответ пользователю: это сделает отдельный responder.
-Не имитируй результаты инструментов и не повторяй одинаковый вызов или
-неизменившийся show_plan без причины.
-При поиске логической S2T-таблицы учитывай обе роли: source_table и target_table.
-""".strip()
+    planner_instruction = _planner_instruction(available_tool_names)
 
     if limit_reached:
         planner_instruction += (
@@ -213,14 +338,14 @@ def _planner_messages(state: AgentGraphState) -> List[BaseMessage]:
             "чтобы граф перешёл к responder."
         )
 
-    messages: List[BaseMessage] = [
-        SystemMessage(content=state["system_prompt"].strip()),
-        SystemMessage(content=planner_instruction),
-    ]
+    system_parts = [state["system_prompt"].strip(), planner_instruction]
+    runtime_context = _runtime_context(state)
+    if runtime_context is not None:
+        system_parts.append(runtime_context)
 
-    runtime_message = _runtime_context(state)
-    if runtime_message is not None:
-        messages.append(runtime_message)
+    messages: List[BaseMessage] = [
+        SystemMessage(content="\n\n".join(system_parts))
+    ]
 
     messages.extend(state["messages"])
     return messages
@@ -260,7 +385,66 @@ def _tool_message_payload(message: ToolMessage) -> Dict[str, Any]:
         "tool_call_id": message.tool_call_id,
         "content": message.content,
         "status": getattr(message, "status", None),
+        "is_error": _tool_message_has_error(message),
     }
+
+
+def _tool_message_has_error(message: ToolMessage) -> bool:
+    if getattr(message, "status", None) == "error":
+        return True
+
+    content = message.content
+    if isinstance(content, dict):
+        payload = content
+    else:
+        try:
+            payload = json.loads(_message_content_text(content))
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+    return isinstance(payload, dict) and bool(payload.get("error"))
+
+
+def _visualization_urls(messages: Sequence[BaseMessage]) -> List[str]:
+    urls: List[str] = []
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        try:
+            payload = json.loads(_message_content_text(message.content))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        url = payload.get("visualization_url")
+        if (
+            isinstance(url, str)
+            and _VISUALIZATION_URL.fullmatch(url)
+            and url not in urls
+        ):
+            urls.append(url)
+    return urls
+
+
+def _s2t_graph_data_urls(messages: Sequence[BaseMessage]) -> List[str]:
+    urls: List[str] = []
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        try:
+            payload = json.loads(_message_content_text(message.content))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        url = payload.get("data_url")
+        if (
+            isinstance(url, str)
+            and _S2T_GRAPH_DATA_URL.fullmatch(url)
+            and url not in urls
+        ):
+            urls.append(url)
+    return urls
 
 
 def _fallback_observation(
@@ -268,6 +452,10 @@ def _fallback_observation(
     tool_results: Sequence[ToolMessage],
     error: Exception,
 ) -> Observation:
+    raw_output = getattr(error, "llm_output", None)
+    if raw_output:
+        return Observation(summary=str(raw_output))
+
     names = [call.get("name", "unknown_tool") for call in tool_call_message.tool_calls]
     result_preview = "\n".join(
         f"{message.name or 'unknown_tool'}: {_message_content_text(message.content)[:1500]}"
@@ -276,7 +464,7 @@ def _fallback_observation(
 
     return Observation(
         summary=(
-            "Observer не смог получить структурированный вывод. "
+            "Observer не смог получить текстовую выжимку. "
             f"Выполнены инструменты: {', '.join(names)}. "
             f"Сырой результат:\n{result_preview}"
         ),
@@ -286,35 +474,23 @@ def _fallback_observation(
     )
 
 
-def _build_observer_model(model: Any) -> Any:
-    """Create a structured observer with a compatibility fallback."""
-    try:
-        return model.with_structured_output(
-            Observation,
-            method="json_schema",
-        )
-    except TypeError:
-        # Some LangChain integrations expose with_structured_output but do not
-        # accept an explicit method argument.
-        return model.with_structured_output(Observation)
-
-
 def build_agent_graph(
     model: Any,
     tools: Mapping[str, BaseTool] | Sequence[BaseTool],
 ):
     """Build the planner -> tools -> observer -> planner graph."""
     tool_list = _normalize_tools(tools)
+    tool_names = tuple(tool.name for tool in tool_list)
     planner_model = model.bind_tools(tool_list)
-    observer_model = _build_observer_model(model)
     tool_node = ToolNode(tool_list, handle_tool_errors=True)
 
     def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
         selected_model = model if limit_reached else planner_model
+        planner_messages = _planner_messages(state, tool_names)
 
         try:
-            reply = selected_model.invoke(_planner_messages(state))
+            reply = selected_model.invoke(planner_messages)
         except Exception as exc:
             logger.exception("LLM error in planner")
             # A plain message routes to responder, which will produce the user
@@ -324,17 +500,66 @@ def build_agent_graph(
         if not isinstance(reply, AIMessage):
             reply = AIMessage(content=_message_content_text(reply))
 
-        if len(reply.tool_calls) > 1:
-            logger.warning(
-                "Planner returned %s tool calls; only one call per step is supported",
-                len(reply.tool_calls),
+        if not limit_reached and reply.tool_calls:
+            reply = _enforce_single_numeric_constraint(
+                reply,
+                _last_user_query(state["messages"]),
             )
-            reply = AIMessage(
-                content=(
-                    "Planner выбрал несколько инструментов одновременно. "
-                    "Перейди к формированию ответа по уже полученным данным."
+
+        if (
+            not limit_reached
+            and state["tool_steps"] > 0
+            and not reply.tool_calls
+        ):
+            try:
+                audit_messages: List[BaseMessage] = [
+                    *planner_messages,
+                    AIMessage(content=_message_text(reply)),
+                    HumanMessage(
+                        content=(
+                            f"{_COMPLETION_AUDIT_PROMPT}\n\n"
+                            "Исходный пользовательский запрос: "
+                            f"{_last_user_query(state['messages'])!r}.\n"
+                            "Фактически завершённые tools: "
+                            f"{_completed_tool_names(state['messages']) or ['нет']}.\n"
+                            f"Доступные tools: {list(tool_names) or ['нет']}."
+                        )
+                    ),
+                ]
+                last_audited_reply: Optional[AIMessage] = None
+                for attempt in range(2):
+                    audited_reply = planner_model.invoke(audit_messages)
+                    if not isinstance(audited_reply, AIMessage):
+                        audited_reply = AIMessage(
+                            content=_message_content_text(audited_reply)
+                        )
+                    last_audited_reply = audited_reply
+                    logger.info(
+                        "Planner completion audit %s after %s tool step(s): "
+                        "tool_calls=%s content=%s",
+                        attempt + 1,
+                        state["tool_steps"],
+                        [call.get("name") for call in audited_reply.tool_calls],
+                        _message_text(audited_reply)[:1000],
+                    )
+                    if audited_reply.tool_calls:
+                        reply = audited_reply
+                        break
+                    if attempt == 0:
+                        audit_messages.extend(
+                            [
+                                audited_reply,
+                                HumanMessage(
+                                    content=_COMPLETION_AUDIT_RETRY_PROMPT
+                                ),
+                            ]
+                        )
+                if not reply.tool_calls and last_audited_reply is not None:
+                    reply = last_audited_reply
+            except Exception:
+                logger.exception(
+                    "LLM error in planner completion audit; using initial decision"
                 )
-            )
 
         logger.info(
             "Agent planner after %s tool step(s): tool_calls=%s content=%s",
@@ -373,8 +598,14 @@ def build_agent_graph(
         )
 
         result = tool_node.invoke(state)
-        tool_messages = result.get("messages", [])
-
+        tool_messages = [
+            message.model_copy(update={"status": "error"})
+            if isinstance(message, ToolMessage)
+            and _tool_message_has_error(message)
+            and getattr(message, "status", None) != "error"
+            else message
+            for message in result.get("messages", [])
+        ]
         logger.info(
             "Tool step result: %s",
             json.dumps(
@@ -403,11 +634,6 @@ def build_agent_graph(
             "tool_results": [
                 _tool_message_payload(message) for message in tool_results
             ],
-            "previous_observation": (
-                state["observation"].model_dump()
-                if state.get("observation") is not None
-                else None
-            ),
         }
 
         observer_messages: List[BaseMessage] = [
@@ -417,7 +643,9 @@ def build_agent_graph(
                     "фактический результат последнего инструмента. Выдели важные "
                     "факты, ошибки, ограничения и неоднозначности. Не выбирай "
                     "следующий инструмент, не решай завершать ли работу и не "
-                    "формулируй ответ пользователю. Не придумывай отсутствующие данные."
+                    "формулируй ответ пользователю. Не придумывай отсутствующие "
+                    "данные. Ответь обычным компактным текстом, не JSON и без "
+                    "tool call."
                 )
             ),
             HumanMessage(
@@ -426,69 +654,116 @@ def build_agent_graph(
         ]
 
         try:
-            result = observer_model.invoke(observer_messages)
+            result = model.invoke(observer_messages)
             if isinstance(result, Observation):
                 observation = result
-            elif isinstance(result, Mapping):
-                observation = Observation.model_validate(result)
             else:
-                observation = Observation.model_validate_json(str(result))
+                raw_summary = (
+                    _message_text(result)
+                    if isinstance(result, BaseMessage)
+                    else _message_content_text(result).strip()
+                )
+                has_error = any(
+                    _tool_message_has_error(message)
+                    for message in tool_results
+                )
+                observation = Observation(
+                    summary=(
+                        raw_summary
+                        or "Observer не вернул текстовую выжимку результата."
+                    ),
+                    has_error=has_error,
+                    limitations=(
+                        ["Один или несколько tools завершились с ошибкой."]
+                        if has_error
+                        else []
+                    ),
+                )
         except Exception as exc:
-            logger.exception("Structured observer failed")
+            logger.exception("Plain-text observer failed")
             observation = _fallback_observation(
                 tool_call_message,
                 tool_results,
                 exc,
             )
 
+        observation = _compact_observation(observation)
         logger.info(
             "Observer result: %s",
             observation.model_dump_json()[:2000],
         )
-        return {"observation": observation}
+        return {
+            "observations": [
+                *(state.get("observations") or []),
+                observation,
+            ]
+        }
 
     def responder(state: AgentGraphState) -> Dict[str, Any]:
         response_instruction = """
-Сформируй окончательный ответ пользователю.
+Сформируй окончательный ответ пользователю по выжимке planner и фактическим
+результатам tools.
 
-Не вызывай инструменты. Используй только исходный запрос, историю диалога,
-реальные ToolMessage и вывод observer. Не упоминай внутренние узлы planner,
-observer или устройство графа. Если данных недостаточно или инструмент завершился
+Не вызывай инструменты. Используй исходный запрос, пользовательскую историю диалога,
+реальные ToolMessage и planner_handoff ниже. Внутренние observations намеренно не
+передаются, чтобы не дублировать и не искажать результаты tools. Если пользователь
+просит список, таблицу, строки или полный результат, перенеси соответствующие данные
+из ToolMessage без сокращения. Не упоминай внутренние узлы или устройство графа. Если
+в handoff или ToolMessage указано, что данных недостаточно либо инструмент завершился
 ошибкой, явно укажи ограничение и не придумывай отсутствующие факты.
 Для ответа о s2t_transformations не связывай глобальный результат с активным
 файлом и не упоминай его file_id или имя. Пустой результат означает только то,
 что глобальная таблица сейчас пуста.
+Табличные данные возвращай только компактным текстовым блоком `table`: внутри должен
+быть валидный JSON-список списков, где первая строка содержит названия колонок, а
+остальные строки — значения. Пример: ```table
+[["target_table","count"],["t_bus_srv",5],["t_agr_dep",2]]
+```. Markdown-таблица с `|` и строкой `---` запрещена: браузер сам отрисует блок
+`table` как таблицу. Не добавляй вводную фразу «Полученные результаты», если она
+не нужна по смыслу. Компактный блок не является сокращением: сохраняй все запрошенные
+строки, порядок колонок и точные значения из ToolMessage.
+Если фактический ToolMessage содержит text_diagram, обязательно перенеси ровно
+готовый text_diagram без изменений внутри блока ```text```. Не заменяй его
+списком, не пересказывай и не добавляй собственную классификацию структуры пути.
+Если ToolMessage содержит
+visualization_url, не печатай HTML, DOT или Mermaid; кратко опиши результат —
+приложение само добавит интерактивный граф. Mermaid-код
+показывай только по прямой просьбе пользователя получить Mermaid.
 """.strip()
 
         planner_message = state.get("planner_message")
-        planner_text = (
-            _message_text(planner_message)
-            if planner_message is not None and not planner_message.tool_calls
-            else ""
-        )
+        planner_text = _clip_text(
+            _message_text(planner_message),
+            _PLANNER_HANDOFF_MAX_CHARS,
+        ) if (
+            planner_message is not None and not planner_message.tool_calls
+        ) else ""
         if planner_text:
             response_instruction += f"""
 
-Planner решил, что дополнительных инструментов больше не требуется, и оставил
-следующий черновик ответа:
+Planner решил, что дополнительных инструментов больше не требуется, и сформировал
+следующую выжимку проверенных фактов:
 
-<planner_draft>
+<planner_handoff>
 {planner_text}
-</planner_draft>
+</planner_handoff>
 
-Используй этот черновик как основу, но сверь его с реальными ToolMessage и
-выводом observer. Верни полноценный окончательный ответ, а не комментарий к
-черновику.
+Используй выжимку как навигацию по результатам, но точные значения и полный
+запрошенный вывод бери из реальных ToolMessage. Верни полноценный окончательный
+ответ, а не комментарий к выжимке.
 """.rstrip()
 
-        messages: List[BaseMessage] = [
-            SystemMessage(content=state["system_prompt"].strip()),
-            SystemMessage(content=response_instruction),
-        ]
+        system_parts = [state["system_prompt"].strip(), response_instruction]
+        runtime_context = _runtime_context(
+            state,
+            include_observations=False,
+        )
+        if runtime_context is not None:
+            system_parts.append(runtime_context)
 
-        runtime_message = _runtime_context(state)
-        if runtime_message is not None:
-            messages.append(runtime_message)
+        messages: List[BaseMessage] = [
+            SystemMessage(content="\n\n".join(system_parts))
+        ]
 
         messages.extend(state["messages"])
 
@@ -572,15 +847,13 @@ def run_agent_graph(
         "messages": initial_messages,
         "system_prompt": system_prompt,
         "planner_message": None,
-        "observation": None,
+        "observations": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
         "active_file_id": int(file_id) if file_id is not None else None,
     }
 
     config: Dict[str, Any] = {
-        # One tool iteration uses planner -> prepare -> tools -> observer.
-        # Add room for the initial planner and final responder.
         "recursion_limit": bounded_steps * 4 + 8,
         "run_name": "agent_chat",
     }
@@ -605,6 +878,25 @@ def run_agent_graph(
     if messages and isinstance(messages[-1], AIMessage):
         answer = _message_text(messages[-1])
         if answer:
+            for url in _visualization_urls(messages):
+                label = (
+                    "Открыть интерактивный граф связей S2T-таблиц"
+                    if url.startswith("/exports/s2t-graphs/")
+                    else "Открыть интерактивный SQL lineage-граф"
+                )
+                link = f"[{label}]({url})"
+                if url not in answer:
+                    answer += f"\n\n{link}"
+            for url in _s2t_graph_data_urls(messages):
+                link = f"[Открыть данные графа в JSON]({url})"
+                if link not in answer:
+                    answer += f"\n\n{link}"
+            logger.info(
+                "Agent final response (%d chars):\n%s",
+                len(answer),
+                answer,
+            )
             return answer
 
+    logger.warning("Agent finished without a final AIMessage response")
     return "Модель не вернула финальный ответ."

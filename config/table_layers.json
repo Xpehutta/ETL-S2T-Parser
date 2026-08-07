@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "sheet_group": "s2t",
+      "source_layer": "B",
+      "target_layer": "T"
+    },
+    {
+      "sheet_group": "additional_objects",
+      "source_layer": null,
+      "target_layer": "B"
+    }
+  ]
+}
