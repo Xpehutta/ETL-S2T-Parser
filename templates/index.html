@@ -319,7 +319,17 @@
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || 'Failed to clear application storage');
             fullReset();
-            window.alert('All SQLite data and the Neo4j projection were cleared.');
+            const graphError = (data.neo4j_deleted || {}).error;
+            const sqliteRows = Object.values(data.sqlite_deleted || {}).reduce(
+                (total, value) => total + Number(value || 0),
+                0
+            );
+            const graphNodes = Number((data.neo4j_deleted || {}).nodes || 0);
+            window.alert(
+                graphError
+                    ? `SQLite cleared: ${sqliteRows} rows. Neo4j was not cleared: ${graphError}`
+                    : `All SQLite data (${sqliteRows} rows) and the Neo4j projection (${graphNodes} nodes) were cleared.`
+            );
         } catch (err) {
             transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
         } finally {
