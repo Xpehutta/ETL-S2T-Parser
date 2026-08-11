@@ -496,6 +496,30 @@ def test_store_excel_data_preserves_filtered_source_row_numbers(
     assert row_numbers == [0, 3]
 
 
+def test_store_excel_data_keeps_rows_beyond_previous_limit(temp_db):
+    rows = [[f"value_{index}"] for index in range(1001)]
+    file_id = store_excel_data(
+        "all_rows.xlsx",
+        "test-model",
+        [
+            {
+                "sheet_name": "Sheet1",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["Value"],
+                "data_rows": rows,
+            }
+        ],
+    )
+
+    count, last_row = temp_db.execute(
+        "SELECT COUNT(*), MAX(row_num) FROM data WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+
+    assert (count, last_row) == (1001, 1000)
+
+
 def test_get_file_returns_complete_record(temp_db):
     file_id = store_excel_data(
         "record.xlsx",

@@ -60,88 +60,6 @@ def insert_s2t_transformations(file_id: int, records: List[Dict[str, Any]]) -> D
     return {"file_id": file_id, "count": len(records)}
 
 
-def replace_s2t_transformations_for_source_rows(
-    file_id: int,
-    source_table: str,
-    records: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Atomically replace generated rows matching metadata source rows."""
-    clean_file_id = int(file_id)
-    clean_source_table = _sql_identifier(source_table)
-    if any(int(row["file_id"]) != clean_file_id for row in records):
-        raise ValueError("All replacement records must belong to file_id")
-
-    insert_columns = (
-        "file_id",
-        "sheet_name",
-        "row_num",
-        *S2T_RECORD_FIELDS,
-    )
-    columns_sql = ", ".join(_sql_identifier(column) for column in insert_columns)
-    placeholders = ", ".join("?" for _ in insert_columns)
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("BEGIN")
-        cursor.execute(
-            f"""
-            SELECT COUNT(*) AS n
-            FROM s2t_transformations
-            WHERE file_id = ?
-              AND EXISTS (
-                  SELECT 1
-                  FROM {clean_source_table} AS source
-                  WHERE source.file_id = s2t_transformations.file_id
-                    AND source.sheet_name = s2t_transformations.sheet_name
-                    AND source.row_num = s2t_transformations.row_num
-              )
-            """,
-            (clean_file_id,),
-        )
-        deleted = int(cursor.fetchone()["n"])
-        cursor.execute(
-            f"""
-            DELETE FROM s2t_transformations
-            WHERE file_id = ?
-              AND EXISTS (
-                  SELECT 1
-                  FROM {clean_source_table} AS source
-                  WHERE source.file_id = s2t_transformations.file_id
-                    AND source.sheet_name = s2t_transformations.sheet_name
-                    AND source.row_num = s2t_transformations.row_num
-              )
-            """,
-            (clean_file_id,),
-        )
-        cursor.executemany(
-            f"""
-            INSERT INTO s2t_transformations
-            ({columns_sql})
-            VALUES ({placeholders})
-            """,
-            [
-                (
-                    row["file_id"],
-                    row["sheet_name"],
-                    row["row_num"],
-                    *(row.get(field) for field in S2T_RECORD_FIELDS),
-                )
-                for row in records
-            ],
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return {
-        "file_id": clean_file_id,
-        "deleted": deleted,
-        "count": len(records),
-    }
-
-
 def clear_s2t_transformations(file_id: int) -> int:
     """Delete generated S2T transformation rows for one workbook."""
     conn = get_db_connection()
@@ -157,14 +75,15 @@ def clear_s2t_transformations(file_id: int) -> int:
 
 def list_s2t_transformations(
     file_id: Optional[int] = None,
-    limit: int = 200,
+    limit: Optional[int] = 200,
     q: Optional[str] = None,
     columns: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Return minimal stored S2T transformations for UI/API browsing."""
-    clean_limit = max(1, min(int(limit or 200), 1000))
-    available_columns = ("row_num", *S2T_RECORD_FIELDS)
-    selected_columns = list(available_columns if columns is None else columns)
+    clean_limit = None if limit is None else max(1, min(int(limit or 200), 1000))
+    available_columns = ("file_id", "sheet_name", "row_num", *S2T_RECORD_FIELDS)
+    default_columns = ("row_num", *S2T_RECORD_FIELDS)
+    selected_columns = list(default_columns if columns is None else columns)
     invalid_columns = [column for column in selected_columns if column not in available_columns]
     if invalid_columns:
         return {
@@ -198,15 +117,16 @@ def list_s2t_transformations(
     cursor = conn.cursor()
     cursor.execute(f"SELECT COUNT(*) AS n FROM s2t_transformations WHERE {where_sql}", params)
     total = int(cursor.fetchone()["n"])
+    limit_sql = "" if clean_limit is None else "LIMIT ?"
     cursor.execute(
         f"""
         SELECT {selected_columns_sql}
         FROM s2t_transformations
         WHERE {where_sql}
         ORDER BY id
-        LIMIT ?
+        {limit_sql}
         """,
-        params + [clean_limit],
+        params if clean_limit is None else params + [clean_limit],
     )
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()

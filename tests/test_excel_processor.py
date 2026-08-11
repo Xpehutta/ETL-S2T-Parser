@@ -124,6 +124,7 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
         sheets = parse_excel_with_decisions(sample_excel_bytes)
 
     assert read_excel.call_count == 1
+    assert "nrows" not in read_excel.call_args.kwargs
     assert sheets[0]["columns"] == ["Name", "Age"]
     assert sheets[0]["header"] == {
         "start_row": 0,

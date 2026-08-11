@@ -1408,27 +1408,41 @@ def test_additional_objects_do_not_treat_cte_as_union_operand(s2t_db):
     )
 
 
-def test_additional_object_refresh_replaces_previous_generated_rows(s2t_db):
+def test_additional_object_refresh_keeps_previous_generated_rows(s2t_db):
     file_id = _store_structured_metadata()
     analysis = classify_file_sheet_groups(file_id, use_llm=False)
 
     first = extract_structured_metadata(file_id, analysis)
+    conn = get_db_connection()
+    try:
+        first_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM s2t_transformations WHERE file_id = ? ORDER BY id",
+                (file_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
     second_etl = extract_additional_object_transformations(file_id)
 
     first_etl = first["targets"]["additional_objects"]["etl_transformations"]
     assert first_etl["written"] == 2
-    assert first_etl["replaced"] == 0
-    assert second_etl["written"] == 2
-    assert second_etl["replaced"] == 2
+    assert first_etl["existing_object_count"] == 0
+    assert second_etl["written"] == 0
+    assert second_etl["existing_object_count"] == 2
     conn = get_db_connection()
     try:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM s2t_transformations WHERE file_id = ?",
-            (file_id,),
-        ).fetchone()[0]
+        second_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM s2t_transformations WHERE file_id = ? ORDER BY id",
+                (file_id,),
+            ).fetchall()
+        ]
     finally:
         conn.close()
-    assert count == 2
+    assert second_ids == first_ids
 
 
 def test_missing_structured_metadata_sheet_does_not_change_its_target(s2t_db):

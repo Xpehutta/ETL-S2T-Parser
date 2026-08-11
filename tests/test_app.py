@@ -132,6 +132,15 @@ def test_chat_app_has_loading_indicators(client):
     assert "return tableHtml(matrix[0], matrix.slice(1))" in body
     assert "window.sessionStorage" in body
     assert "clearChatHistoryBtn" in body
+    assert 'id="viewAllTransformationsBtn"' in body
+    assert "showAllTransformations" in body
+    assert "fetch('/transformations?full=true')" in body
+    assert "transformationsTableHtml" in body
+    assert "max-height: min(520px, 58vh)" in body
+    assert "overflow: auto" in body
+    assert "position: sticky" in body
+    assert 'aria-label="Полная таблица трансформаций с прокруткой"' in body
+    assert 'aria-label="Таблица с прокруткой"' in body
     assert "sessionStorage.getItem(CHAT_SESSION_ID_STORAGE_KEY)" in body
     assert "JSON.stringify({ query, file_id: currentFileId, history, session_id: currentSessionId })" in body
     assert 'id="clearAllDataBtn"' in body
@@ -487,6 +496,29 @@ def test_get_transformations(client):
     assert "table_transformation_sql" not in body["rows"][0]
 
 
+def test_get_all_transformations_can_return_full_global_table(client):
+    conn = get_db_connection()
+    conn.executemany(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, target_table)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [(304, 206, "S2T", 1, "t_first"), (305, 207, "S2T", 2, "t_second")],
+    )
+    conn.commit()
+    conn.close()
+
+    response = client.get("/transformations?full=true")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["scope"] == "global"
+    assert body["total"] == 2
+    assert body["limit"] is None
+    assert [row["file_id"] for row in body["rows"]] == [206, 207]
+
+
 def test_get_transformations_filter(client):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -625,6 +657,7 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
 
     assert response.status_code == 200
     assert response.get_json() == {
+        "status": "ok",
         "sqlite_deleted": {
             "files": 1,
             "file_sheet_headers": 1,
@@ -639,6 +672,7 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
         "memory_deleted": {
             "progress_entries": 1,
         },
+        "warnings": [],
     }
     mock_clear_graph.assert_called_once_with()
     conn = get_db_connection()
@@ -663,7 +697,7 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
 
 
 @patch("app.clear_graph_projection", side_effect=RuntimeError("Neo4j unavailable"))
-def test_delete_all_storage_keeps_sqlite_when_neo4j_fails(
+def test_delete_all_storage_clears_sqlite_when_neo4j_fails(
     mock_clear_graph,
     client,
 ):
@@ -679,14 +713,38 @@ def test_delete_all_storage_keeps_sqlite_when_neo4j_fails(
 
     response = client.delete("/storage")
 
-    assert response.status_code == 500
-    assert response.get_json() == {"error": "Neo4j unavailable"}
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "status": "partial",
+        "sqlite_deleted": {
+            "files": 1,
+            "file_sheet_headers": 0,
+            "source_tables": 0,
+            "target_tables": 0,
+            "additional_objects": 0,
+            "pxf_to_a": 0,
+            "s2t_transformations": 0,
+            "data": 0,
+        },
+        "neo4j_deleted": {
+            "nodes": 0,
+            "skipped": True,
+            "error": "Neo4j unavailable",
+        },
+        "memory_deleted": {"progress_entries": 0},
+        "warnings": [
+            {
+                "storage": "neo4j",
+                "error": "Neo4j unavailable",
+            }
+        ],
+    }
     mock_clear_graph.assert_called_once_with()
     conn = get_db_connection()
     try:
         assert conn.execute(
             "SELECT COUNT(*) FROM files"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

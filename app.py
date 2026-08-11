@@ -268,15 +268,35 @@ def get_description(file_id: int):
         }
     ), 200
 
-@app.route('/transformations/<int:file_id>', methods=['GET'])
-def get_transformations(file_id: int):
+def _get_transformations_response(file_id: Optional[int] = None):
     try:
-        limit = request.args.get("limit", 200, type=int)
+        full = request.args.get("full", "false").lower() == "true"
+        limit = None if full else request.args.get("limit", 200, type=int)
         q = request.args.get("q", "", type=str).strip()
-        return jsonify(list_s2t_transformations(file_id, limit=limit, q=q or None)), 200
+        columns = None
+        if full:
+            columns = [
+                "file_id", "sheet_name", "row_num", "target_layer", "target_table",
+                "target_field", "source_layer", "source_table", "source_field",
+                "transformation_rule",
+            ]
+        return jsonify(
+            list_s2t_transformations(file_id, limit=limit, q=q or None, columns=columns)
+        ), 200
     except Exception as e:
         logger.exception("Failed to load S2T transformations")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/transformations', methods=['GET'])
+def get_all_transformations():
+    """Return global S2T transformations for the chat table viewer."""
+    return _get_transformations_response()
+
+
+@app.route('/transformations/<int:file_id>', methods=['GET'])
+def get_transformations(file_id: int):
+    return _get_transformations_response(file_id)
 
 
 @app.route('/transformations/<int:file_id>', methods=['DELETE'])
@@ -292,23 +312,43 @@ def delete_transformations(file_id: int):
 @app.route('/storage', methods=['DELETE'])
 def delete_all_storage():
     try:
-        graph_deleted = clear_graph_projection()
         sqlite_deleted = clear_all_data()
-        with analysis_progress_lock:
-            progress_entries = len(analysis_progress)
-            analysis_progress.clear()
-        return jsonify(
-            {
-                "sqlite_deleted": sqlite_deleted,
-                "neo4j_deleted": graph_deleted,
-                "memory_deleted": {
-                    "progress_entries": progress_entries,
-                },
-            }
-        ), 200
     except Exception as e:
-        logger.exception("Failed to clear all application storage")
-        return jsonify({"error": str(e)}), 500
+        logger.exception("Failed to clear SQLite application storage")
+        return jsonify({"error": str(e), "storage": "sqlite"}), 500
+
+    with analysis_progress_lock:
+        progress_entries = len(analysis_progress)
+        analysis_progress.clear()
+
+    warnings = []
+    try:
+        graph_deleted = clear_graph_projection()
+    except Exception as e:
+        logger.warning("SQLite cleared, but Neo4j cleanup failed: %s", e)
+        graph_deleted = {
+            "nodes": 0,
+            "skipped": True,
+            "error": str(e),
+        }
+        warnings.append(
+            {
+                "storage": "neo4j",
+                "error": str(e),
+            }
+        )
+
+    return jsonify(
+        {
+            "status": "partial" if warnings else "ok",
+            "sqlite_deleted": sqlite_deleted,
+            "neo4j_deleted": graph_deleted,
+            "memory_deleted": {
+                "progress_entries": progress_entries,
+            },
+            "warnings": warnings,
+        }
+    ), 200
 
 
 @app.route('/sheet_groups/<int:file_id>/classify', methods=['GET'])

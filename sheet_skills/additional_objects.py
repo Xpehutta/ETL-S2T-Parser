@@ -16,7 +16,7 @@ from agents.llm_factory import create_chat_model
 from config.table_layers import resolve_sheet_layers
 from services.sql_dialects import GREENPLUM_DIALECT
 from storage.database import get_db_connection
-from storage.s2t import replace_s2t_transformations_for_source_rows
+from storage.s2t import insert_s2t_transformations
 
 
 def _text(value: Any) -> Optional[str]:
@@ -693,7 +693,7 @@ def _parse_object(
 
 
 def extract_additional_object_transformations(file_id: int) -> Dict[str, Any]:
-    """Parse every stored additional object and append its column lineage."""
+    """Append lineage only for additional-object source rows not processed before."""
     conn = get_db_connection()
     try:
         source_rows = [
@@ -708,27 +708,66 @@ def extract_additional_object_transformations(file_id: int) -> Dict[str, Any]:
                 (int(file_id),),
             ).fetchall()
         ]
+        existing_source_keys = {
+            (str(row["sheet_name"]), int(row["row_num"]))
+            for row in conn.execute(
+                """
+                SELECT DISTINCT transformations.sheet_name, transformations.row_num
+                FROM s2t_transformations AS transformations
+                WHERE transformations.file_id = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM additional_objects AS source
+                      WHERE source.file_id = transformations.file_id
+                        AND source.sheet_name = transformations.sheet_name
+                        AND source.row_num = transformations.row_num
+                  )
+                """,
+                (int(file_id),),
+            ).fetchall()
+        }
     finally:
         conn.close()
 
     records: List[Dict[str, Any]] = []
     objects = []
     for source_row in source_rows:
+        source_key = (str(source_row["sheet_name"]), int(source_row["row_num"]))
+        if source_key in existing_source_keys:
+            objects.append(
+                {
+                    "additional_object_id": int(source_row["id"]),
+                    "sheet_name": source_row["sheet_name"],
+                    "row_num": int(source_row["row_num"]),
+                    "name": _text(source_row.get("name")),
+                    "dialect": GREENPLUM_DIALECT,
+                    "written": 0,
+                    "status": "already_present",
+                    "llm_repair_attempted": False,
+                    "llm_repair_status": "not_needed",
+                    "errors": [],
+                }
+            )
+            continue
         object_records, object_report = _parse_object(source_row)
         records.extend(object_records)
         objects.append(object_report)
-    replacement = replace_s2t_transformations_for_source_rows(
-        file_id,
-        "additional_objects",
-        records,
-    )
+    if records:
+        insert_s2t_transformations(file_id, records)
     return {
-        "status": "ok" if all(item["status"] == "ok" for item in objects) else "partial",
+        "status": (
+            "ok"
+            if all(item["status"] in {"ok", "already_present"} for item in objects)
+            else "partial"
+        ),
         "file_id": int(file_id),
         "dialect": GREENPLUM_DIALECT,
         "objects": objects,
         "object_count": len(objects),
         "parsed_object_count": sum(item["written"] > 0 for item in objects),
+        "existing_object_count": sum(
+            item["status"] == "already_present" for item in objects
+        ),
         "error_count": sum(bool(item["errors"]) for item in objects),
         "repair_attempt_count": sum(
             bool(item["llm_repair_attempted"]) for item in objects
@@ -741,7 +780,6 @@ def extract_additional_object_transformations(file_id: int) -> Dict[str, Any]:
             for item in objects
         ),
         "written": len(records),
-        "replaced": replacement["deleted"],
     }
 
 

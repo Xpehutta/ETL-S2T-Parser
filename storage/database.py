@@ -481,9 +481,8 @@ def store_excel_data(
     filename: str,
     model_used: str,
     sheets: List[Dict[str, Any]],
-    max_rows_per_sheet: int = 1000,
 ) -> int:
-    """Store one workbook upload; equal files and equal rows remain separate records."""
+    """Store every parsed row of one workbook; equal facts remain separate records."""
     upload_time = datetime.now().isoformat()
     conn = get_db_connection()
     try:
@@ -552,7 +551,7 @@ def store_excel_data(
                 raise ValueError(
                     f"data_row_numbers length does not match data_rows for sheet {sheet_name}"
                 )
-            for row_index, row in enumerate(data_rows[:max_rows_per_sheet]):
+            for row_index, row in enumerate(data_rows):
                 row_num = (
                     int(data_row_numbers[row_index])
                     if data_row_numbers is not None

@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {"xlsx", "xls", "xlsm"}
 PREVIEW_ROWS = 10
-MAX_DATA_ROWS = 10000
 MergedRange = Tuple[int, int, int, int]
 
 
@@ -342,9 +341,7 @@ def _parse_loaded_sheet(
         return {"skip_reason": error, "detail": f"{sheet_name}: не найдены {missing}"}
 
     data_frame = _expand_merged_values(frame, merged_ranges or [], data_start)
-    data_positions = list(
-        range(data_start, min(data_start + MAX_DATA_ROWS, len(data_frame)))
-    )
+    data_positions = list(range(data_start, len(data_frame)))
     if not include_hidden_rows:
         hidden = hidden_rows or set()
         data_positions = [position for position in data_positions if position not in hidden]
@@ -424,7 +421,6 @@ def parse_excel_with_decisions(
                 excel_file,
                 sheet_name=sheet_name,
                 header=None,
-                nrows=PREVIEW_ROWS + MAX_DATA_ROWS,
             )
             parsed = _parse_loaded_sheet(
                 frame,

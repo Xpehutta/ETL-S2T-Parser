@@ -179,7 +179,13 @@
         }
         .message .table-responsive {
             max-width: min(1240px, 92vw);
-            overflow-x: auto;
+            max-height: min(520px, 58vh);
+            overflow: auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: #fff;
         }
         .message th,
         .message td {
@@ -191,6 +197,9 @@
             overflow-wrap: anywhere;
         }
         .message th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
             background: #eef4fb;
             white-space: nowrap;
         }
@@ -333,6 +342,7 @@
             <div class="status-label mt-3">S2T transformations</div>
             <div id="currentTransformations" class="status-value text-muted">-</div>
             <div class="d-grid gap-2 mt-3">
+                <button id="viewAllTransformationsBtn" class="btn btn-outline-primary btn-sm" type="button">Показать полную таблицу трансформаций</button>
                 <button id="clearAllDataBtn" class="btn btn-outline-danger btn-sm" type="button">Очистить все данные</button>
             </div>
         </div>
@@ -396,6 +406,7 @@
     const currentFileNameEl = document.getElementById('currentFileName');
     const currentFileIdEl = document.getElementById('currentFileId');
     const currentTransformationsEl = document.getElementById('currentTransformations');
+    const viewAllTransformationsBtn = document.getElementById('viewAllTransformationsBtn');
     const clearAllDataBtn = document.getElementById('clearAllDataBtn');
     const quickActionButtons = document.querySelectorAll('[data-prompt]');
     const analysisProgress = document.getElementById('analysisProgress');
@@ -414,6 +425,7 @@
         fileInput.disabled = value;
         includeHiddenRows.disabled = value;
         uploadSubmitBtn.disabled = value;
+        viewAllTransformationsBtn.disabled = value;
         clearAllDataBtn.disabled = value;
         quickActionButtons.forEach((button) => {
             button.disabled = value;
@@ -509,6 +521,7 @@
 
     sendBtn.addEventListener('click', sendChat);
     clearChatHistoryBtn.addEventListener('click', clearChatHistory);
+    viewAllTransformationsBtn.addEventListener('click', showAllTransformations);
     clearAllDataBtn.addEventListener('click', clearAllData);
     chatInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
@@ -547,6 +560,23 @@
             appendChatHistory('assistant', answer);
         } catch (error) {
             addMessage('agent', `Ошибка: ${error.message}`);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function showAllTransformations() {
+        if (busy) return;
+
+        addMessage('user', 'Показать полную таблицу трансформаций');
+        setBusy(true, 'Загружаю полную таблицу трансформаций...');
+        try {
+            const response = await fetch('/transformations?full=true');
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Не удалось загрузить трансформации');
+            addTransformationsTableMessage(data);
+        } catch (error) {
+            addMessage('agent', `Ошибка загрузки таблицы трансформаций: ${error.message}`);
         } finally {
             setBusy(false);
         }
@@ -648,11 +678,14 @@
                 0
             );
             const graphNodes = Number((data.neo4j_deleted || {}).nodes || 0);
+            const graphError = (data.neo4j_deleted || {}).error;
             setCurrentFile({});
             fileInput.value = '';
             addMessage(
                 'system',
-                `Полная очистка завершена: SQLite — ${sqliteRows} строк, Neo4j — ${graphNodes} узлов.`
+                graphError
+                    ? `SQLite очищена: ${sqliteRows} строк. Neo4j пока не очищен: ${graphError}`
+                    : `Полная очистка завершена: SQLite — ${sqliteRows} строк, Neo4j — ${graphNodes} узлов.`
             );
         } catch (error) {
             addMessage('agent', `Ошибка очистки: ${error.message}`);
@@ -671,6 +704,32 @@
         messages.appendChild(node);
         messages.scrollTop = messages.scrollHeight;
         return node;
+    }
+
+    function addTransformationsTableMessage(data) {
+        const node = document.createElement('div');
+        node.className = 'message message-agent message-wide';
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        if (!rows.length) {
+            node.textContent = 'В таблице s2t_transformations пока нет строк.';
+        } else {
+            node.innerHTML = `<div class="mb-2">Полная таблица трансформаций: ${escapeHtml(data.total)} строк.</div>${transformationsTableHtml(rows)}`;
+        }
+        messages.appendChild(node);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function transformationsTableHtml(rows) {
+        const columns = [
+            ['file_id', 'Файл'], ['sheet_name', 'Лист'], ['row_num', '#'],
+            ['target_layer', 'Целевой слой'], ['target_table', 'Целевая таблица'],
+            ['target_field', 'Целевое поле'], ['source_layer', 'Исходный слой'],
+            ['source_table', 'Исходная таблица'], ['source_field', 'Исходное поле'],
+            ['transformation_rule', 'Правило трансформации']
+        ];
+        const header = columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join('');
+        const body = rows.map((row) => `<tr>${columns.map(([key]) => `<td>${escapeHtml(row[key] ?? '')}</td>`).join('')}</tr>`).join('');
+        return `<div class="table-responsive" tabindex="0" role="region" aria-label="Полная таблица трансформаций с прокруткой"><table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
 
     function showLoadingMessage(text) {
@@ -855,7 +914,7 @@
     function tableHtml(header, rows) {
         const head = header.map((cell) => `<th>${renderInline(cell)}</th>`).join('');
         const body = rows.map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell)}</td>`).join('')}</tr>`).join('');
-        return `<div class="table-responsive"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+        return `<div class="table-responsive" tabindex="0" role="region" aria-label="Таблица с прокруткой"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
 
     function renderInline(text) {
