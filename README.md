@@ -6,9 +6,9 @@
 
 ETL S2T Agent — chat-first приложение для загрузки и анализа Excel-файлов с Source-to-Target-маппингами. Оно сохраняет исходные факты в SQLite, извлекает S2T- и SQL-lineage, при наличии Neo4j строит графовую проекцию и отвечает на вопросы через многоагентный LangGraph.
 
-> **Baseline качества:** [live-отчёт от 3 сентября 2026 года](LIVE_AGENT_STATUS_REPORT_2026-09-03.md). Он фиксирует последнюю сохранённую семантическую оценку, состояние загрузки и причины оставшихся провалов; текущий состав тестов описан ниже.
+> **Актуальное состояние функций:** [отчёт от 15 сентября 2026 года](LIVE_AGENT_ADDED_FEATURES_AND_WORD_9_REPORT_2026-09-15.md). Он описывает добавленные возможности и статус девяти основных Word-требований.
 
-> **Последний независимый holdout:** [A/B-отчёт от 9 сентября 2026 года](LIVE_MULTIAGENT_HOLDOUT_REPORT_2026-09-09.md). Он фиксирует отрицательный результат сравнения двух multiagent-конфигураций на GigaChat-2-Max; candidate не принят.
+> **Актуальный benchmark локальных моделей:** [полный CORE29-отчёт от 18 сентября 2026 года](CORE29_TOP2_FULL_REPORT.md). Он сравнивает лучшие локальные модели на основном Word‑9 и расширенном наборе из 22 сценариев.
 
 Исторические демонстрации и отчёты предыдущих прогонов собраны в
 [`docs/history/`](docs/history/README.md) и не описывают текущее поведение.
@@ -329,6 +329,8 @@ OLLAMA_NUM_CTX=16384
 OLLAMA_TIMEOUT=120
 OLLAMA_TEMPERATURE=0
 OLLAMA_REASONING=0
+# auto | native | text; auto uses text tool calls for deepseek-r1 and llama3.1
+OLLAMA_TOOL_CALL_MODE=auto
 ```
 
 ### OpenRouter
@@ -402,13 +404,15 @@ decision и upstream answer не
 подменяются. Запросы выполняются строго последовательно, без batching и
 параллельного pytest.
 
-Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает текущий запрос, role-aware историю, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок. Пользовательские сообщения истории считаются условиями задачи, а неподтверждённый текст assistant — нет.
+Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает текущий запрос, role-aware историю, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок. Пользовательские сообщения истории считаются условиями задачи, а неподтверждённый текст assistant — нет. `LLM_JUDGE_PROVIDER` может независимо выбрать provider judge; например, локального Ollama-агента можно оценивать через `LLM_JUDGE_PROVIDER=gigachat` и `GIGACHAT_JUDGE_MODEL=GigaChat-2-Max`.
 
 ```powershell
 $env:RUN_LIVE_AGENT_SCENARIOS = "1"
 $env:LIVE_AGENT_MODE = "multiagent"
 $env:LLM_PROVIDER = "ollama"
 $env:OLLAMA_MODEL = "qwen3.5:9b"
+$env:LLM_JUDGE_PROVIDER = "gigachat"
+$env:GIGACHAT_JUDGE_MODEL = "GigaChat-2-Max"
 $env:LIVE_AGENT_DB_PATH = "C:\path\to\live-excel-data.db"
 $env:LIVE_AGENT_TRANSCRIPT_PATH = ".test_runs/live-agent.md"
 pytest tests/test_live_agent_scenarios.py -q
@@ -567,8 +571,8 @@ Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и 
 одно семейство не прошло preregistered gate. Combined score изменился с 7/20 до
 9/20, при этом semantic score снизился с 16/20 до 15/20, candidate agent tokens
 выросли на 76,3%, а `epistemic_state_machine` дал regression с HTTP 500.
-Продвигать варианты нельзя; подробности —
-[`LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`](LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md).
+Продвигать варианты нельзя: результаты этого исторического эксперимента не
+описывают текущий runtime.
 
 Для development-проверки SQL-risk operation scope доступен отдельный
 opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=1`.
