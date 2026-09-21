@@ -11,7 +11,7 @@ help:
 	@echo "  lint         Run linter (ruff)"
 	@echo "  format       Format code (black)"
 	@echo "  clean        Remove cache and temporary files"
-	@echo "  run          Run the Flask application"
+	@echo "  run          Run the FastAPI application"
 
 install:
 	uv sync --no-dev
@@ -41,4 +41,4 @@ clean:
 	rm -f excel_data.db  # optional – remove local database
 
 run:
-	uv run python app.py
+	uv run uvicorn app:app --host 127.0.0.1 --port 8000

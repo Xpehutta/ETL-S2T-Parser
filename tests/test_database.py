@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 import json
 import datetime
@@ -684,6 +686,66 @@ def test_store_excel_data(temp_db):
     data_table_names = {row["table_name"] for row in cursor.fetchall()}
     assert data_table_names == {"Sheet1"}
     conn.close()
+
+
+def test_store_excel_data_rolls_back_all_writes_on_failure(temp_db):
+    valid_sheet = {
+        "sheet_name": "First",
+        "skip_reason": None,
+        "header": {"start_row": 0, "row_count": 1, "nested": False},
+        "columns": ["Value"],
+        "data_rows": [["saved only if the transaction commits"]],
+    }
+    invalid_sheet = {
+        "sheet_name": "Second",
+        "skip_reason": None,
+        "header": {"start_row": 0, "row_count": 1, "nested": False},
+        "columns": ["Value"],
+        "data_rows": [["one"], ["two"]],
+        "data_row_numbers": [0],
+    }
+
+    with pytest.raises(ValueError, match="data_row_numbers length"):
+        store_excel_data(
+            "rollback.xlsx",
+            "test-model",
+            [valid_sheet, invalid_sheet],
+        )
+
+    assert temp_db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert temp_db.execute("SELECT COUNT(*) FROM data").fetchone()[0] == 0
+
+
+def test_store_excel_data_rolls_back_on_cancellation(temp_db, monkeypatch):
+    def cancel_during_header_serialization(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "storage.database.json.dumps",
+        cancel_during_header_serialization,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        store_excel_data(
+            "cancelled.xlsx",
+            "test-model",
+            [
+                {
+                    "sheet_name": "Sheet1",
+                    "skip_reason": None,
+                    "header": {
+                        "start_row": 0,
+                        "row_count": 1,
+                        "nested": False,
+                    },
+                    "columns": ["Value"],
+                    "data_rows": [["not committed"]],
+                }
+            ],
+        )
+
+    assert temp_db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert temp_db.execute("SELECT COUNT(*) FROM data").fetchone()[0] == 0
 
 
 def test_store_excel_data_preserves_filtered_source_row_numbers(

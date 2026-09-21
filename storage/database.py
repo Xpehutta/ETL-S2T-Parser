@@ -960,7 +960,7 @@ def store_excel_data(
 
         conn.commit()
         return current_file_id
-    except Exception:
+    except BaseException:
         conn.rollback()
         raise
     finally:

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from .agent import chat_model
+from .async_runtime import ainvoke_compat, ainvoke_graph_compat, run_coroutine_sync
 from .chat_graph import WorkerRunResult
 from .coordinator import (
     COORDINATOR_CONTEXT_MAX_CHARS,
     coordinator_chat,
+    coordinator_chat_async,
 )
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import (
@@ -25,10 +30,25 @@ from .run_metrics import (
 from .worker import resolve_worker_display_refs
 
 logger = logging.getLogger(__name__)
+_DEFAULT_SYNC_COORDINATOR_CHAT = coordinator_chat
+
+
+async def _call_coordinator_chat(task: str, **kwargs: Any) -> Any:
+    """Keep legacy injected coordinators off the event loop."""
+
+    if coordinator_chat is not _DEFAULT_SYNC_COORDINATOR_CHAT:
+        return await asyncio.to_thread(coordinator_chat, task, **kwargs)
+    return await coordinator_chat_async(task, **kwargs)
 
 _DELEGATE_TOOL_NAME = "delegate_to_coordinator"
 _EMPTY_DECISION_MAX_RETRIES = 1
 _RESOLVED_REFERENCES_MAX_CHARS = COORDINATOR_CONTEXT_MAX_CHARS
+_PSEUDO_DELEGATE_KEYS = {
+    "resolved_references",
+    "context",
+    "current_query",
+    "delegate_to_coordinator",
+}
 
 
 class SupervisorGraphState(TypedDict):
@@ -190,6 +210,65 @@ def _message_text(result: Any) -> str:
     return str(content or "").strip()
 
 
+def _pseudo_delegate_message(message: AIMessage) -> Optional[AIMessage]:
+    """Recover a single handoff emitted as JSON text instead of a tool call.
+
+    Some local tool-capable models serialize the arguments of the only bound
+    tool into ``content``. The two handoff field names are internal and form
+    a narrow discriminator, so ordinary JSON answers remain direct answers.
+    """
+    if message.tool_calls:
+        return None
+    text = _message_text(message)
+    if not text:
+        return None
+
+    fenced = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    candidate = fenced.group(1) if fenced else text[text.find("{") :]
+    if not candidate or not candidate.startswith("{"):
+        return None
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    payload_keys = {str(key) for key in payload}
+    required_keys = {"resolved_references", "context"}
+    if not required_keys.issubset(payload_keys):
+        return None
+    if payload_keys - _PSEUDO_DELEGATE_KEYS:
+        return None
+
+    def handoff_text(value: Any) -> str:
+        if value is None or value == [] or value == {}:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": _DELEGATE_TOOL_NAME,
+                "args": {
+                    "resolved_references": handoff_text(
+                        payload.get("resolved_references")
+                    ),
+                    "context": handoff_text(payload.get("context")),
+                },
+                "id": "recovered-pseudo-delegate",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
 def _parse_delegate_handoff(decision: Any) -> tuple[str, str]:
     """Validate the native supervisor handoff without interpreting its text."""
 
@@ -272,13 +351,16 @@ def build_supervisor_graph(
     model_config = {"callbacks": callback_list} if callback_list else None
     supervisor_model = model.bind_tools([_delegate_tool_schema()])
 
-    def invoke_supervisor(call_messages: Sequence[BaseMessage]) -> AIMessage:
+    async def invoke_supervisor(
+        call_messages: Sequence[BaseMessage],
+    ) -> AIMessage:
         try:
             with llm_stage("supervisor"):
-                result = (
-                    supervisor_model.invoke(call_messages, config=model_config)
-                    if model_config is not None
-                    else supervisor_model.invoke(call_messages)
+                result = await ainvoke_compat(
+                    supervisor_model,
+                    call_messages,
+                    config=model_config,
+                    category="llm",
                 )
         except Exception as exc:
             raise RuntimeError(
@@ -288,8 +370,10 @@ def build_supervisor_graph(
             return AIMessage(content=_message_text(result))
         return result
 
-    def supervisor_node(state: SupervisorGraphState) -> Dict[str, Any]:
-        decision = invoke_supervisor(
+    async def supervisor_node(
+        state: SupervisorGraphState,
+    ) -> Dict[str, Any]:
+        decision = await invoke_supervisor(
             _supervisor_messages(
                 current_query=state["current_query"],
                 recent_history=state["recent_history"],
@@ -303,13 +387,20 @@ def build_supervisor_graph(
                 retry_index + 1,
                 _EMPTY_DECISION_MAX_RETRIES,
             )
-            decision = invoke_supervisor(
+            decision = await invoke_supervisor(
                 _supervisor_messages(
                     current_query=state["current_query"],
                     recent_history=state["recent_history"],
                     repair_empty=True,
                 )
             )
+        recovered_decision = _pseudo_delegate_message(decision)
+        if recovered_decision is not None:
+            logger.warning(
+                "Supervisor emitted delegate arguments as text; recovered "
+                "delegate_to_coordinator native call"
+            )
+            decision = recovered_decision
         final_answer = None if decision.tool_calls else _message_text(decision)
         if not decision.tool_calls and not final_answer:
             raise RuntimeError(
@@ -323,24 +414,30 @@ def build_supervisor_graph(
             "final_answer": final_answer,
         }
 
-    def coordinator_node(state: SupervisorGraphState) -> Dict[str, Any]:
+    async def coordinator_node(
+        state: SupervisorGraphState,
+    ) -> Dict[str, Any]:
         decision = state.get("supervisor_message")
         if decision is None or not decision.tool_calls:
             raise RuntimeError(
                 "Supervisor вызвал coordinator без delegate_to_coordinator."
             )
         delegated_task = str(state["current_query"]).strip()
-        resolved_references, delegated_context = _parse_delegate_handoff(
-            decision
-        )
         if not state["recent_history"]:
-            if resolved_references or delegated_context:
-                logger.warning(
-                    "Supervisor emitted history-derived handoff fields without "
-                    "history; discarding them"
+            if (
+                len(decision.tool_calls) != 1
+                or decision.tool_calls[0].get("name") != _DELEGATE_TOOL_NAME
+            ):
+                raise RuntimeError(
+                    "Supervisor должен вернуть ровно один native call "
+                    f"{_DELEGATE_TOOL_NAME}."
                 )
             resolved_references = ""
             delegated_context = ""
+        else:
+            resolved_references, delegated_context = _parse_delegate_handoff(
+                decision
+            )
         if resolved_references:
             delegated_task = (
                 f"{delegated_task}\n\n"
@@ -356,7 +453,7 @@ def build_supervisor_graph(
             "Supervisor delegated coordinator task=%s",
             delegated_task[:1000],
         )
-        coordinator_result = coordinator_chat(
+        coordinator_result = await _call_coordinator_chat(
             delegated_task,
             context=delegated_context,
         )
@@ -395,7 +492,7 @@ def build_supervisor_graph(
     return graph.compile()
 
 
-def _supervisor_chat_impl(
+async def _supervisor_chat_impl_async(
     clean_query: str,
     *,
     history: Optional[List[Dict[str, str]]] = None,
@@ -436,7 +533,11 @@ def _supervisor_chat_impl(
         tags=["supervisor", "coordinator", "worker", "experiment"],
     ):
         try:
-            final_state = graph.invoke(initial_state, config=graph_config)
+            final_state = await ainvoke_graph_compat(
+                graph,
+                initial_state,
+                config=graph_config,
+            )
             final_answer = str(final_state.get("final_answer") or "").strip()
             if not final_answer:
                 raise RuntimeError("Supervisor LangGraph завершился без ответа.")
@@ -447,12 +548,12 @@ def _supervisor_chat_impl(
                 answer=final_answer,
                 display_items=display_items,
             )
-        except Exception:
+        except BaseException:
             resolve_worker_display_refs(collected_display_refs)
             raise
 
 
-def supervisor_chat(
+async def supervisor_chat_async(
     user_query: str,
     *,
     history: Optional[List[Dict[str, str]]] = None,
@@ -467,15 +568,33 @@ def supervisor_chat(
         )
 
     with capture_agent_run(session_id):
-        return _supervisor_chat_impl(
+        return await _supervisor_chat_impl_async(
             clean_query,
             history=history,
             session_id=session_id,
         )
 
 
+def supervisor_chat(
+    user_query: str,
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+) -> WorkerRunResult:
+    """Compatibility facade for non-ASGI callers."""
+
+    return run_coroutine_sync(
+        supervisor_chat_async(
+            user_query,
+            history=history,
+            session_id=session_id,
+        )
+    )
+
+
 __all__ = [
     "SupervisorGraphState",
     "build_supervisor_graph",
     "supervisor_chat",
+    "supervisor_chat_async",
 ]

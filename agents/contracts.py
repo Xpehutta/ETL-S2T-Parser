@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Mapping, Optional
 
@@ -10,6 +11,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -311,11 +313,23 @@ class Observation(BaseModel):
     @classmethod
     def _discard_non_reroute_metadata(cls, value: Any) -> Any:
         """Treat status as authoritative for provider-added route metadata."""
-        if not isinstance(value, Mapping) or value.get("status") == "reroute":
+        if not isinstance(value, Mapping):
             return value
         normalized = dict(value)
-        normalized.pop("reroute_reason", None)
-        normalized.pop("required_capabilities", None)
+        for input_only_field in (
+            "prior_state",
+            "accepted_evidence",
+            "tool_calls",
+            "tool_results",
+            "candidate_answer",
+            "available_tools",
+            "user_request",
+            "previous_results",
+        ):
+            normalized.pop(input_only_field, None)
+        if normalized.get("status") != "reroute":
+            normalized.pop("reroute_reason", None)
+            normalized.pop("required_capabilities", None)
         return normalized
 
     @field_validator(
@@ -325,16 +339,47 @@ class Observation(BaseModel):
         mode="before",
     )
     @classmethod
-    def _remove_blank_list_items(cls, value: Any) -> List[str]:
+    def _remove_blank_list_items(
+        cls,
+        value: Any,
+        info: ValidationInfo,
+    ) -> List[str]:
         if value is None:
             return []
         if not isinstance(value, list):
             raise ValueError("observation list fields must be arrays")
-        return [
+        values = [
             clean_item
             for item in value
             if (clean_item := str(item or "").strip())
         ]
+        if info.field_name == "required_capabilities":
+            aliases = {
+                "source_column_catalog_read": "column_catalog_read",
+                "target_column_catalog_read": "column_catalog_read",
+                "column_metadata_read": "column_catalog_read",
+                "s2t_catalog_read": "s2t_read",
+            }
+            values = [aliases.get(item, item) for item in values]
+        return values
+
+    @field_validator("reroute_reason", mode="before")
+    @classmethod
+    def _unwrap_reroute_reason(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        allowed = {
+            "missing_capability",
+            "unresolved_entity",
+            "wrong_arguments",
+            "truncated_result",
+            "tool_error",
+        }
+        for key in ("type", "code", "reroute_reason"):
+            candidate = str(value.get(key) or "").strip()
+            if candidate in allowed:
+                return candidate
+        return value
 
     @field_validator("accepted_tool_call_ids")
     @classmethod
@@ -544,9 +589,17 @@ class WorkerOutcome(BaseModel):
 
 
 class PlanStep(BaseModel):
-    """One ready-to-run worker task selected by the downstream planner."""
+    """One worker task and its explicit DAG dependencies."""
 
     model_config = ConfigDict(extra="forbid")
+
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Уникальный стабильный ID шага. Для legacy-плана без ID "
+            "coordinator создаёт последовательные step_1..step_N."
+        ),
+    )
 
     task: str = Field(
         min_length=1,
@@ -555,6 +608,25 @@ class PlanStep(BaseModel):
             "Производный анализ выполняет upstream coordinator."
         ),
     )
+    depends_on: List[str] = Field(
+        default_factory=list,
+        description=(
+            "ID шагов, результаты которых нужны этой task. Пустой список "
+            "означает, что task готова к независимому запуску."
+        ),
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        clean_value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", clean_value):
+            raise ValueError(
+                "id must use 1-64 ASCII letters, digits, '.', '_' or '-'"
+            )
+        return clean_value
 
     @field_validator("task")
     @classmethod
@@ -564,9 +636,30 @@ class PlanStep(BaseModel):
             raise ValueError("task must not be blank")
         return clean_value
 
+    @field_validator("depends_on")
+    @classmethod
+    def _validate_dependencies(cls, values: List[str]) -> List[str]:
+        result: List[str] = []
+        for value in values:
+            clean_value = str(value or "").strip()
+            if not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}",
+                clean_value,
+            ):
+                raise ValueError(
+                    "depends_on IDs must use 1-64 ASCII letters, digits, "
+                    "'.', '_' or '-'"
+                )
+            if clean_value in result:
+                raise ValueError(
+                    f"depends_on must not contain duplicate ID {clean_value!r}"
+                )
+            result.append(clean_value)
+        return result
+
 
 class WorkerPlan(BaseModel):
-    """Validated linear sequence of downstream worker steps."""
+    """Validated worker DAG with a legacy linear-plan compatibility path."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -574,10 +667,88 @@ class WorkerPlan(BaseModel):
         min_length=1,
         max_length=MAX_PLAN_STEPS,
         description=(
-            "Последовательность worker tasks на получение данных; следующая "
-            "task может лениво использовать принятые результаты предыдущих."
+            "DAG worker tasks на получение данных. Независимые tasks могут "
+            "выполняться конкурентно; зависимая task может лениво использовать "
+            "принятые результаты только перечисленных depends_on."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_and_normalize_dag(self) -> "WorkerPlan":
+        has_ids = [step.id is not None for step in self.steps]
+        if any(has_ids) and not all(has_ids):
+            raise ValueError("all DAG steps must either provide id or omit it")
+
+        if not any(has_ids):
+            if any(step.depends_on for step in self.steps):
+                raise ValueError("legacy steps without id cannot use depends_on")
+            previous_ids: List[str] = []
+            for index, step in enumerate(self.steps, start=1):
+                step.id = f"step_{index}"
+                # Preserve the old handoff contract exactly: every later
+                # worker can see all accepted results from earlier workers.
+                step.depends_on = list(previous_ids)
+                previous_ids.append(step.id)
+
+        ids = [str(step.id) for step in self.steps]
+        duplicate_ids = sorted(
+            step_id for step_id in set(ids) if ids.count(step_id) > 1
+        )
+        if duplicate_ids:
+            raise ValueError(
+                "duplicate DAG step ids: " + ", ".join(duplicate_ids)
+            )
+
+        known_ids = set(ids)
+        for step in self.steps:
+            assert step.id is not None
+            if step.id in step.depends_on:
+                raise ValueError(f"step {step.id!r} cannot depend on itself")
+            missing = sorted(set(step.depends_on) - known_ids)
+            if missing:
+                raise ValueError(
+                    f"step {step.id!r} has missing dependencies: "
+                    + ", ".join(missing)
+                )
+
+        completed: set[str] = set()
+        while len(completed) < len(self.steps):
+            ready = [
+                step
+                for step in self.steps
+                if step.id not in completed
+                and set(step.depends_on).issubset(completed)
+            ]
+            if not ready:
+                unresolved = [
+                    str(step.id)
+                    for step in self.steps
+                    if step.id not in completed
+                ]
+                raise ValueError(
+                    "worker plan contains a dependency cycle: "
+                    + ", ".join(unresolved)
+                )
+            completed.update(str(step.id) for step in ready)
+        return self
+
+    def ready_groups(self) -> List[List[PlanStep]]:
+        """Return deterministic topological layers in declared plan order."""
+
+        completed: set[str] = set()
+        groups: List[List[PlanStep]] = []
+        while len(completed) < len(self.steps):
+            ready = [
+                step
+                for step in self.steps
+                if step.id not in completed
+                and set(step.depends_on).issubset(completed)
+            ]
+            if not ready:  # Defensive: validation already rejects cycles.
+                raise ValueError("worker plan contains a dependency cycle")
+            groups.append(ready)
+            completed.update(str(step.id) for step in ready)
+        return groups
 
 
 class UpstreamOutput(BaseModel):

@@ -16,8 +16,10 @@ level coordinator decides which complete results should be displayed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
 from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
 from uuid import uuid4
@@ -42,6 +44,7 @@ from pydantic import (
     model_validator,
 )
 
+from .async_runtime import ainvoke_compat, ainvoke_graph_compat, run_coroutine_sync
 from .contracts import (
     EvidenceFact,
     Observation,
@@ -50,6 +53,10 @@ from .contracts import (
     WorkerRequestParts,
     WorkerStopReason,
     parse_worker_request,
+)
+from .native_call_adapter import (
+    json_mapping_from_message,
+    recover_required_tool_call,
 )
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import llm_stage
@@ -528,16 +535,16 @@ def _with_structured_output(model: Any, schema: Any) -> Any:
         )
     except TypeError:
         try:
-            return model.with_structured_output(
+            raw_model = model.with_structured_output(
                 schema,
                 method="function_calling",
             )
         except TypeError:
-            return model.with_structured_output(schema)
+            raw_model = model.with_structured_output(schema)
 
     class _NormalizedStructuredOutput:
-        def invoke(self, messages: Any, **kwargs: Any) -> Any:
-            result = raw_model.invoke(messages, **kwargs)
+        @staticmethod
+        def _normalize(result: Any) -> Any:
             if not isinstance(result, Mapping):
                 return result
             parsed = result.get("parsed")
@@ -559,12 +566,43 @@ def _with_structured_output(model: Any, schema: Any) -> Any:
                     matching_calls[0].get("args") or {}
                 )
 
+            recovered_message = recover_required_tool_call(
+                raw_message,
+                expected_name,
+            )
+            recovered_calls = getattr(
+                recovered_message,
+                "tool_calls",
+                [],
+            ) or []
+            if len(recovered_calls) == 1:
+                return schema.model_validate(
+                    recovered_calls[0].get("args") or {}
+                )
+
+            textual_payload = json_mapping_from_message(raw_message)
+            if textual_payload is not None:
+                return schema.model_validate(textual_payload)
+
             parsing_error = result.get("parsing_error")
             if isinstance(parsing_error, BaseException):
                 raise parsing_error
             raise ValueError(
                 "Structured output did not contain exactly one expected call "
                 f"{expected_name}."
+            )
+
+        def invoke(self, messages: Any, **kwargs: Any) -> Any:
+            return self._normalize(raw_model.invoke(messages, **kwargs))
+
+        async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+            return self._normalize(
+                await ainvoke_compat(
+                    raw_model,
+                    messages,
+                    category="llm",
+                    **kwargs,
+                )
             )
 
     return _NormalizedStructuredOutput()
@@ -615,6 +653,46 @@ def _compact_observation(observation: Observation) -> Observation:
         ],
         reroute_reason=observation.reroute_reason,
         required_capabilities=list(observation.required_capabilities),
+    )
+
+
+def _reroute_for_unavailable_tool(
+    observation: Observation,
+    available_tool_names: Sequence[str],
+) -> Observation:
+    """Turn an impossible continue request into a capability reroute."""
+    if observation.status != "continue" or not observation.gap:
+        return observation
+    available = {str(name) for name in available_tool_names}
+    gap = observation.gap.casefold()
+    from .tools.registry import WORKER_CAPABILITY_TOOL_NAMES
+
+    missing_capabilities: List[WorkerCapability] = []
+    mentioned_missing_tools: List[str] = []
+    for capability, tool_names in WORKER_CAPABILITY_TOOL_NAMES.items():
+        missing = sorted(
+            name
+            for name in tool_names
+            if name not in available and name.casefold() in gap
+        )
+        if missing:
+            missing_capabilities.append(capability)
+            mentioned_missing_tools.extend(missing)
+    if not missing_capabilities:
+        return observation
+    logger.warning(
+        "Observer requested unavailable tool(s) while continuing; "
+        "converting to capability reroute: %s",
+        ", ".join(mentioned_missing_tools),
+    )
+    return observation.model_copy(
+        update={
+            "status": "reroute",
+            "reroute_reason": "missing_capability",
+            "required_capabilities": list(
+                dict.fromkeys(missing_capabilities)
+            ),
+        }
     )
 
 
@@ -969,6 +1047,7 @@ def _selected_worker_tool_name(
     allowed_names: Sequence[str],
 ) -> str:
     """Validate the selector's single native call."""
+    message = recover_required_tool_call(message, _SELECT_WORKER_TOOL_NAME)
     if not isinstance(message, AIMessage):
         raise ValueError("Tool selector не вернул AIMessage.")
     matching_calls = [
@@ -1163,7 +1242,7 @@ def build_agent_graph(
             payload["evidence_id"] = evidence_id
         return payload
 
-    def invoke_with_fallback(
+    async def invoke_with_fallback(
         primary_model: Any,
         messages: Sequence[BaseMessage],
         *,
@@ -1172,7 +1251,11 @@ def build_agent_graph(
     ) -> Any:
         with llm_stage(stage):
             try:
-                return primary_model.invoke(messages)
+                return await ainvoke_compat(
+                    primary_model,
+                    messages,
+                    category="llm",
+                )
             except Exception:
                 if fallback_model is None or fallback_model is primary_model:
                     raise
@@ -1181,7 +1264,11 @@ def build_agent_graph(
                     "regular planner tool palette",
                     exc_info=True,
                 )
-                return fallback_model.invoke(messages)
+                return await ainvoke_compat(
+                    fallback_model,
+                    messages,
+                    category="llm",
+                )
 
     def bind_required_tool(tool_definition: Any, tool_name: str) -> Any:
         try:
@@ -1192,7 +1279,7 @@ def build_agent_graph(
         except TypeError:
             return model.bind_tools([tool_definition])
 
-    def select_worker_tool(
+    async def select_worker_tool(
         state: AgentGraphState,
         *,
         must_continue: bool,
@@ -1223,7 +1310,7 @@ def build_agent_graph(
             selectable_descriptions,
         )
         try:
-            selector_reply = invoke_with_fallback(
+            selector_reply = await invoke_with_fallback(
                 selector_model,
                 selector_messages,
                 stage="worker_tool_selector",
@@ -1249,7 +1336,7 @@ def build_agent_graph(
                 ),
             ]
             try:
-                selector_reply = invoke_with_fallback(
+                selector_reply = await invoke_with_fallback(
                     selector_model,
                     repair_messages,
                     stage="worker_tool_selector",
@@ -1264,7 +1351,7 @@ def build_agent_graph(
                 ) from repair_exc
         return selected_name, selectable_definitions[selected_name]
 
-    def planner(state: AgentGraphState) -> Dict[str, Any]:
+    async def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
         latest_observation = (
             (state.get("observations") or [])[-1]
@@ -1291,7 +1378,7 @@ def build_agent_graph(
             and not finish_only
         )
         if split_current_call:
-            selected_name, selected_definition = select_worker_tool(
+            selected_name, selected_definition = await select_worker_tool(
                 state,
                 must_continue=must_continue,
             )
@@ -1341,7 +1428,7 @@ def build_agent_graph(
                 else "worker_planner" if worker_finish else "legacy_planner"
             )
         try:
-            reply = invoke_with_fallback(
+            reply = await invoke_with_fallback(
                 selected_model,
                 planner_messages,
                 stage=planner_stage,
@@ -1377,21 +1464,27 @@ def build_agent_graph(
                 ),
             )
             continue_repair_prompt = _WORKER_CONTINUE_CALL_REPAIR_PROMPT
-            repaired_reply = invoke_with_fallback(
-                selected_model,
-                [
-                    *planner_messages,
-                    HumanMessage(
-                        content=(
-                            continue_repair_prompt
-                            if must_continue
-                            else _WORKER_NATIVE_CALL_REPAIR_PROMPT
-                        )
-                    ),
-                ],
-                stage=planner_stage,
-                fallback_model=selected_fallback,
-            )
+            try:
+                repaired_reply = await invoke_with_fallback(
+                    selected_model,
+                    [
+                        *planner_messages,
+                        HumanMessage(
+                            content=(
+                                continue_repair_prompt
+                                if must_continue
+                                else _WORKER_NATIVE_CALL_REPAIR_PROMPT
+                            )
+                        ),
+                    ],
+                    stage=planner_stage,
+                    fallback_model=selected_fallback,
+                )
+            except Exception as exc:
+                logger.exception("LLM error in planner native-call repair")
+                repaired_reply = AIMessage(
+                    content=f"Planner repair error: {type(exc).__name__}"
+                )
             if not isinstance(repaired_reply, AIMessage):
                 repaired_reply = AIMessage(
                     content=_message_content_text(repaired_reply)
@@ -1431,7 +1524,7 @@ def build_agent_graph(
                     default=str,
                 )[:2000]
             )
-            repaired_reply = invoke_with_fallback(
+            repaired_reply = await invoke_with_fallback(
                 selected_model,
                 [
                     *planner_messages,
@@ -1472,7 +1565,7 @@ def build_agent_graph(
                 "Worker requested another data tool after the step limit; "
                 "asking the LLM to finish"
             )
-            repaired_reply = invoke_with_fallback(
+            repaired_reply = await invoke_with_fallback(
                 finish_model,
                 [
                     *planner_messages,
@@ -1524,7 +1617,7 @@ def build_agent_graph(
             "planner_message": None,
         }
 
-    def execute_tools(state: AgentGraphState) -> Dict[str, Any]:
+    async def execute_tools(state: AgentGraphState) -> Dict[str, Any]:
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             raise RuntimeError("ToolNode вызван без AIMessage.tool_calls.")
@@ -1549,7 +1642,11 @@ def build_agent_graph(
                     "args": dict(call.get("args") or {}),
                 }
 
-        result = tool_node.invoke(state)
+        result = await ainvoke_compat(
+            tool_node,
+            state,
+            category="tool",
+        )
         raw_messages = [
             message.model_copy(update={"status": "error"})
             if isinstance(message, ToolMessage)
@@ -1567,7 +1664,10 @@ def build_agent_graph(
             if not _tool_message_has_error(message):
                 from .tools.saved_results import persist_sqlite_tool_message
 
-                message = persist_sqlite_tool_message(message)
+                message = await asyncio.to_thread(
+                    persist_sqlite_tool_message,
+                    message,
+                )
 
             tool_call_id = str(message.tool_call_id or "").strip()
             if tool_call_id in retained_tool_calls:
@@ -1619,7 +1719,7 @@ def build_agent_graph(
             "tool_steps": state["tool_steps"] + len(last_message.tool_calls),
         }
 
-    def observer(state: AgentGraphState) -> Dict[str, Any]:
+    async def observer(state: AgentGraphState) -> Dict[str, Any]:
         planner_message = state.get("planner_message")
         no_tool_cycle = bool(
             worker_finish
@@ -1747,6 +1847,10 @@ def build_agent_graph(
                 if isinstance(result, Observation)
                 else Observation.model_validate(result)
             )
+            parsed_observation = _reroute_for_unavailable_tool(
+                parsed_observation,
+                [tool.name for tool in tool_list],
+            )
             accepted_ids = set(parsed_observation.accepted_tool_call_ids)
             invalid_ids = sorted(accepted_ids - allowed_ids)
             if invalid_ids:
@@ -1776,6 +1880,32 @@ def build_agent_graph(
             unknown_evidence_ids = sorted(
                 fact_evidence_ids - accepted_evidence_ids
             )
+            if (
+                unknown_evidence_ids
+                and os.getenv("LLM_PROVIDER", "").strip().casefold()
+                == "ollama"
+            ):
+                retained_facts = [
+                    fact
+                    for fact in parsed_observation.facts
+                    if set(fact.evidence_ids).issubset(accepted_evidence_ids)
+                ]
+                logger.warning(
+                    "Local observer cited unknown evidence IDs; discarding "
+                    "unsupported facts only: %s",
+                    ", ".join(unknown_evidence_ids),
+                )
+                parsed_observation = parsed_observation.model_copy(
+                    update={"facts": retained_facts}
+                )
+                fact_evidence_ids = {
+                    evidence_id
+                    for fact in parsed_observation.facts
+                    for evidence_id in fact.evidence_ids
+                }
+                unknown_evidence_ids = sorted(
+                    fact_evidence_ids - accepted_evidence_ids
+                )
             if unknown_evidence_ids:
                 raise ValueError(
                     "facts содержит неизвестные или непринятые evidence_ids: "
@@ -1797,7 +1927,7 @@ def build_agent_graph(
             try:
                 with llm_stage("observer"):
                     observation = parse_observation(
-                        observer_model.invoke(attempt_messages)
+                        await observer_model.ainvoke(attempt_messages)
                     )
                 break
             except Exception as error:
@@ -1871,7 +2001,7 @@ def build_agent_graph(
             ]
         return update
 
-    def responder(state: AgentGraphState) -> Dict[str, Any]:
+    async def responder(state: AgentGraphState) -> Dict[str, Any]:
         response_instruction = _LEGACY_RESPONDER_PROMPT
 
         planner_message = state.get("planner_message")
@@ -1903,7 +2033,11 @@ def build_agent_graph(
 
         try:
             with llm_stage("legacy_responder"):
-                reply = model.invoke(messages)
+                reply = await ainvoke_compat(
+                    model,
+                    messages,
+                    category="llm",
+                )
             if not isinstance(reply, AIMessage):
                 reply = AIMessage(content=_message_content_text(reply))
         except Exception as exc:
@@ -1992,7 +2126,7 @@ def build_agent_graph(
     return graph.compile()
 
 
-def run_agent_graph(
+async def run_agent_graph_async(
     user_query: str,
     system_prompt: str,
     model: Any,
@@ -2052,7 +2186,11 @@ def run_agent_graph(
         metadata=trace_metadata,
         tags=trace_tags or ["chat"],
     ):
-        final_state = graph.invoke(initial_state, config=config)
+        final_state = await ainvoke_graph_compat(
+            graph,
+            initial_state,
+            config=config,
+        )
 
     messages = final_state.get("messages") or []
     if messages and isinstance(messages[-1], AIMessage):
@@ -2082,7 +2220,39 @@ def run_agent_graph(
     return "Модель не вернула финальный ответ."
 
 
-def run_worker_graph(
+def run_agent_graph(
+    user_query: str,
+    system_prompt: str,
+    model: Any,
+    tools: Mapping[str, BaseTool] | Sequence[BaseTool],
+    max_steps: int = 5,
+    history: Optional[List[ChatHistoryMessage]] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    trace_tags: Optional[List[str]] = None,
+    trace_metadata: Optional[Dict[str, Any]] = None,
+    callbacks: Optional[List[Any]] = None,
+) -> str:
+    """Compatibility facade for non-ASGI callers."""
+
+    return run_coroutine_sync(
+        run_agent_graph_async(
+            user_query=user_query,
+            system_prompt=system_prompt,
+            model=model,
+            tools=tools,
+            max_steps=max_steps,
+            history=history,
+            session_id=session_id,
+            user_id=user_id,
+            trace_tags=trace_tags,
+            trace_metadata=trace_metadata,
+            callbacks=callbacks,
+        )
+    )
+
+
+async def run_worker_graph_async(
     task: str | WorkerRequestParts,
     system_prompt: str,
     model: Any,
@@ -2159,7 +2329,11 @@ def run_worker_graph(
         },
         tags=["worker", "experiment"],
     ):
-        final_state = graph.invoke(initial_state, config=config)
+        final_state = await ainvoke_graph_compat(
+            graph,
+            initial_state,
+            config=config,
+        )
 
     latest_observation = (
         (final_state.get("observations") or [])[-1]
@@ -2373,4 +2547,31 @@ def run_worker_graph(
             else []
         ),
         accepted_tool_call_ids=accepted_tool_call_ids,
+    )
+
+
+def run_worker_graph(
+    task: str | WorkerRequestParts,
+    system_prompt: str,
+    model: Any,
+    tools: Mapping[str, BaseTool] | Sequence[BaseTool],
+    max_steps: int = 5,
+    *,
+    tool_message_preview_chars: int = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
+    callbacks: Optional[List[Any]] = None,
+    split_tool_call_planning: bool = False,
+) -> WorkerRunResult:
+    """Compatibility facade for deterministic sync callers and tests."""
+
+    return run_coroutine_sync(
+        run_worker_graph_async(
+            task=task,
+            system_prompt=system_prompt,
+            model=model,
+            tools=tools,
+            max_steps=max_steps,
+            tool_message_preview_chars=tool_message_preview_chars,
+            callbacks=callbacks,
+            split_tool_call_planning=split_tool_call_planning,
+        )
     )

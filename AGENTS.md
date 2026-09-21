@@ -11,7 +11,7 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
   и не перезаписывать.
 - `/chat` по умолчанию использует multiagent; `CHAT_AGENT_MODE=single_agent` оставлен как baseline.
 - Актуальный общий поток: `supervisor → operation router → downstream plan → workers → upstream decision → upstream answer`. Специализированные ветки выбираются только после supervisor.
-- Downstream создаёт полный план из 1–8 задач чтения; coordinator допускает максимум два цикла. Workers идут последовательно и могут лениво читать принятые результаты предыдущих workers.
+- Downstream создаёт полный DAG из 1–8 задач чтения; coordinator допускает максимум два цикла. Независимые ready-workers выполняются конкурентно с bounded limit, а зависимые получают lazy-ссылки только прямых `depends_on`. Legacy-план без DAG-полей сохраняет последовательную семантику.
 - Router одновременно выбирает tools, retrieval-skills и schemas; planner вызывает выбранные tools; observer проверяет каждый data-tool result и возвращает только `complete`, `continue` или `reroute`.
 - Upstream получает исходную задачу и принятые evidence, решает `pass/reroute`, затем анализирует данные, формирует ответ и выбирает display-results.
 - Полные tool-results живут только в run-scoped хранилище; последующим workers передаются короткие `result_id`/schema references. SQLite проекта не изменяется.
@@ -38,12 +38,12 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 
 ## Основные компоненты
 
-- `app.py` — Flask API, загрузка файлов, просмотр данных и `/chat`.
+- `app.py` — FastAPI/ASGI API, загрузка файлов, просмотр данных и `/chat`.
 - `processing/excel.py`, `sheet_skills/` — механический Excel-разбор и доменное извлечение каталогов/S2T.
 - `storage/database.py`, `storage/s2t.py` — публичная SQLite-схема и транзакционная запись.
 - `services/graph_sync.py`, `graph_storage/` — производная Neo4j-проекция lineage; исходные факты остаются в SQLite.
 - `agents/supervisor.py` — выделяет самодостаточную task и устойчивый context; не хранит неявный активный файл.
-- `agents/coordinator.py` — downstream-план, последовательный запуск workers, два upstream-этапа и reroute.
+- `agents/coordinator.py` — downstream DAG, bounded запуск ready-workers через `TaskGroup`, два upstream-этапа и reroute.
 - `agents/sql_risk_scope_extraction.py` — native LLM-контракт режима и точного directed scope с проверкой дословного происхождения.
 - `agents/sql_risk_operation_pipeline.py`, `agents/sql_risk_structure.py` — exact-reader ветка и нейтральный SQLGlot structural bundle для пяти закрытых SQL-risk операций.
 - `agents/sql_risk_assessment.py` — native LLM-контракт итогового анализа риска, ответа и display selection.
@@ -62,8 +62,8 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 ## Поток агентного запроса
 
 1. `supervisor` один раз решает, нужен ли доступ к данным. Он передаёт coordinator текущую самодостаточную `task` и отдельный устойчивый `context` до 4000 символов; история, tools и план в context не копируются.
-2. `downstream` возвращает обязательный native call `submit_worker_plan` с 1–8 `PlanStep(task)`. В plan нет tools/skills/schemas и отдельных задач анализа, сравнения или оформления.
-3. Workers выполняются последовательно. Каждый worker получает model-owned текущую `task`, неизменённую исходную coordinator-task отдельным reference и короткие references всех принятых результатов предыдущих workers текущего цикла. Исходная task служит только источником точных literals/roles/scope и не расширяет поручение шага. Содержимое результатов читается явно через `read_previous_result` либо анализируется через `query_saved_result`. Когда строки задают несколько однотипных входов, planner использует batch-аргумент соответствующего tool, а не расходует цикл на последовательный перебор. Prompt требует не использовать handoff, если следующая task исполнима прямо из исходного запроса.
+2. `downstream` возвращает обязательный native call `submit_worker_plan` с 1–8 `PlanStep(id, task, depends_on)`. В plan нет tools/skills/schemas и отдельных задач анализа, сравнения или оформления. Код отклоняет duplicate/missing/self dependencies и cycles до запуска workers.
+3. Coordinator запускает готовые topological groups через fail-fast `asyncio.TaskGroup`, ограниченный `WORKER_MAX_CONCURRENCY`. Каждый worker получает model-owned текущую `task`, неизменённую исходную coordinator-task отдельным reference и короткие references только результатов прямых `depends_on`; unrelated siblings не передаются. Legacy-план без `id`/`depends_on` нормализуется в прежнюю последовательную цепочку со всеми предыдущими handoff. Исходная task служит только источником точных literals/roles/scope и не расширяет поручение шага. Содержимое результатов читается явно через `read_previous_result` либо анализируется через `query_saved_result`. Когда строки задают несколько однотипных входов, planner использует batch-аргумент соответствующего tool. Prompt требует не создавать искусственных зависимостей, если task исполнима прямо из исходного запроса.
 4. Внутри worker router одним structured вызовом независимо выбирает списки tools, retrieval-skills и schemas. Они могут быть пустыми; выбранные skills/schemas подгружаются лениво. В default-пути первые две routing-попытки используют специализированную палитру, а после двух observer-requested reroute открывается общая read-only fallback-палитра. Capability-based reroute остаётся выключенным экспериментом.
 5. Planner вызывает data-tool. После каждого результата observer проверяет соответствие именно worker-task и возвращает `complete`, `continue` или `reroute`; статуса `blocked` нет. Невалидный structured observer-output повторяется до пяти раз на том же payload без повторного data-tool.
 6. `finish_worker` завершает worker и отдаёт summary, факты и только принятые evidence. Подтверждённые факты ссылаются на принятый `evidence_id`.
@@ -158,11 +158,11 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Независимый holdout запускается `scripts/run_multiagent_holdout.py`: ровно 10 фиксированных сценариев вне E1–E5, обе руки только `multiagent`, agent/judge `GigaChat-2-Max`, обязательные hard+semantic проверки, counterbalanced AB/BA и неизменный SHA256 live DB. `--dry-run` проверяет preregistration и fixture без сетевых вызовов.
 - Operation-protocol matrix запускается `scripts/run_operation_protocol_experiments.py`: ровно 20 fixed variants (`<aspect>__<family>`) и 40 paired exchanges, только multiagent и Max/Max semantic judge. До live-run обязателен clean committed HEAD; каждый pair работает в отдельном clone и на копиях SQLite, а default остаётся неизменным. Все ячейки проходят full five-stage agentic protocol. Holdout, E1–E5 и operation-protocol runners явно фиксируют `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=0`, поэтому внутренняя scope extraction/assessment ветка не меняет preregistered популяцию.
 - `--llm-judge` оценивает текущий запрос, role-aware историю, публичный answer и ограниченные display-results. Пользовательские сообщения истории являются условиями, неподтверждённый текст assistant — нет. Новые физические идентификаторы в основанном на сохранённых данных SQL требуют подтверждения display либо явного placeholder; маршрут `A → B` должен достигать точного `B`. Не использовать judge как замену ручному разбору плана и evidence.
-- Запуск UI: `uv run python app.py`.
+- Запуск UI: `uv run uvicorn app:app --host 127.0.0.1 --port 8000`.
 
 ## Cursor Cloud specific instructions
 
 - `app.py` создаёт LLM-модель на импорте (`agents/agent.py`), поэтому и запуск приложения, и `pytest` требуют наличия LLM-креденшелов в окружении. Конструктор модели не проверяет доступность сети — достаточно любого значения. Чтобы прогнать тесты без внешнего провайдера, задай фиктивный `GIGACHAT_API_KEY` (например `GIGACHAT_API_KEY=dummy uv run pytest tests/ -q`) или выставь `LLM_PROVIDER=ollama` (провайдеру ollama креденшелы не нужны).
 - Cloud-окружение самодостаточно: локальный Ollama с моделью `qwen2.5:7b` (native tool calling) поднимается на `http://127.0.0.1:11434`, а `LLM_PROVIDER` по умолчанию `ollama` через `.env`. Реальные секреты (`GIGACHAT_API_KEY`, `OPENROUTER_API_KEY`, `LLM_PROVIDER=...`) переопределяют `.env`, потому что `python-dotenv` не перезаписывает уже заданные переменные окружения — задавай их через Secrets, чтобы переключить провайдера.
-- Flask-приложение слушает `http://127.0.0.1:5000` (пути `/` и `/chat_app` открывают chat-first UI). На CPU локальная LLM медленная: полный `/upload` одного файла из `samples/` занимает несколько минут, а один запрос к chat-агенту — тоже минуты. Детерминированный разбор Excel → SQLite и read-only эндпоинты (`/summary`, `/transformations`) отрабатывают мгновенно.
+- FastAPI-приложение слушает `http://127.0.0.1:8000` (пути `/` и `/chat_app` открывают chat-first UI). На CPU локальная LLM медленная: полный `/upload` одного файла из `samples/` занимает несколько минут, а один запрос к chat-агенту — тоже минуты. Детерминированный разбор Excel → SQLite и read-only эндпоинты (`/summary`, `/transformations`) отрабатывают мгновенно.
 - Эмбеддинги (`intfloat/multilingual-e5-small`) и модель Ollama предварительно скачаны в образ окружения, поэтому первый вызов summary/описаний не ждёт загрузку из сети.

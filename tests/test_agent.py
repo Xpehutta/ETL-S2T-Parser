@@ -1486,6 +1486,25 @@ def test_observation_carries_typed_capability_reroute_metadata():
     assert continue_observation.required_capabilities == []
 
 
+def test_observation_normalizes_local_nested_reroute_metadata():
+    from agents.chat_graph import Observation
+
+    observation = Observation.model_validate(
+        {
+            "status": "reroute",
+            "gap": "Нужен каталог target-колонок.",
+            "reroute_reason": {
+                "type": "missing_capability",
+                "details": "Нужен другой инструмент.",
+            },
+            "required_capabilities": ["target_column_catalog_read"],
+        }
+    )
+
+    assert observation.reroute_reason == "missing_capability"
+    assert observation.required_capabilities == ["column_catalog_read"]
+
+
 def test_native_observer_schema_is_provider_compatible_flat_object():
     from agents.chat_graph import Observation
 
@@ -1522,6 +1541,44 @@ def test_observation_status_discards_provider_added_non_reroute_metadata():
     assert complete.accepted_tool_call_ids == ["call-exact-read"]
     assert complete.reroute_reason is None
     assert complete.required_capabilities == []
+
+
+def test_observation_discards_echoed_input_payload_fields():
+    from agents.chat_graph import Observation
+
+    observation = Observation.model_validate(
+        {
+            "status": "continue",
+            "gap": "Нужно точное чтение.",
+            "accepted_tool_call_ids": [],
+            "facts": [],
+            "limitations": [],
+            "prior_state": [],
+            "accepted_evidence": [],
+            "tool_calls": [],
+            "tool_results": [],
+            "user_request": "input-only",
+        }
+    )
+
+    assert observation.status == "continue"
+    assert observation.gap == "Нужно точное чтение."
+
+
+def test_observer_continue_for_unavailable_named_tool_becomes_reroute():
+    from agents.chat_graph import Observation, _reroute_for_unavailable_tool
+
+    observation = _reroute_for_unavailable_tool(
+        Observation(
+            status="continue",
+            gap="Нужен list_file_sheet_headers для точных заголовков.",
+        ),
+        ["resolve_file"],
+    )
+
+    assert observation.status == "reroute"
+    assert observation.reroute_reason == "missing_capability"
+    assert observation.required_capabilities == ["excel_read"]
 
 
 def test_observer_prompt_requires_semantic_task_comparison():

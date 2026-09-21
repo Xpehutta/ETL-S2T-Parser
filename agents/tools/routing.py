@@ -10,6 +10,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from ..async_runtime import ainvoke_compat
 from ..contracts import WorkerRequestParts, parse_worker_request
 from ..run_metrics import llm_stage
 from .context import SCHEMA_CATALOG
@@ -799,6 +800,136 @@ def select_chat_route(
             return fallback_route
 
 
+async def select_chat_route_async(
+    user_query: str | WorkerRequestParts,
+    history: Optional[List[Dict[str, str]]] = None,
+    *,
+    model: Any,
+    available_tools: Sequence[BaseTool],
+    callbacks: Optional[Sequence[Any]] = None,
+    reroute_context: Optional[Mapping[str, Any]] = None,
+    catalog_stage: str = "unrestricted",
+) -> ToolRoute:
+    """Async equivalent of :func:`select_chat_route` using native LLM I/O."""
+
+    request_parts = parse_worker_request(user_query)
+    if not request_parts.current_task:
+        raise ToolRoutingError("Tool-router получил пустой запрос")
+    if not available_tools:
+        raise ToolRoutingError("Tool-router не получил каталог tools")
+    if catalog_stage not in {
+        "unrestricted",
+        "specialized_only",
+        "general_fallback",
+        "capability_expansion",
+        "reroute_palette",
+    }:
+        raise ToolRoutingError(
+            f"Tool-router получил неизвестный catalog_stage: {catalog_stage}"
+        )
+
+    payload = {
+        "current_task": request_parts.current_task,
+        "recent_history": _history_payload(history),
+        "available_tools": _tool_catalog(
+            available_tools,
+            mark_general_fallback=(catalog_stage == "general_fallback"),
+            mark_capability_expansion=(
+                catalog_stage == "capability_expansion"
+            ),
+        ),
+        "catalog_stage": catalog_stage,
+        "available_skills": _named_catalog(SKILL_CATALOG),
+        "available_schemas": _named_catalog(SCHEMA_CATALOG),
+    }
+    if request_parts.operation_execution_context:
+        payload["operation_context"] = request_parts.operation_execution_context
+    if request_parts.previous_results is not None:
+        payload["previous_results"] = [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in request_parts.previous_results
+        ]
+    if reroute_context:
+        payload["reroute_context"] = dict(reroute_context)
+    messages = [
+        SystemMessage(content=_TOOL_ROUTER_PROMPT),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+    ]
+    config = {"callbacks": list(callbacks)} if callbacks else None
+
+    with_structured_output = getattr(model, "with_structured_output", None)
+    if not callable(with_structured_output):
+        raise ToolRoutingError(
+            "LLM tool-router не поддерживает structured output"
+        )
+    try:
+        structured_model = with_structured_output(
+            ToolRoute,
+            method="function_calling",
+        )
+    except TypeError:
+        structured_model = with_structured_output(ToolRoute)
+    except Exception as exc:
+        raise ToolRoutingError(
+            f"Ошибка настройки structured output tool-router: {type(exc).__name__}"
+        ) from exc
+
+    async def invoke_router(call_messages: Sequence[BaseMessage]) -> Any:
+        try:
+            with llm_stage("router"):
+                return await ainvoke_compat(
+                    structured_model,
+                    call_messages,
+                    config=config,
+                    category="llm",
+                )
+        except Exception as exc:
+            raise ToolRoutingError(
+                f"Ошибка LLM tool-router: {type(exc).__name__}"
+            ) from exc
+
+    try:
+        return _validated_route(
+            await invoke_router(messages),
+            available_tools,
+            reroute_context,
+        )
+    except ToolRoutingError as first_error:
+        logger.warning(
+            "Tool-router structured output rejected; requesting one LLM "
+            "repair: error=%s",
+            first_error,
+        )
+        repair_messages: List[BaseMessage] = [
+            *messages,
+            HumanMessage(
+                content=_TOOL_ROUTER_REPAIR_PROMPT.replace(
+                    "{validation_error}", str(first_error)
+                )
+            ),
+        ]
+        try:
+            return _validated_route(
+                await invoke_router(repair_messages),
+                available_tools,
+                reroute_context,
+            )
+        except ToolRoutingError as repair_error:
+            logger.warning(
+                "Tool-router structured repair rejected: %s",
+                repair_error,
+            )
+            fallback_route = _general_fallback_route(
+                available_tools,
+                reroute_context,
+            )
+            logger.warning(
+                "Tool-router uses general read-only fallback: tools=%s",
+                fallback_route.tools,
+            )
+            return fallback_route
+
+
 __all__ = [
     "GENERAL_FALLBACK_TOOL_NAMES",
     "SCHEMA_CATALOG",
@@ -806,4 +937,5 @@ __all__ = [
     "ToolRoute",
     "ToolRoutingError",
     "select_chat_route",
+    "select_chat_route_async",
 ]

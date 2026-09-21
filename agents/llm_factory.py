@@ -6,10 +6,10 @@ from typing import Optional
 from dotenv import load_dotenv
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_gigachat import GigaChat
-from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from .env_flags import read_binary_env_flag
+from .native_call_adapter import CompatibleChatOllama
 
 load_dotenv()
 
@@ -59,6 +59,21 @@ def get_llm_provider() -> str:
     return os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
 
 
+def get_judge_provider() -> str:
+    """Return the judge provider independently from the agent provider."""
+
+    provider = (
+        os.getenv("LLM_JUDGE_PROVIDER", "").strip().lower()
+        or get_llm_provider()
+    )
+    if provider not in SUPPORTED_LLM_PROVIDERS:
+        raise ValueError(
+            f"Unsupported LLM_JUDGE_PROVIDER={provider!r}. "
+            f"Use {', '.join(repr(item) for item in SUPPORTED_LLM_PROVIDERS)}."
+        )
+    return provider
+
+
 def get_chat_model_name() -> str:
     provider = get_llm_provider()
     if provider == "openrouter":
@@ -78,7 +93,7 @@ def get_chat_model_name() -> str:
 
 def get_judge_model_name() -> str:
     """Return the independently configurable model used by LLM-as-judge."""
-    provider = get_llm_provider()
+    provider = get_judge_provider()
     generic_override = os.getenv("LLM_JUDGE_MODEL", "").strip()
     if provider == "gigachat":
         return (
@@ -180,7 +195,7 @@ def _create_openrouter_chat_model(
 def _create_ollama_chat_model(
     timeout: Optional[float] = None,
     model_name: Optional[str] = None,
-) -> ChatOllama:
+) -> CompatibleChatOllama:
     base_url = _normalize_ollama_base_url(
         os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)
     )
@@ -190,7 +205,7 @@ def _create_ollama_chat_model(
         )
     }
 
-    return ChatOllama(
+    return CompatibleChatOllama(
         model=model_name or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         base_url=base_url,
         temperature=_env_float("OLLAMA_TEMPERATURE", 0.0),
@@ -220,5 +235,14 @@ def create_chat_model(
 
 
 def create_judge_chat_model(timeout: Optional[float] = None) -> BaseChatModel:
-    """Create the judge model independently from the agent model."""
-    return create_chat_model(timeout=timeout, model_name=get_judge_model_name())
+    """Create the judge independently from the agent provider and model."""
+
+    provider = get_judge_provider()
+    model_name = get_judge_model_name()
+    if provider == "gigachat":
+        return _create_gigachat_chat_model(timeout, model_name)
+    if provider == "openrouter":
+        return _create_openrouter_chat_model(timeout, model_name)
+    if provider == "ollama":
+        return _create_ollama_chat_model(timeout, model_name)
+    raise AssertionError(f"Unhandled judge provider: {provider!r}")

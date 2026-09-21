@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -888,24 +889,43 @@ def live_workspace_db(monkeypatch) -> Iterator[Path]:
 
 @pytest.fixture
 def live_chat_client(live_workspace_db):
-    from app import app as flask_app
-    from werkzeug.serving import make_server
+    import uvicorn
 
-    previous_testing = flask_app.config.get("TESTING", False)
-    previous_agent_mode = flask_app.config.get("CHAT_AGENT_MODE", "multiagent")
-    flask_app.config["TESTING"] = False
-    flask_app.config["CHAT_AGENT_MODE"] = LIVE_AGENT_MODE
-    server = make_server("127.0.0.1", 0, flask_app, threaded=False)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    from app import app as asgi_app
+
+    previous_testing = asgi_app.config.get("TESTING", False)
+    previous_agent_mode = asgi_app.config.get("CHAT_AGENT_MODE", "multiagent")
+    asgi_app.config["TESTING"] = False
+    asgi_app.config["CHAT_AGENT_MODE"] = LIVE_AGENT_MODE
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    listener.setblocking(False)
+    server_port = int(listener.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(
+            asgi_app,
+            host="127.0.0.1",
+            port=server_port,
+            log_level="warning",
+            lifespan="on",
+        )
+    )
+    server_thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [listener]},
+        daemon=True,
+    )
     server_thread.start()
     try:
-        yield _LiveHttpClient(f"http://127.0.0.1:{server.server_port}")
+        yield _LiveHttpClient(f"http://127.0.0.1:{server_port}")
     finally:
-        server.shutdown()
-        server.server_close()
+        server.should_exit = True
         server_thread.join(timeout=10)
-        flask_app.config["TESTING"] = previous_testing
-        flask_app.config["CHAT_AGENT_MODE"] = previous_agent_mode
+        listener.close()
+        asgi_app.config["TESTING"] = previous_testing
+        asgi_app.config["CHAT_AGENT_MODE"] = previous_agent_mode
 
 
 @pytest.fixture(autouse=True)
@@ -1169,7 +1189,6 @@ def _protocol_live_case(
           {expression_filter}
           {catalog_filter}
         ORDER BY LENGTH(s2t.transformation_rule), s2t.id
-        LIMIT 200
         """
         ).fetchall()
     finally:

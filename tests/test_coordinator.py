@@ -2417,7 +2417,7 @@ def test_sql_risk_operation_skill_separates_risk_layers_by_stage():
     assert "отсечение входных строк самим SQL" not in contexts["observer"]
 
 
-def test_plan_accepts_only_non_blank_task_per_step():
+def test_plan_normalizes_legacy_steps_to_a_linear_dag():
     from agents.coordinator import WorkerPlan
 
     plan = WorkerPlan.model_validate(
@@ -2433,8 +2433,12 @@ def test_plan_accepts_only_non_blank_task_per_step():
         "Второй шаг.",
     ]
     assert [step.model_dump() for step in plan.steps] == [
-        {"task": "Первый шаг."},
-        {"task": "Второй шаг."},
+        {"id": "step_1", "task": "Первый шаг.", "depends_on": []},
+        {
+            "id": "step_2",
+            "task": "Второй шаг.",
+            "depends_on": ["step_1"],
+        },
     ]
 
     obsolete_fields = {
@@ -2443,7 +2447,6 @@ def test_plan_accepts_only_non_blank_task_per_step():
         "scope": {"file_id": 7},
         "coverage": "all_matches",
         "dependencies": [1],
-        "depends_on": [],
         "needs_from_previous": "Несуществующий прошлый факт",
         "required_evidence": ["Лишний критерий"],
     }
@@ -2649,14 +2652,15 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "не схлопывай одинаковые occurrences" in (
         _UPSTREAM_ANALYSIS_CONTEXT
     )
-    assert "`depends_on`" not in _DOWNSTREAM_PLAN_PROMPT
+    assert "`depends_on`" in _DOWNSTREAM_PLAN_PROMPT
+    assert "`depends_on=[]` для независимых steps" in _DOWNSTREAM_PLAN_PROMPT
     assert "needs_from_previous" not in _DOWNSTREAM_PLAN_PROMPT
     assert "required_evidence" not in _DOWNSTREAM_PLAN_PROMPT
     assert "не выбирай tools/skills" in (
         _DOWNSTREAM_PLAN_PROMPT.lower().replace("\n", " ")
     )
-    assert "task читает необходимые факты" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
+    assert "`steps` чтения" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Каждый step незаменим" in _DOWNSTREAM_PLAN_PROMPT
     assert "`file_id` допустим лишь из original_task либо принятого" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
@@ -2674,14 +2678,15 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "problem не заменяет и не переопределяет явные идентификаторы" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Наличие\nтаблицы в справочнике не требует её чтения" in (
+    assert "чтение справочника без необходимости" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "использует результат предыдущего" in (
+    assert "получает lazy-ссылки только прямых `depends_on`" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Минимизируй обмен" in _DOWNSTREAM_PLAN_PROMPT
-    assert "только краткие lazy-ссылки" in _DOWNSTREAM_PLAN_PROMPT
+    assert "не связывай независимые чтения ради порядка" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
     assert "отдельный worker может сначала получить" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
@@ -2779,12 +2784,12 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "input_steps" not in plan_schema_text
     assert _plan_tool_schema()["function"]["parameters"]["properties"][
         "steps"
-    ]["items"]["required"] == ["task"]
+    ]["items"]["required"] == ["id", "task", "depends_on"]
     assert set(
         _plan_tool_schema()["function"]["parameters"]["properties"][
             "steps"
         ]["items"]["properties"]
-    ) == {"task"}
+    ) == {"id", "task", "depends_on"}
     plan_parameters = _plan_tool_schema()["function"]["parameters"]
     object_schemas = []
 
@@ -2883,10 +2888,10 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert set(request_schema["properties"]) == {"decision", "problem"}
     plan_schema = _plan_tool_schema()["function"]["parameters"]
     step_schema = plan_schema["properties"]["steps"]["items"]
-    assert step_schema["required"] == ["task"]
-    assert set(step_schema["properties"]) == {"task"}
+    assert step_schema["required"] == ["id", "task", "depends_on"]
+    assert set(step_schema["properties"]) == {"id", "task", "depends_on"}
     assert "input_steps" not in step_schema["properties"]
-    assert "depends_on" not in step_schema["properties"]
+    assert step_schema["properties"]["depends_on"]["uniqueItems"] is True
     assert "needs_from_previous" not in step_schema["properties"]
     assert "required_evidence" not in step_schema["properties"]
 

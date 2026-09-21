@@ -12,11 +12,14 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.utils.json import parse_json_markdown
 
-from .chat_graph import run_agent_graph
+from .chat_graph import run_agent_graph, run_agent_graph_async
 from .header_classifier import predict_header_row
 from .llm_factory import create_chat_model, get_chat_model_name
 from .run_metrics import capture_agent_run, get_run_metrics_callback
-from .tools.routing import select_chat_route as _select_chat_route
+from .tools.routing import (
+    select_chat_route as _select_chat_route,
+    select_chat_route_async as _select_chat_route_async,
+)
 from .tools import (
     get_tools,
     get_tools_for_names,
@@ -356,6 +359,53 @@ def _agent_chat_impl(
     )
 
 
+async def _agent_chat_impl_async(
+    clean_query: str,
+    max_steps: int = 5,
+    history: Optional[List[Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> str:
+    callbacks = _get_langfuse_callbacks()
+    metrics_callback = get_run_metrics_callback()
+    if metrics_callback is not None and metrics_callback not in callbacks:
+        callbacks.append(metrics_callback)
+    available_tools = get_tools()
+    route = await _select_chat_route_async(
+        clean_query,
+        history,
+        model=chat_model,
+        available_tools=available_tools,
+        callbacks=callbacks,
+    )
+    selected_tools = get_tools_for_names(route.tools)
+    selected_skills = load_skills(tuple(route.skills))
+    selected_schemas = load_schemas(tuple(route.schemas))
+
+    logger.info(
+        "Chat routed tools=%s skills=%s schemas=%s",
+        [tool.name for tool in selected_tools],
+        route.skills,
+        route.schemas,
+    )
+    return await run_agent_graph_async(
+        user_query=clean_query,
+        system_prompt=build_chat_system_prompt(
+            selected_skills,
+            selected_schemas,
+        ),
+        model=chat_model,
+        tools=selected_tools,
+        max_steps=max_steps,
+        history=history,
+        session_id=session_id,
+        user_id=user_id,
+        callbacks=callbacks,
+        trace_tags=["chat"],
+        trace_metadata={},
+    )
+
+
 def agent_chat(
     user_query: str,
     max_steps: int = 5,
@@ -370,6 +420,28 @@ def agent_chat(
 
     with capture_agent_run(session_id):
         return _agent_chat_impl(
+            clean_query,
+            max_steps=max_steps,
+            history=history,
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+
+async def agent_chat_async(
+    user_query: str,
+    max_steps: int = 5,
+    history: Optional[List[Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> str:
+    """Run the single-agent baseline without blocking the event loop."""
+
+    clean_query = str(user_query or "").strip()
+    if not clean_query:
+        return "Запрос не должен быть пустым."
+    with capture_agent_run(session_id):
+        return await _agent_chat_impl_async(
             clean_query,
             max_steps=max_steps,
             history=history,

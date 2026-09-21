@@ -2,6 +2,7 @@ import sys
 import os
 import tempfile
 import logging
+import asyncio
 
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -27,6 +28,7 @@ if not _live_agent_tests_enabled:
 os.environ["LANGFUSE_PUBLIC_KEY"] = ""
 os.environ["LANGFUSE_SECRET_KEY"] = ""
 os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ.setdefault("GIGACHAT_VERIFY_SSL", "0")
 
 # app.py configures file logging at import time. Keep test-only tool calls such
 # as ping/echo out of the runtime logs/agent.log.
@@ -43,8 +45,66 @@ _pytest_import_db.close()
 db_storage.DB_PATH = _pytest_import_db.name
 
 import pytest
-from app import app as flask_app
+import httpx
+import pytest_asyncio
+from app import app as asgi_app
 from storage.database import init_db
+
+
+class _TestResponse:
+    """Small Flask-response compatibility layer for the existing API tests."""
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+        self.status_code = response.status_code
+        self.headers = response.headers
+        self.data = response.content
+        self.mimetype = response.headers.get("content-type", "").split(";", 1)[0]
+
+    def get_json(self):
+        return self._response.json()
+
+    def get_data(self, *, as_text=False):
+        return self._response.text if as_text else self._response.content
+
+
+class _SyncASGITestClient:
+    def __init__(self, application):
+        self.application = application
+
+    def _request(self, method, url, **kwargs):
+        kwargs.pop("content_type", None)
+        data = kwargs.get("data")
+        if isinstance(data, dict) and "file" in data:
+            form = dict(data)
+            stream, filename = form.pop("file")
+            kwargs["data"] = form
+            kwargs["files"] = {
+                "file": (
+                    filename,
+                    stream.getvalue() if hasattr(stream, "getvalue") else stream.read(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            }
+
+        async def send():
+            transport = httpx.ASGITransport(app=self.application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as http_client:
+                return await http_client.request(method, url, **kwargs)
+
+        return _TestResponse(asyncio.run(send()))
+
+    def get(self, url, **kwargs):
+        return self._request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._request("POST", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self._request("DELETE", url, **kwargs)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -114,18 +174,28 @@ def mock_embeddings(monkeypatch):
 
 @pytest.fixture
 def app(tmp_path):
-    """Flask test client fixture."""
-    previous_agent_mode = flask_app.config.get('CHAT_AGENT_MODE')
-    flask_app.config['TESTING'] = True
-    flask_app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
-    flask_app.config['DB_PATH'] = str(tmp_path / "flask_test.db")
-    flask_app.config['CHAT_AGENT_MODE'] = 'multiagent'
-    yield flask_app
-    flask_app.config['CHAT_AGENT_MODE'] = previous_agent_mode
+    """FastAPI application fixture with transitional config values."""
+    previous_agent_mode = asgi_app.config.get('CHAT_AGENT_MODE')
+    asgi_app.config['TESTING'] = True
+    asgi_app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+    asgi_app.config['DB_PATH'] = str(tmp_path / "fastapi_test.db")
+    asgi_app.config['CHAT_AGENT_MODE'] = 'multiagent'
+    yield asgi_app
+    asgi_app.config['CHAT_AGENT_MODE'] = previous_agent_mode
 
 @pytest.fixture
 def client(app):
-    return app.test_client()
+    return _SyncASGITestClient(app)
+
+
+@pytest_asyncio.fixture
+async def async_client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http_client:
+        yield http_client
 
 @pytest.fixture
 def temp_db(tmp_path):

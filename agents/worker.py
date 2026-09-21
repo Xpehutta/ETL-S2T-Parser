@@ -10,6 +10,7 @@ level coordinator performs the analysis and selects UI results.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from threading import Lock
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from uuid import uuid4
 
 from .agent import build_chat_system_prompt, chat_model
+from .async_runtime import run_coroutine_sync
 from .chat_graph import (
     DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     WorkerCycleTrace,
@@ -24,6 +26,7 @@ from .chat_graph import (
     WorkerResponseError,
     ensure_worker_tools,
     run_worker_graph,
+    run_worker_graph_async,
 )
 from .contracts import (
     EvidenceArtifact,
@@ -51,7 +54,7 @@ from .tools.saved_results import (
     bind_saved_result_schemas,
     get_active_saved_result_store,
 )
-from .tools.routing import select_chat_route
+from .tools.routing import select_chat_route, select_chat_route_async
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,24 @@ _READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
 _SPLIT_TOOL_CALL_PLANNING_ENV = WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV
 _DISPLAY_RESULTS: Dict[str, WorkerDisplayItem] = {}
 _DISPLAY_RESULTS_LOCK = Lock()
+_DEFAULT_SYNC_SELECT_CHAT_ROUTE = select_chat_route
+_DEFAULT_SYNC_RUN_WORKER_GRAPH = run_worker_graph
+
+
+async def _select_chat_route_compat(*args: Any, **kwargs: Any) -> Any:
+    """Use native async routing, with a legacy sync injection boundary."""
+
+    if select_chat_route is not _DEFAULT_SYNC_SELECT_CHAT_ROUTE:
+        return await asyncio.to_thread(select_chat_route, *args, **kwargs)
+    return await select_chat_route_async(*args, **kwargs)
+
+
+async def _run_worker_graph_compat(**kwargs: Any) -> Any:
+    """Use native async graph execution unless a sync adapter is injected."""
+
+    if run_worker_graph is not _DEFAULT_SYNC_RUN_WORKER_GRAPH:
+        return await asyncio.to_thread(run_worker_graph, **kwargs)
+    return await run_worker_graph_async(**kwargs)
 
 
 def _split_tool_call_planning_enabled() -> bool:
@@ -266,7 +287,9 @@ def _final_outcome_summary(
     return f"{clean_answer}\nПричина незавершённости: {clean_gap}"
 
 
-def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
+async def worker_chat_async(
+    task: str | WorkerRequestParts,
+) -> WorkerOutcome:
     """Execute one self-contained task in an isolated generic worker."""
     request_parts = parse_worker_request(task)
     clean_task = request_parts.current_task.strip()
@@ -373,7 +396,10 @@ def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
         }
         if reroute_context is not None:
             route_kwargs["reroute_context"] = reroute_context
-        route = select_chat_route(request_parts, **route_kwargs)
+        route = await _select_chat_route_compat(
+            request_parts,
+            **route_kwargs,
+        )
         selected_names = set(route.tools)
         if any(
             item.name == _READ_PREVIOUS_RESULT_TOOL_NAME
@@ -432,7 +458,7 @@ def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
             )
 
         try:
-            graph_result = run_worker_graph(
+            graph_result = await _run_worker_graph_compat(
                 task=request_parts,
                 system_prompt=system_prompt,
                 model=chat_model,
@@ -591,6 +617,12 @@ def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
         )
 
 
+def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
+    """Compatibility facade for non-ASGI callers."""
+
+    return run_coroutine_sync(worker_chat_async(task))
+
+
 __all__ = [
     "WORKER_MAX_STEPS",
     "WORKER_MAX_REROUTES",
@@ -603,4 +635,5 @@ __all__ = [
     "register_worker_display_items",
     "resolve_worker_display_refs",
     "worker_chat",
+    "worker_chat_async",
 ]

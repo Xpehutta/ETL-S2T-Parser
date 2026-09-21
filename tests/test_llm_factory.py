@@ -12,9 +12,11 @@ from agents.llm_factory import (
     create_chat_model,
     create_judge_chat_model,
     get_chat_model_name,
+    get_judge_provider,
     get_judge_model_name,
     get_llm_provider,
 )
+from agents.native_call_adapter import CompatibleChatOllama
 
 
 def test_default_llm_provider_is_gigachat(monkeypatch):
@@ -80,6 +82,37 @@ def test_gigachat_judge_model_can_be_overridden(monkeypatch):
     assert get_judge_model_name() == "GigaChat-Max"
 
 
+def test_judge_provider_defaults_to_agent_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.delenv("LLM_JUDGE_PROVIDER", raising=False)
+
+    assert get_judge_provider() == "ollama"
+
+
+def test_ollama_agent_can_use_gigachat_judge(monkeypatch):
+    from langchain_gigachat import GigaChat
+
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:9b")
+    monkeypatch.setenv("LLM_JUDGE_PROVIDER", "gigachat")
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.setenv("GIGACHAT_JUDGE_MODEL", "GigaChat-2-Max")
+
+    model = create_judge_chat_model(timeout=5)
+
+    assert get_judge_provider() == "gigachat"
+    assert get_judge_model_name() == "GigaChat-2-Max"
+    assert isinstance(model, GigaChat)
+    assert model.model == "GigaChat-2-Max"
+
+
+def test_judge_provider_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("LLM_JUDGE_PROVIDER", "unknown")
+
+    with pytest.raises(ValueError, match="LLM_JUDGE_PROVIDER"):
+        get_judge_provider()
+
+
 def test_openrouter_factory_uses_free_router_by_default(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test")
@@ -111,6 +144,7 @@ def test_ollama_factory_uses_local_openai_compatible_endpoint(monkeypatch):
     model = create_chat_model(timeout=4)
 
     assert isinstance(model, ChatOllama)
+    assert isinstance(model, CompatibleChatOllama)
     assert model.model == DEFAULT_OLLAMA_MODEL
     assert model.base_url == DEFAULT_OLLAMA_BASE_URL
     assert model.client_kwargs["timeout"] == 4

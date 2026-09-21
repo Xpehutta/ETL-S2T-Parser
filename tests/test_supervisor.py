@@ -568,6 +568,83 @@ def test_supervisor_discards_handoff_fields_when_history_is_empty():
     )
 
 
+def test_historyless_supervisor_discards_non_string_handoff_fields():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel(
+        [
+            _delegate_message(
+                [],
+                context={},
+            )
+        ]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Данные прочитаны."),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Покажи сохранённые данные", history=[])
+
+    assert result.answer == "Данные прочитаны."
+    coordinator.assert_called_once_with(
+        "Покажи сохранённые данные",
+        context="",
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"resolved_references": "", "context": ""}',
+        '```json\n{"resolved_references": [], "context": []}\n```',
+    ],
+)
+def test_supervisor_recovers_pseudo_delegate_json_from_local_model(content):
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel([AIMessage(content=content)])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Данные прочитаны."),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Покажи сохранённые данные")
+
+    assert result.answer == "Данные прочитаны."
+    coordinator.assert_called_once_with(
+        "Покажи сохранённые данные",
+        context="",
+    )
+
+
+def test_supervisor_keeps_unrelated_json_as_direct_answer():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel([AIMessage(content='{"status": "ok"}')])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        result = supervisor_chat("Верни JSON")
+
+    assert result.answer == '{"status": "ok"}'
+    coordinator.assert_not_called()
+
+
 def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
     from agents.supervisor import supervisor_chat
 

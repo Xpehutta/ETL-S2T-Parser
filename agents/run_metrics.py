@@ -146,6 +146,7 @@ class AgentRunMetrics(BaseModel):
     supervisor_decision: Optional[SupervisorDecisionMetric] = None
     worker_tasks: List[str] = Field(default_factory=list)
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
+    coordinator_dag: List[Dict[str, Any]] = Field(default_factory=list)
     worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
     observations: List[ObservationMetric] = Field(default_factory=list)
     worker_outcomes: List[Dict[str, Any]] = Field(default_factory=list)
@@ -323,6 +324,7 @@ class _RunCollector:
         self.supervisor_decision: Optional[SupervisorDecisionMetric] = None
         self.worker_tasks: List[str] = []
         self.coordinator_plan: List[Dict[str, Any]] = []
+        self.coordinator_dag: List[Dict[str, Any]] = []
         self.worker_routes: List[WorkerRouteMetric] = []
         self.observations: List[ObservationMetric] = []
         self.worker_outcomes: List[Dict[str, Any]] = []
@@ -450,6 +452,7 @@ class _RunCollector:
                 supervisor_decision=self.supervisor_decision,
                 worker_tasks=list(self.worker_tasks),
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
+                coordinator_dag=[dict(item) for item in self.coordinator_dag],
                 worker_routes=list(self.worker_routes),
                 observations=list(self.observations),
                 worker_outcomes=[dict(item) for item in self.worker_outcomes],
@@ -638,6 +641,15 @@ def record_coordinator_plan(steps: List[Dict[str, Any]]) -> None:
     if collector := _ACTIVE_RUN.get():
         with collector.lock:
             collector.coordinator_plan.extend(dict(item) for item in steps)
+
+
+def record_coordinator_dag(result: Mapping[str, Any]) -> None:
+    """Retain bounded DAG topology and execution timings for one cycle."""
+
+    if collector := _ACTIVE_RUN.get():
+        payload = dict(_bounded_json_value(result))
+        with collector.lock:
+            collector.coordinator_dag.append(payload)
 
 
 def record_worker_route(
@@ -1173,6 +1185,7 @@ __all__ = [
     "get_run_metrics_callback",
     "llm_stage",
     "record_upstream_output",
+    "record_coordinator_dag",
     "record_coordinator_plan",
     "record_display_tools",
     "record_entity_resolution",

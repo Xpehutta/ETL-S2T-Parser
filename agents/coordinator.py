@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
+from time import perf_counter
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    TypedDict,
+)
 
 from langchain_core.messages import (
     AIMessage,
@@ -24,6 +37,12 @@ from pydantic import (
 )
 
 from .agent import chat_model
+from .async_runtime import (
+    ainvoke_compat,
+    ainvoke_graph_compat,
+    run_coroutine_sync,
+    worker_max_concurrency,
+)
 from .contracts import (
     EvidenceArtifact,
     MAX_PLAN_STEPS,
@@ -38,6 +57,7 @@ from .contracts import (
 )
 from .experiment_flags import experiment_flag_enabled
 from .chat_graph import WorkerDisplayItem
+from .native_call_adapter import recover_required_tool_call
 from .observability import get_callback_handler, langfuse_trace_context
 from .operation_protocols import (
     OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
@@ -47,6 +67,7 @@ from .operation_protocols import (
 from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
+    record_coordinator_dag,
     record_coordinator_plan,
     record_entity_resolution,
     record_sql_risk_operation,
@@ -93,6 +114,7 @@ from .worker import (
     discard_worker_display_refs,
     register_worker_display_items,
     worker_chat,
+    worker_chat_async,
 )
 from .tools.saved_results import (
     get_active_saved_result_store,
@@ -120,6 +142,15 @@ from .test_protocol_resolution import (
 )
 from .validation_protocol import read_test_protocol_inputs
 logger = logging.getLogger(__name__)
+_DEFAULT_SYNC_WORKER_CHAT = worker_chat
+
+
+async def _call_worker_chat(task: WorkerRequestParts) -> WorkerOutcome:
+    """Keep legacy injected workers compatible without blocking ASGI."""
+
+    if worker_chat is not _DEFAULT_SYNC_WORKER_CHAT:
+        return await asyncio.to_thread(worker_chat, task)
+    return await worker_chat_async(task)
 
 COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
@@ -231,6 +262,8 @@ class OperationSkillSelection(BaseModel):
 class CoordinatorWorkerRun(TypedDict):
     cycle: int
     step: int
+    step_id: str
+    depends_on: List[str]
     outcome: WorkerOutcome
 
 
@@ -248,6 +281,182 @@ class CoordinatorGraphState(TypedDict):
     upstream_output: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     selected_display_refs: List[str]
+
+
+async def _execute_worker_plan_dag(
+    plan: WorkerPlan,
+    *,
+    cycle: int,
+    original_task: str,
+    planner_context: str,
+    observer_context: str,
+    collected_display_refs: Optional[List[str]] = None,
+    worker_runner: Optional[
+        Callable[[WorkerRequestParts], Awaitable[WorkerOutcome]]
+    ] = None,
+    max_concurrency: Optional[int] = None,
+) -> List[CoordinatorWorkerRun]:
+    """Execute validated topological layers with fail-fast sibling semantics."""
+
+    runner = worker_runner or _call_worker_chat
+    concurrency_limit = (
+        worker_max_concurrency()
+        if max_concurrency is None
+        else max_concurrency
+    )
+    if concurrency_limit < 1:
+        raise ValueError("worker DAG max_concurrency must be positive")
+
+    groups = plan.ready_groups()
+    step_numbers = {
+        str(step.id): index
+        for index, step in enumerate(plan.steps, start=1)
+    }
+    completed: Dict[str, CoordinatorWorkerRun] = {}
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    activity_lock = asyncio.Lock()
+    active_workers = 0
+    max_observed_concurrency = 0
+    scheduler_started = perf_counter()
+    timings: Dict[str, Dict[str, Any]] = {}
+
+    def dependency_results(step: PlanStep) -> List[Any]:
+        references: List[Any] = []
+        seen_ids: set[str] = set()
+        for dependency_id in step.depends_on:
+            dependency_run = completed[dependency_id]
+            for reference in dependency_run["outcome"].previous_results:
+                if reference.result_id in seen_ids:
+                    continue
+                seen_ids.add(reference.result_id)
+                references.append(reference)
+        return references
+
+    async def run_step(
+        step: PlanStep,
+        *,
+        layer: int,
+    ) -> CoordinatorWorkerRun:
+        nonlocal active_workers, max_observed_concurrency
+        step_id = str(step.id)
+        previous_results = dependency_results(step)
+        request = WorkerRequestParts(
+            current_task=step.task,
+            original_task=original_task,
+            operation_execution_context=planner_context,
+            operation_completeness_context=observer_context,
+            previous_results=(previous_results or None),
+        )
+        queued_at = perf_counter()
+        timing: Dict[str, Any] = {
+            "step_id": step_id,
+            "depends_on": list(step.depends_on),
+            "layer": layer,
+            "queued_at_seconds": queued_at - scheduler_started,
+        }
+        timings[step_id] = timing
+        async with semaphore:
+            started_at = perf_counter()
+            async with activity_lock:
+                active_workers += 1
+                max_observed_concurrency = max(
+                    max_observed_concurrency,
+                    active_workers,
+                )
+                concurrent_at_start = active_workers
+            timing.update(
+                {
+                    "started_at_seconds": started_at - scheduler_started,
+                    "dependency_wait_seconds": queued_at - scheduler_started,
+                    "semaphore_wait_seconds": started_at - queued_at,
+                    "concurrent_at_start": concurrent_at_start,
+                }
+            )
+            logger.info(
+                "Coordinator dispatches DAG worker step_id=%s step=%s "
+                "depends_on=%s previous_results=%s",
+                step_id,
+                step_numbers[step_id],
+                step.depends_on,
+                len(previous_results),
+            )
+            try:
+                outcome = await runner(request)
+            except BaseException as exc:
+                timing["status"] = "cancelled" if isinstance(
+                    exc, asyncio.CancelledError
+                ) else "failed"
+                timing["error_type"] = type(exc).__name__
+                raise
+            else:
+                timing["status"] = outcome.status
+            finally:
+                ended_at = perf_counter()
+                timing["ended_at_seconds"] = ended_at - scheduler_started
+                timing["elapsed_seconds"] = ended_at - started_at
+                async with activity_lock:
+                    active_workers -= 1
+
+        record_worker_outcome(
+            cycle=cycle,
+            step=step_numbers[step_id],
+            status=outcome.status,
+            stop_reason=outcome.stop_reason,
+            unmet_requirements=list(outcome.unmet_requirements),
+            evidence_count=len(outcome.evidence),
+            dataset_count=len(outcome.datasets),
+        )
+        if collected_display_refs is not None:
+            collected_display_refs.extend(
+                artifact.display_ref
+                for artifact in outcome.evidence
+                if artifact.display_ref
+            )
+        return {
+            "cycle": cycle,
+            "step": step_numbers[step_id],
+            "step_id": step_id,
+            "depends_on": list(step.depends_on),
+            "outcome": outcome,
+        }
+
+    try:
+        for layer, ready_steps in enumerate(groups, start=1):
+            tasks: List[
+                tuple[PlanStep, asyncio.Task[CoordinatorWorkerRun]]
+            ] = []
+            async with asyncio.TaskGroup() as task_group:
+                for step in ready_steps:
+                    tasks.append(
+                        (
+                            step,
+                            task_group.create_task(
+                                run_step(step, layer=layer),
+                                name=f"worker-dag:{step.id}",
+                            ),
+                        )
+                    )
+            for step, task in tasks:
+                completed[str(step.id)] = task.result()
+    finally:
+        record_coordinator_dag(
+            {
+                "cycle": cycle,
+                "plan_size": len(plan.steps),
+                "dag_depth": len(groups),
+                "max_parallel_width": max(len(group) for group in groups),
+                "worker_max_concurrency": concurrency_limit,
+                "max_observed_concurrency": max_observed_concurrency,
+                "elapsed_seconds": perf_counter() - scheduler_started,
+                "workers": [
+                    timings[step_id]
+                    for step_id in step_numbers
+                    if step_id in timings
+                ],
+            }
+        )
+
+    return [completed[str(step.id)] for step in plan.steps]
 
 
 _OPERATION_SKILL_CATALOG_CONTEXT = "\n".join(
@@ -457,11 +666,11 @@ class CoordinatorResponseError(RuntimeError):
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
 Ты downstream planner. Верни native call `{_PLAN_TOOL_NAME}` с 1–{COORDINATOR_MAX_WORKERS}
-`steps`. Каждая task читает необходимые факты.
+`steps` чтения. Задай уникальный `id`; `depends_on=[]` для независимых steps,
+иначе ID прямых входов. Missing/self dependencies и циклы запрещены.
 
-Каждый step обязан быть незаменимым: без него нельзя ответить на original_task.
-Удали незапрошенные проверки, обогащение и реализацию. Наличие
-таблицы в справочнике не требует её чтения.
+Каждый step незаменим для ответа. Не добавляй незапрошенные проверки,
+обогащение, реализацию и чтение справочника без необходимости.
 
 Сохрани сущность, направление, scope и фильтры. Роль source/target известна,
 только если привязана к идентификатору в original_task/context или доказана
@@ -508,9 +717,8 @@ SQLite-каталоги хранят метаданные. Значения `tab
 Не создавай значения для неподтверждённых физических объектов и полей. Передавай
 upstream только подтверждённые имена, а нехватку данных опиши явно.
 
-Минимизируй обмен. Последующий worker использует результат предыдущего, только
-если без него нельзя читать дальше. Передаются только краткие lazy-ссылки;
-зависимая task называет нужный результат и новое чтение, не будущие значения.
+Worker получает lazy-ссылки только прямых `depends_on`; перечисли все нужные
+входы и не связывай независимые чтения ради порядка.
 
 Если объект задан только бизнес-смыслом, отдельный worker может сначала получить
 технические кандидаты из каталога, а следующий — найти эти кандидаты в S2T.
@@ -531,7 +739,8 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` нарушает схему или смысловой контракт.
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь
-только одну непустую `task`.
+уникальный `id`, непустую `task` и `depends_on` с существующими ID. Удали
+self-dependency, missing dependency и cycles. Независимые чтения не связывай.
 Сохрани запрошенные роли, объекты, фильтры и результаты. Не придумывай
 идентификаторы, функции, tools или требования. Используй только реальные таблицы
 хранилища из system prompt; неизвестные бизнес-объекты оставляй текстом поиска.
@@ -954,7 +1163,7 @@ def _plan_tool_schema() -> Dict[str, Any]:
         "function": {
             "name": _PLAN_TOOL_NAME,
             "description": (
-                "Зафиксировать последовательность готовых worker tasks."
+                "Зафиксировать DAG готовых worker tasks."
             ),
             "parameters": {
                 "type": "object",
@@ -970,6 +1179,17 @@ def _plan_tool_schema() -> Dict[str, Any]:
                         "items": {
                             "type": "object",
                             "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 64,
+                                    "pattern": (
+                                        "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+                                    ),
+                                    "description": (
+                                        "Уникальный стабильный ID шага."
+                                    ),
+                                },
                                 "task": {
                                     "type": "string",
                                     "description": (
@@ -979,8 +1199,22 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                         "upstream"
                                     ),
                                 },
+                                "depends_on": {
+                                    "type": "array",
+                                    "maxItems": COORDINATOR_MAX_WORKERS - 1,
+                                    "uniqueItems": True,
+                                    "items": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 64,
+                                    },
+                                    "description": (
+                                        "ID прямых зависимостей; пусто для "
+                                        "независимого шага."
+                                    ),
+                                },
                             },
-                            "required": ["task"],
+                            "required": ["id", "task", "depends_on"],
                             "additionalProperties": False,
                         },
                     }
@@ -1066,6 +1300,7 @@ def _native_payload(
     tool_name: str,
     payload_model: type[BaseModel],
 ) -> BaseModel:
+    message = recover_required_tool_call(message, tool_name)
     if not isinstance(message, AIMessage):
         raise CoordinatorResponseError(
             f"Coordinator ожидал AIMessage с native call {tool_name}."
@@ -1104,6 +1339,7 @@ def _native_payload(
 def _native_call_arguments(message: Any, tool_name: str) -> Mapping[str, Any]:
     """Return one native-call argument mapping without semantic validation."""
 
+    message = recover_required_tool_call(message, tool_name)
     if not isinstance(message, AIMessage):
         raise CoordinatorResponseError(
             f"Coordinator ожидал AIMessage с native call {tool_name}."
@@ -1384,6 +1620,80 @@ def select_operation_route(
         return _native_operation_route(repaired)
 
 
+async def select_operation_route_async(
+    task: str,
+    *,
+    model: Any,
+    callbacks: Optional[Sequence[Any]] = None,
+    stable_context: str = "",
+) -> OperationSkillSelection:
+    """Async operation router with the same bounded repair contract."""
+
+    callback_list = list(callbacks or [])
+    model_config = {"callbacks": callback_list} if callback_list else None
+    schema = _operation_skill_tool_schema()
+    try:
+        try:
+            selected_model = model.bind_tools(
+                [schema],
+                tool_choice=_OPERATION_SKILL_TOOL_NAME,
+            )
+        except TypeError:
+            selected_model = model.bind_tools([schema])
+        messages: List[BaseMessage] = [
+            SystemMessage(content=_operation_skill_prompt()),
+            HumanMessage(
+                content=json.dumps(
+                    {
+                        "original_task": str(task or "").strip(),
+                        "stable_context": str(stable_context or "").strip(),
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        with llm_stage("operation_router"):
+            result = await ainvoke_compat(
+                selected_model,
+                messages,
+                config=model_config,
+                category="llm",
+            )
+    except Exception as exc:
+        if isinstance(exc, CoordinatorResponseError):
+            raise
+        raise CoordinatorResponseError(
+            f"Ошибка LLM coordinator: {type(exc).__name__}"
+        ) from exc
+
+    try:
+        return _native_operation_route(result)
+    except CoordinatorResponseError as first_error:
+        logger.warning(
+            "Operation route violated selection schema; requesting one "
+            "LLM repair: %s",
+            first_error,
+        )
+        repair_messages = _repair_messages(
+            messages,
+            result,
+            _operation_skill_repair_prompt() + "\nОшибка: " + str(first_error),
+        )
+        try:
+            with llm_stage("operation_router"):
+                repaired = await ainvoke_compat(
+                    selected_model,
+                    repair_messages,
+                    config=model_config,
+                    category="llm",
+                )
+        except Exception as exc:
+            raise CoordinatorResponseError(
+                f"Ошибка LLM coordinator: {type(exc).__name__}"
+            ) from exc
+        return _native_operation_route(repaired)
+
+
 def build_coordinator_graph(
     model: Any,
     *,
@@ -1410,7 +1720,7 @@ def build_coordinator_graph(
         _UPSTREAM_ANSWER_TOOL_NAME,
     )
 
-    def invoke(
+    async def invoke(
         selected_model: Any,
         messages: Sequence[BaseMessage],
         *,
@@ -1418,17 +1728,18 @@ def build_coordinator_graph(
     ) -> Any:
         try:
             with llm_stage(stage):
-                return (
-                    selected_model.invoke(messages, config=model_config)
-                    if model_config is not None
-                    else selected_model.invoke(messages)
+                return await ainvoke_compat(
+                    selected_model,
+                    messages,
+                    config=model_config,
+                    category="llm",
                 )
         except Exception as exc:
             raise CoordinatorResponseError(
                 f"Ошибка LLM coordinator: {type(exc).__name__}"
             ) from exc
 
-    def extract_sql_risk_scope(
+    async def extract_sql_risk_scope(
         original_task: str,
         stable_context: str = "",
     ) -> tuple[SqlRiskScopeExtraction | None, List[str]]:
@@ -1460,7 +1771,7 @@ def build_coordinator_graph(
         last_errors: List[str] = []
         for attempt in range(MAX_SQL_RISK_SCOPE_EXTRACTION_ATTEMPTS):
             try:
-                result = invoke(
+                result = await invoke(
                     sql_risk_scope_extraction_model,
                     messages,
                     stage="sql_risk_scope_contract",
@@ -1504,7 +1815,7 @@ def build_coordinator_graph(
             messages = _repair_messages(messages, result, repair_prompt)
         return None, last_errors
 
-    def assess_sql_risk_scope(context: Any) -> Any:
+    async def assess_sql_risk_scope(context: Any) -> Any:
         """Run the bounded scope-analysis LLM and validate its provenance."""
 
         messages: List[BaseMessage] = [
@@ -1518,7 +1829,7 @@ def build_coordinator_graph(
         result: Any = None
         validation: Any = None
         for attempt in range(MAX_SQL_RISK_ASSESSMENT_ATTEMPTS):
-            result = invoke(
+            result = await invoke(
                 sql_risk_assessment_model,
                 messages,
                 stage="sql_risk_scope_analysis",
@@ -1545,14 +1856,16 @@ def build_coordinator_graph(
             )
         return validation
 
-    def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    async def downstream_plan_node(
+        state: CoordinatorGraphState,
+    ) -> Dict[str, Any]:
         operation_skills = state.get("operation_skills")
         operation_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
         operation_pipeline = state.get("operation_pipeline")
         if operation_skills is None:
-            operation_route = select_operation_route(
+            operation_route = await select_operation_route_async(
                 state["task"],
                 model=model,
                 callbacks=callback_list,
@@ -1616,7 +1929,7 @@ def build_coordinator_graph(
                 extraction_messages = protocol_messages
                 for extraction_attempt in range(2):
                     try:
-                        protocol_result = invoke(
+                        protocol_result = await invoke(
                             protocol_contract_model,
                             extraction_messages,
                             stage="validation_protocol_contract",
@@ -1669,7 +1982,7 @@ def build_coordinator_graph(
                                 )
                             ),
                         ]
-                        review_result = invoke(
+                        review_result = await invoke(
                             protocol_review_model,
                             review_messages,
                             stage="validation_protocol_contract_review",
@@ -1749,7 +2062,8 @@ def build_coordinator_graph(
                 }
             else:
                 try:
-                    resolution = resolve_test_protocol_contract(
+                    resolution = await asyncio.to_thread(
+                        resolve_test_protocol_contract,
                         raw_protocol_contract,
                         callbacks=callback_list,
                     )
@@ -1816,11 +2130,13 @@ def build_coordinator_graph(
                     else:
                         protocol_contract = resolution.contract
                         assert protocol_contract is not None
-                        protocol_reader_results = read_test_protocol_inputs(
+                        protocol_reader_results = await asyncio.to_thread(
+                            read_test_protocol_inputs,
                             protocol_contract,
                             callbacks=callback_list,
                         )
-                        compiled_protocol = compile_test_protocol(
+                        compiled_protocol = await asyncio.to_thread(
+                            compile_test_protocol,
                             protocol_contract,
                             reader_results=protocol_reader_results,
                         )
@@ -1943,7 +2259,7 @@ def build_coordinator_graph(
                 )
             ),
         ]
-        plan_result = invoke(
+        plan_result = await invoke(
             plan_model,
             plan_messages,
             stage="downstream_plan",
@@ -1960,7 +2276,7 @@ def build_coordinator_graph(
                 "one LLM repair: %s",
                 first_error,
             )
-            repaired_result = invoke(
+            repaired_result = await invoke(
                 plan_model,
                 _repair_messages(
                     plan_messages,
@@ -2007,12 +2323,12 @@ def build_coordinator_graph(
             "next_step": 0,
         }
 
-    def sql_risk_scope_node(
+    async def sql_risk_scope_node(
         state: CoordinatorGraphState,
     ) -> Dict[str, Any]:
         """Extract, read, structure and assess one closed SQL-risk scope."""
 
-        extraction, extraction_errors = extract_sql_risk_scope(
+        extraction, extraction_errors = await extract_sql_risk_scope(
             state["task"],
             state["context"],
         )
@@ -2039,14 +2355,26 @@ def build_coordinator_graph(
             )
         else:
             contract = build_sql_risk_scope_contract(extraction)
-            result = run_sql_risk_operation_pipeline(
-                contract,
-                original_task=state["task"],
-                stable_context=state["context"],
-                assessment_runner=assess_sql_risk_scope,
-                callbacks=callback_list,
-                evidence_namespace=f"cycle-{state['cycle']}",
-            )
+            event_loop = asyncio.get_running_loop()
+
+            def run_pipeline() -> SqlRiskOperationPipelineResult:
+                def assess_from_reader_thread(context: Any) -> Any:
+                    future = asyncio.run_coroutine_threadsafe(
+                        assess_sql_risk_scope(context),
+                        event_loop,
+                    )
+                    return future.result()
+
+                return run_sql_risk_operation_pipeline(
+                    contract,
+                    original_task=state["task"],
+                    stable_context=state["context"],
+                    assessment_runner=assess_from_reader_thread,
+                    callbacks=callback_list,
+                    evidence_namespace=f"cycle-{state['cycle']}",
+                )
+
+            result = await asyncio.to_thread(run_pipeline)
 
         operation_trace = {
             **result.metrics_payload(),
@@ -2073,14 +2401,10 @@ def build_coordinator_graph(
             "selected_display_refs": selected_display_refs,
         }
 
-    def worker_node(state: CoordinatorGraphState) -> Dict[str, Any]:
-        step_index = state["next_step"]
-        plan_step = PlanStep.model_validate(state["plan"][step_index])
-        planned_task = plan_step.task
-        if not planned_task:
-            raise CoordinatorResponseError(
-                "Coordinator вызвал worker с пустой task из плана."
-            )
+    async def worker_node(
+        state: CoordinatorGraphState,
+    ) -> Dict[str, Any]:
+        plan = WorkerPlan.model_validate({"steps": state["plan"]})
         selected_operation_skills = state.get("operation_skills") or []
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
@@ -2095,46 +2419,17 @@ def build_coordinator_graph(
             stage="observer",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
-        previous_results = [
-            reference
-            for run in state["worker_runs"]
-            if run["cycle"] == state["cycle"]
-            for reference in run["outcome"].previous_results
-        ]
-        worker_request = WorkerRequestParts(
-            current_task=planned_task,
-            original_task=state["task"],
-            operation_execution_context=planner_context,
-            operation_completeness_context=observer_context,
-            previous_results=(previous_results or None),
-        )
-        logger.info(
-            "Coordinator dispatches planned worker step=%s task=%s previous_results=%s",
-            step_index + 1,
-            worker_request.current_task[:1000],
-            len(previous_results),
-        )
-        outcome = worker_chat(worker_request)
-        record_worker_outcome(
+        runs = await _execute_worker_plan_dag(
+            plan,
             cycle=state["cycle"],
-            step=step_index + 1,
-            status=outcome.status,
-            stop_reason=outcome.stop_reason,
-            unmet_requirements=list(outcome.unmet_requirements),
-            evidence_count=len(outcome.evidence),
-            dataset_count=len(outcome.datasets),
+            original_task=state["task"],
+            planner_context=planner_context,
+            observer_context=observer_context,
+            collected_display_refs=collected_display_refs,
         )
-        for artifact in outcome.evidence:
-            if artifact.display_ref and collected_display_refs is not None:
-                collected_display_refs.append(artifact.display_ref)
-        run: CoordinatorWorkerRun = {
-            "cycle": state["cycle"],
-            "step": step_index + 1,
-            "outcome": outcome,
-        }
         return {
-            "worker_runs": [*state["worker_runs"], run],
-            "next_step": step_index + 1,
+            "worker_runs": [*state["worker_runs"], *runs],
+            "next_step": len(plan.steps),
         }
 
     def validate_upstream_decision(
@@ -2183,7 +2478,9 @@ def build_coordinator_graph(
             )
         return output
 
-    def upstream_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    async def upstream_node(
+        state: CoordinatorGraphState,
+    ) -> Dict[str, Any]:
         selected_operation_skills = state.get("operation_skills") or []
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
@@ -2259,11 +2556,11 @@ def build_coordinator_graph(
             )
         )
 
-        def invoke_decision(
+        async def invoke_decision(
             messages: Sequence[BaseMessage],
         ) -> tuple[Any, UpstreamDecision]:
             can_reroute = state["cycle"] < COORDINATOR_MAX_CYCLES
-            result = invoke(
+            result = await invoke(
                 upstream_data_decision_model,
                 messages,
                 stage="upstream",
@@ -2279,7 +2576,7 @@ def build_coordinator_graph(
                     "requesting one LLM repair: %s",
                     first_error,
                 )
-                result = invoke(
+                result = await invoke(
                     upstream_data_decision_model,
                     _repair_messages(
                         messages,
@@ -2296,14 +2593,14 @@ def build_coordinator_graph(
                 )
             return result, decision
 
-        def invoke_answer(
+        async def invoke_answer(
             messages: Sequence[BaseMessage],
         ) -> tuple[Any, UpstreamOutput]:
             require_used_evidence = bool(
                 available_evidence_ids
                 and "Анализ SQL-рисков" in selected_operation_skills
             )
-            result = invoke(
+            result = await invoke(
                 upstream_answer_model,
                 messages,
                 stage="upstream",
@@ -2321,7 +2618,7 @@ def build_coordinator_graph(
                     "repair: %s",
                     first_error,
                 )
-                result = invoke(
+                result = await invoke(
                     upstream_answer_model,
                     _repair_messages(
                         messages,
@@ -2362,7 +2659,7 @@ def build_coordinator_graph(
                 "selected_display_refs": [],
             }
 
-        _, decision = invoke_decision(decision_messages)
+        _, decision = await invoke_decision(decision_messages)
         if decision.decision == "reroute":
             return data_request_update(decision.problem)
 
@@ -2385,7 +2682,7 @@ def build_coordinator_graph(
                 content=json.dumps(answer_payload, ensure_ascii=False)
             ),
         ]
-        _, evidence = invoke_answer(answer_messages)
+        _, evidence = await invoke_answer(answer_messages)
 
         upstream_output = evidence.model_dump()
         selected_display_refs = [
@@ -2408,8 +2705,6 @@ def build_coordinator_graph(
     def route_after_worker(
         state: CoordinatorGraphState,
     ) -> Literal["worker", "upstream"]:
-        if state["next_step"] < len(state["plan"]):
-            return "worker"
         return "upstream"
 
     def route_after_downstream(
@@ -2467,7 +2762,7 @@ def build_coordinator_graph(
     return graph.compile()
 
 
-def coordinator_chat(
+async def coordinator_chat_async(
     task: str,
     *,
     context: str = "",
@@ -2527,7 +2822,11 @@ def coordinator_chat(
         ),
     ):
         try:
-            final_state = graph.invoke(initial_state, config=config)
+            final_state = await ainvoke_graph_compat(
+                graph,
+                initial_state,
+                config=config,
+            )
             final_answer = str(final_state.get("final_answer") or "").strip()
             if not final_answer:
                 raise CoordinatorResponseError(
@@ -2544,10 +2843,22 @@ def coordinator_chat(
                 answer=final_answer,
                 display_refs=selected_refs,
             )
-        except Exception:
+        except BaseException:
             if collected_display_refs:
                 discard_worker_display_refs(collected_display_refs)
             raise
+
+
+def coordinator_chat(
+    task: str,
+    *,
+    context: str = "",
+) -> CoordinatorAnswer:
+    """Compatibility facade for non-ASGI callers."""
+
+    return run_coroutine_sync(
+        coordinator_chat_async(task, context=context)
+    )
 
 
 __all__ = [
@@ -2564,5 +2875,7 @@ __all__ = [
     "WorkerPlan",
     "build_coordinator_graph",
     "coordinator_chat",
+    "coordinator_chat_async",
     "select_operation_route",
+    "select_operation_route_async",
 ]
