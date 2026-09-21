@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from contextlib import nullcontext
@@ -362,6 +363,131 @@ def test_coordinator_graph_routes_tasks_downstream_and_one_result_upstream():
     assert ("sql_risk_scope", "__end__") in edges
     assert ("upstream", "downstream_plan") in edges
     assert ("upstream", "__end__") in edges
+
+
+@pytest.mark.asyncio
+async def test_public_async_coordinator_executes_full_fan_in_graph(monkeypatch):
+    import agents.coordinator as coordinator_module
+    from agents.coordinator import coordinator_chat_async
+    from agents.run_metrics import capture_agent_run, consume_agent_run_metrics
+
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {"id": "a", "task": "A", "depends_on": []},
+                            {"id": "b", "task": "B", "depends_on": []},
+                            {
+                                "id": "merge",
+                                "task": "MERGE",
+                                "depends_on": ["a", "b"],
+                            },
+                            {
+                                "id": "final",
+                                "task": "FINAL",
+                                "depends_on": ["merge"],
+                            },
+                        ]
+                    },
+                    "plan-full-dag",
+                )
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Граф выполнен.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-full-dag",
+                )
+            ],
+        }
+    )
+    requests = {}
+    roots_started = set()
+    both_roots_started = asyncio.Event()
+
+    async def runner(request):
+        requests[request.current_task] = request
+        if request.current_task in {"A", "B"}:
+            roots_started.add(request.current_task)
+            if len(roots_started) == 2:
+                both_roots_started.set()
+            await asyncio.wait_for(both_roots_started.wait(), timeout=1)
+        references = {
+            "A": [
+                PreviousResultReference(
+                    result_id="result_shared",
+                    description="shared from A",
+                ),
+                PreviousResultReference(
+                    result_id="result_a",
+                    description="result from A",
+                ),
+            ],
+            "B": [
+                PreviousResultReference(
+                    result_id="result_shared",
+                    description="shared from B",
+                ),
+                PreviousResultReference(
+                    result_id="result_b",
+                    description="result from B",
+                ),
+            ],
+            "MERGE": [
+                PreviousResultReference(
+                    result_id="result_merge",
+                    description="merged result",
+                )
+            ],
+            "FINAL": [],
+        }
+        return _outcome(
+            f"done:{request.current_task}",
+            previous_results=references[request.current_task],
+        )
+
+    monkeypatch.setattr(coordinator_module, "_call_worker_chat", runner)
+    model_patch, callback_patch, trace_patch = _patches(model)
+    session_id = "public-full-dag"
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        capture_agent_run(session_id),
+    ):
+        result = await coordinator_chat_async("Выполни полный DAG.")
+
+    assert result.answer == "Граф выполнен."
+    assert roots_started == {"A", "B"}
+    assert requests["A"].previous_results is None
+    assert requests["B"].previous_results is None
+    assert [
+        item.result_id for item in requests["MERGE"].previous_results
+    ] == ["result_shared", "result_a", "result_b"]
+    assert [
+        item.result_id for item in requests["FINAL"].previous_results
+    ] == ["result_merge"]
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    dag = metrics.coordinator_dag[0]
+    assert dag["dag_depth"] == 3
+    assert dag["max_parallel_width"] == 2
+    assert dag["max_observed_concurrency"] == 2
+    assert [item["status"] for item in dag["workers"]] == [
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+    ]
 
 
 def test_operation_skill_is_selected_once_and_applied_by_stage(monkeypatch):

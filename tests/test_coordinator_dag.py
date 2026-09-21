@@ -173,6 +173,8 @@ async def test_dag_executes_roots_concurrently_and_passes_only_dependencies(
     assert dag["max_parallel_width"] == 4
     assert dag["max_observed_concurrency"] == 4
     assert len(dag["workers"]) == 6
+    assert all(item["status"] == "complete" for item in dag["workers"])
+    assert all(item["ready_at_seconds"] is not None for item in dag["workers"])
 
 
 @pytest.mark.asyncio
@@ -259,7 +261,8 @@ async def test_dag_respects_worker_concurrency_limit():
 
 
 @pytest.mark.asyncio
-async def test_dag_worker_failure_cancels_running_sibling():
+async def test_dag_worker_failure_cancels_running_sibling(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
     plan = WorkerPlan.model_validate(
         {
             "steps": [
@@ -283,22 +286,31 @@ async def test_dag_worker_failure_cancels_running_sibling():
             raise
         raise AssertionError("slow worker must be cancelled")
 
-    with pytest.raises(ExceptionGroup) as captured:
-        await _execute_worker_plan_dag(
-            plan,
-            cycle=1,
-            original_task="fail fast",
-            planner_context="",
-            observer_context="",
-            worker_runner=runner,
-            max_concurrency=2,
-        )
+    session_id = f"dag-cancel-running-{uuid4()}"
+    with capture_agent_run(session_id):
+        with pytest.raises(ExceptionGroup) as captured:
+            await _execute_worker_plan_dag(
+                plan,
+                cycle=1,
+                original_task="fail fast",
+                planner_context="",
+                observer_context="",
+                worker_runner=runner,
+                max_concurrency=2,
+            )
 
     assert any(
         isinstance(error, RuntimeError) and str(error) == "worker failed"
         for error in captured.value.exceptions
     )
     assert slow_cancelled.is_set()
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    statuses = {
+        item["step_id"]: item["status"]
+        for item in metrics.coordinator_dag[0]["workers"]
+    }
+    assert statuses == {"fail": "failed", "slow": "cancelled_running"}
 
 
 @pytest.mark.asyncio
@@ -434,3 +446,121 @@ async def test_partial_parent_requires_usable_result_for_child(has_result):
     assert [item.result_id for item in bundle.previous_results] == [
         "result_a"
     ]
+
+
+@pytest.mark.asyncio
+async def test_ready_child_starts_before_independent_slow_root_finishes():
+    plan = WorkerPlan.model_validate(
+        {
+            "steps": [
+                {"id": "a", "task": "A", "depends_on": []},
+                {"id": "b", "task": "B", "depends_on": []},
+                {"id": "c", "task": "C", "depends_on": ["a"]},
+            ]
+        }
+    )
+    a_finished = asyncio.Event()
+    c_started = asyncio.Event()
+    b_finished = asyncio.Event()
+
+    async def runner(request):
+        if request.current_task == "A":
+            a_finished.set()
+            return _result_outcome("a")
+        if request.current_task == "B":
+            await asyncio.wait_for(c_started.wait(), timeout=1)
+            b_finished.set()
+            return _result_outcome("b")
+        assert a_finished.is_set()
+        assert not b_finished.is_set()
+        c_started.set()
+        return _result_outcome("c")
+
+    runs = await _execute_worker_plan_dag(
+        plan,
+        cycle=1,
+        original_task="readiness",
+        planner_context="",
+        observer_context="",
+        worker_runner=runner,
+        max_concurrency=3,
+    )
+
+    assert [run["step_id"] for run in runs] == ["a", "b", "c"]
+    assert c_started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_failure_terminalizes_steps_before_semaphore(
+    monkeypatch,
+):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    plan = WorkerPlan.model_validate(
+        {
+            "steps": [
+                {"id": name, "task": name, "depends_on": []}
+                for name in ("fail", "queued_1", "queued_2")
+            ]
+        }
+    )
+
+    async def runner(request):
+        if request.current_task == "fail":
+            await asyncio.sleep(0)
+            raise RuntimeError("infrastructure failure")
+        await asyncio.sleep(60)
+        raise AssertionError("queued worker must not finish")
+
+    session_id = f"dag-cancel-before-{uuid4()}"
+    with capture_agent_run(session_id):
+        with pytest.raises(ExceptionGroup):
+            await _execute_worker_plan_dag(
+                plan,
+                cycle=1,
+                original_task="cancel queued",
+                planner_context="",
+                observer_context="",
+                worker_runner=runner,
+                max_concurrency=1,
+            )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    workers = metrics.coordinator_dag[0]["workers"]
+    assert len(workers) == 3
+    assert workers[0]["status"] == "failed"
+    assert any(
+        item["status"] == "cancelled_before_start"
+        for item in workers[1:]
+    )
+    assert all(item["status"] is not None for item in workers)
+
+
+@pytest.mark.asyncio
+async def test_ready_queue_preserves_declared_order_under_one_permit():
+    plan = WorkerPlan.model_validate(
+        {
+            "steps": [
+                {"id": name, "task": name.upper(), "depends_on": []}
+                for name in ("a", "b", "c", "d")
+            ]
+        }
+    )
+    started = []
+
+    async def runner(request):
+        started.append(request.current_task)
+        await asyncio.sleep(0)
+        return _result_outcome(request.current_task.lower())
+
+    await _execute_worker_plan_dag(
+        plan,
+        cycle=1,
+        original_task="stable order",
+        planner_context="",
+        observer_context="",
+        worker_runner=runner,
+        max_concurrency=1,
+    )
+
+    assert started == ["A", "B", "C", "D"]

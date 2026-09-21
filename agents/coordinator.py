@@ -331,7 +331,7 @@ async def _execute_worker_plan_dag(
     ] = None,
     max_concurrency: Optional[int] = None,
 ) -> List[CoordinatorWorkerRun]:
-    """Execute validated topological layers with fail-fast sibling semantics."""
+    """Execute a validated DAG from a stable readiness queue."""
 
     runner = worker_runner or _call_worker_chat
     concurrency_limit = (
@@ -347,13 +347,42 @@ async def _execute_worker_plan_dag(
         str(step.id): index
         for index, step in enumerate(plan.steps, start=1)
     }
+    steps_by_id = {str(step.id): step for step in plan.steps}
+    layer_by_id = {
+        str(step.id): layer
+        for layer, group in enumerate(groups, start=1)
+        for step in group
+    }
+    children: Dict[str, List[str]] = {
+        step_id: [] for step_id in step_numbers
+    }
+    remaining_dependencies = {
+        str(step.id): len(step.depends_on) for step in plan.steps
+    }
+    for step in plan.steps:
+        for dependency_id in step.depends_on:
+            children[dependency_id].append(str(step.id))
     completed: Dict[str, CoordinatorWorkerRun] = {}
     semaphore = asyncio.Semaphore(concurrency_limit)
     activity_lock = asyncio.Lock()
     active_workers = 0
     max_observed_concurrency = 0
     scheduler_started = perf_counter()
-    timings: Dict[str, Dict[str, Any]] = {}
+    timings: Dict[str, Dict[str, Any]] = {
+        step_id: {
+            "step_id": step_id,
+            "depends_on": list(steps_by_id[step_id].depends_on),
+            "layer": layer_by_id[step_id],
+            "ready_at_seconds": None,
+            "queued_at_seconds": None,
+            "started_at_seconds": None,
+            "ended_at_seconds": None,
+            "dependency_wait_seconds": None,
+            "semaphore_wait_seconds": None,
+            "status": None,
+        }
+        for step_id in step_numbers
+    }
 
     def dependency_bundles(step: PlanStep) -> List[DependencyBundle]:
         bundles: List[DependencyBundle] = []
@@ -389,8 +418,6 @@ async def _execute_worker_plan_dag(
 
     async def run_step(
         step: PlanStep,
-        *,
-        layer: int,
     ) -> CoordinatorWorkerRun:
         nonlocal active_workers, max_observed_concurrency
         step_id = str(step.id)
@@ -406,18 +433,20 @@ async def _execute_worker_plan_dag(
             ),
             dependency_bundles=(bundles if step.depends_on else None),
         )
-        queued_at = perf_counter()
-        timing: Dict[str, Any] = {
-            "step_id": step_id,
-            "depends_on": list(step.depends_on),
-            "layer": layer,
-            "queued_at_seconds": queued_at - scheduler_started,
-        }
-        timings[step_id] = timing
-        async with semaphore:
+        timing = timings[step_id]
+        queued_at = scheduler_started + float(
+            timing["queued_at_seconds"] or 0.0
+        )
+        acquired = False
+        started_at: Optional[float] = None
+        active_incremented = False
+        try:
+            await semaphore.acquire()
+            acquired = True
             started_at = perf_counter()
             async with activity_lock:
                 active_workers += 1
+                active_incremented = True
                 max_observed_concurrency = max(
                     max_observed_concurrency,
                     active_workers,
@@ -426,7 +455,6 @@ async def _execute_worker_plan_dag(
             timing.update(
                 {
                     "started_at_seconds": started_at - scheduler_started,
-                    "dependency_wait_seconds": queued_at - scheduler_started,
                     "semaphore_wait_seconds": started_at - queued_at,
                     "concurrent_at_start": concurrent_at_start,
                 }
@@ -439,22 +467,31 @@ async def _execute_worker_plan_dag(
                 step.depends_on,
                 len(previous_results),
             )
-            try:
-                outcome = await runner(request)
-            except BaseException as exc:
-                timing["status"] = "cancelled" if isinstance(
-                    exc, asyncio.CancelledError
-                ) else "failed"
-                timing["error_type"] = type(exc).__name__
-                raise
-            else:
-                timing["status"] = outcome.status
-            finally:
-                ended_at = perf_counter()
-                timing["ended_at_seconds"] = ended_at - scheduler_started
-                timing["elapsed_seconds"] = ended_at - started_at
+            outcome = await runner(request)
+            timing["status"] = outcome.status
+        except asyncio.CancelledError as exc:
+            timing["status"] = (
+                "cancelled_running"
+                if started_at is not None
+                else "cancelled_before_start"
+            )
+            timing["error_type"] = type(exc).__name__
+            raise
+        except BaseException as exc:
+            timing["status"] = "failed"
+            timing["error_type"] = type(exc).__name__
+            raise
+        finally:
+            ended_at = perf_counter()
+            timing["ended_at_seconds"] = ended_at - scheduler_started
+            timing["elapsed_seconds"] = (
+                ended_at - started_at if started_at is not None else 0.0
+            )
+            if active_incremented:
                 async with activity_lock:
                     active_workers -= 1
+            if acquired:
+                semaphore.release()
 
         record_worker_outcome(
             cycle=cycle,
@@ -481,43 +518,49 @@ async def _execute_worker_plan_dag(
             "outcome": outcome,
         }
 
-    try:
-        for layer, ready_steps in enumerate(groups, start=1):
-            runnable_steps: List[PlanStep] = []
-            for step in ready_steps:
-                blockers = []
-                for dependency_id in step.depends_on:
-                    dependency_run = completed[dependency_id]
-                    dependency_outcome = dependency_run["outcome"]
-                    status = dependency_run["terminal_status"]
-                    if status in {"failed", "blocked_by_dependency"}:
-                        blockers.append(dependency_id)
-                    elif (
-                        status == "partial"
-                        and (
-                            dependency_outcome is None
-                            or not dependency_outcome.previous_results
-                        )
-                    ):
-                        blockers.append(dependency_id)
-                if not blockers:
-                    runnable_steps.append(step)
-                    continue
+    def blocking_dependencies(step: PlanStep) -> List[str]:
+        blockers: List[str] = []
+        for dependency_id in step.depends_on:
+            dependency_run = completed[dependency_id]
+            dependency_outcome = dependency_run["outcome"]
+            status = dependency_run["terminal_status"]
+            if status in {"failed", "blocked_by_dependency"}:
+                blockers.append(dependency_id)
+            elif (
+                status == "partial"
+                and (
+                    dependency_outcome is None
+                    or not dependency_outcome.previous_results
+                )
+            ):
+                blockers.append(dependency_id)
+        return blockers
 
-                step_id = str(step.id)
+    try:
+        active_tasks: Dict[asyncio.Task[CoordinatorWorkerRun], str] = {}
+        async with asyncio.TaskGroup() as task_group:
+            def unlock_children(step_id: str) -> None:
+                for child_id in children[step_id]:
+                    remaining_dependencies[child_id] -= 1
+                    if remaining_dependencies[child_id] == 0:
+                        enqueue_ready(child_id)
+
+            def mark_blocked(step_id: str, blockers: Sequence[str]) -> None:
                 now = perf_counter()
-                timings[step_id] = {
-                    "step_id": step_id,
-                    "depends_on": list(step.depends_on),
-                    "layer": layer,
-                    "queued_at_seconds": now - scheduler_started,
-                    "started_at_seconds": None,
-                    "ended_at_seconds": now - scheduler_started,
-                    "dependency_wait_seconds": now - scheduler_started,
-                    "semaphore_wait_seconds": 0.0,
-                    "status": "blocked_by_dependency",
-                    "blocked_by": blockers,
-                }
+                elapsed = now - scheduler_started
+                timing = timings[step_id]
+                timing.update(
+                    {
+                        "ready_at_seconds": elapsed,
+                        "dependency_wait_seconds": elapsed,
+                        "semaphore_wait_seconds": 0.0,
+                        "ended_at_seconds": elapsed,
+                        "elapsed_seconds": 0.0,
+                        "status": "blocked_by_dependency",
+                        "blocked_by": list(blockers),
+                    }
+                )
+                step = steps_by_id[step_id]
                 completed[step_id] = {
                     "cycle": cycle,
                     "step": step_numbers[step_id],
@@ -538,23 +581,58 @@ async def _execute_worker_plan_dag(
                     evidence_count=0,
                     dataset_count=0,
                 )
-            tasks: List[
-                tuple[PlanStep, asyncio.Task[CoordinatorWorkerRun]]
-            ] = []
-            async with asyncio.TaskGroup() as task_group:
-                for step in runnable_steps:
-                    tasks.append(
-                        (
-                            step,
-                            task_group.create_task(
-                                run_step(step, layer=layer),
-                                name=f"worker-dag:{step.id}",
-                            ),
-                        )
-                    )
-            for step, task in tasks:
-                completed[str(step.id)] = task.result()
+                unlock_children(step_id)
+
+            def enqueue_ready(step_id: str) -> None:
+                step = steps_by_id[step_id]
+                now = perf_counter()
+                elapsed = now - scheduler_started
+                timing = timings[step_id]
+                timing["ready_at_seconds"] = elapsed
+                timing["dependency_wait_seconds"] = elapsed
+                blockers = blocking_dependencies(step)
+                if blockers:
+                    mark_blocked(step_id, blockers)
+                    return
+                timing["queued_at_seconds"] = elapsed
+                task = task_group.create_task(
+                    run_step(step),
+                    name=f"worker-dag:{step_id}",
+                )
+                active_tasks[task] = step_id
+
+            for step in plan.steps:
+                step_id = str(step.id)
+                if remaining_dependencies[step_id] == 0:
+                    enqueue_ready(step_id)
+
+            while active_tasks:
+                done, _ = await asyncio.wait(
+                    tuple(active_tasks),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in sorted(
+                    done,
+                    key=lambda item: step_numbers[active_tasks[item]],
+                ):
+                    step_id = active_tasks.pop(task)
+                    completed[step_id] = task.result()
+                    unlock_children(step_id)
+
+            if len(completed) != len(plan.steps):
+                raise RuntimeError("DAG scheduler stopped before all steps")
     finally:
+        terminalized_at = perf_counter() - scheduler_started
+        for timing in timings.values():
+            if timing["status"] is not None:
+                continue
+            timing.update(
+                {
+                    "ended_at_seconds": terminalized_at,
+                    "elapsed_seconds": 0.0,
+                    "status": "cancelled_before_start",
+                }
+            )
         record_coordinator_dag(
             {
                 "cycle": cycle,
@@ -563,11 +641,21 @@ async def _execute_worker_plan_dag(
                 "max_parallel_width": max(len(group) for group in groups),
                 "worker_max_concurrency": concurrency_limit,
                 "max_observed_concurrency": max_observed_concurrency,
+                "blocked_count": sum(
+                    item["status"] == "blocked_by_dependency"
+                    for item in timings.values()
+                ),
+                "cancelled_before_start_count": sum(
+                    item["status"] == "cancelled_before_start"
+                    for item in timings.values()
+                ),
+                "cancelled_running_count": sum(
+                    item["status"] == "cancelled_running"
+                    for item in timings.values()
+                ),
                 "elapsed_seconds": perf_counter() - scheduler_started,
                 "workers": [
-                    timings[step_id]
-                    for step_id in step_numbers
-                    if step_id in timings
+                    timings[step_id] for step_id in step_numbers
                 ],
             }
         )
