@@ -2565,7 +2565,9 @@ def test_worker_exposes_only_saved_results_accepted_by_observer():
             "result_id",
             "description",
             "result_schema",
+            "source_evidence_ids",
         }
+        assert reference.source_evidence_ids == ["evidence-correct"]
         assert reference.description == (
             'run_sql: args={"query":"SELECT value FROM result"}'
         )
@@ -2580,6 +2582,7 @@ def test_worker_exposes_only_saved_results_accepted_by_observer():
             {"result_id": reference.result_id}
         )
         assert resolved["result"]["rows"] == [{"value": "correct"}]
+        assert resolved["source_evidence_ids"] == ["evidence-correct"]
 
     assert len(result.datasets) == 1
     descriptor = result.datasets[0]

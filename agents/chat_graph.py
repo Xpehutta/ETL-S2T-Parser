@@ -517,6 +517,30 @@ def _tool_saved_result_ref(content: Any) -> str:
         return ""
 
 
+def _tool_source_evidence_ids(content: Any) -> List[str]:
+    """Read original evidence lineage from a lazy previous-result read."""
+    try:
+        from .tools.saved_results import _decode_tool_content
+
+        payload = _decode_tool_content(content)
+        if not isinstance(payload, Mapping):
+            return []
+        records = payload.get("results")
+        if not isinstance(records, list):
+            records = [payload]
+        result: List[str] = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            for value in record.get("source_evidence_ids") or []:
+                clean_value = str(value or "").strip()
+                if clean_value and clean_value not in result:
+                    result.append(clean_value)
+        return result
+    except (TypeError, ValueError):
+        return []
+
+
 def _tool_message_preview(content: Any, max_chars: int) -> str:
     text = _tool_model_content(content).strip()
     limit = max(1, int(max_chars))
@@ -746,6 +770,10 @@ class WorkerDisplayItem(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict, exclude=True)
     preview: str = Field(default="", exclude=True)
     truncated: bool = Field(default=False, exclude=True)
+    lineage_evidence_ids: List[str] = Field(
+        default_factory=list,
+        exclude=True,
+    )
 
 
 class WorkerRunResult(BaseModel):
@@ -2420,6 +2448,11 @@ async def run_worker_graph_async(
                 truncated=(
                     len(model_content.strip()) > preview_chars
                     or _tool_result_truncated(message)
+                ),
+                lineage_evidence_ids=(
+                    _tool_source_evidence_ids(message.content)
+                    if message.name == "read_previous_result"
+                    else []
                 ),
             )
         )

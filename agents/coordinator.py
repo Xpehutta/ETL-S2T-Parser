@@ -180,6 +180,8 @@ async def _coordinator_runtime_scope() -> Any:
 COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
+UPSTREAM_EVIDENCE_PREVIEW_MAX_CHARS = 2000
+UPSTREAM_EVIDENCE_SERIALIZED_MAX_CHARS = 12000
 _PLAN_TOOL_NAME = "submit_worker_plan"
 _SQL_RISK_OPERATION_SKILL = "Анализ SQL-рисков"
 _DEFAULT_SQL_RISK_PROTOCOL = "default/current"
@@ -329,7 +331,12 @@ def _worker_run_manifest(
                 "status": run["terminal_status"],
                 "stop_reason": run["stop_reason"],
                 "evidence_count": (
-                    len(outcome.evidence) if outcome is not None else 0
+                    sum(
+                        not item.lineage_evidence_ids
+                        for item in outcome.evidence
+                    )
+                    if outcome is not None
+                    else 0
                 ),
                 "result_count": (
                     len(outcome.previous_results)
@@ -339,6 +346,106 @@ def _worker_run_manifest(
             }
         )
     return manifest
+
+
+def _compact_json_chars(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _bounded_upstream_preview(value: str) -> tuple[str, bool]:
+    preview = str(value or "")
+    if len(preview) <= UPSTREAM_EVIDENCE_PREVIEW_MAX_CHARS:
+        return preview, False
+    marker = "… [upstream preview truncated]"
+    prefix_length = max(
+        0,
+        UPSTREAM_EVIDENCE_PREVIEW_MAX_CHARS - len(marker),
+    )
+    return preview[:prefix_length].rstrip() + marker, True
+
+
+def _build_upstream_evidence_bundle(
+    runs: Sequence[CoordinatorWorkerRun],
+) -> Dict[str, Any]:
+    """Build a bounded, explicit evidence envelope in stable plan order."""
+    evidence: List[Dict[str, Any]] = []
+    evidence_lineage: List[Dict[str, Any]] = []
+    omitted_evidence_ids: List[str] = []
+    preview_truncated_evidence_ids: List[str] = []
+    seen_evidence_ids: set[str] = set()
+
+    for run in runs:
+        outcome = run["outcome"]
+        if outcome is None:
+            continue
+        for artifact in outcome.evidence:
+            if artifact.evidence_id in seen_evidence_ids:
+                raise CoordinatorResponseError(
+                    "Workers вернули дублирующий evidence_id: "
+                    + artifact.evidence_id
+                )
+            seen_evidence_ids.add(artifact.evidence_id)
+            if artifact.lineage_evidence_ids:
+                evidence_lineage.append(
+                    {
+                        "producer_step_id": run["step_id"],
+                        "evidence_id": artifact.evidence_id,
+                        "source_evidence_ids": list(
+                            artifact.lineage_evidence_ids
+                        ),
+                    }
+                )
+                continue
+
+            preview, preview_truncated = _bounded_upstream_preview(
+                artifact.preview
+            )
+            envelope = {
+                "evidence_id": artifact.evidence_id,
+                "producer_step_id": run["step_id"],
+                "tool_name": artifact.tool_name,
+                "args": artifact.compact_args,
+                "preview": preview,
+                "truncated": artifact.truncated or preview_truncated,
+                "preview_truncated": preview_truncated,
+                "displayable": artifact.display_ref is not None,
+            }
+            if (
+                _compact_json_chars([*evidence, envelope])
+                > UPSTREAM_EVIDENCE_SERIALIZED_MAX_CHARS
+            ):
+                omitted_evidence_ids.append(artifact.evidence_id)
+                continue
+            evidence.append(envelope)
+            if preview_truncated:
+                preview_truncated_evidence_ids.append(
+                    artifact.evidence_id
+                )
+
+    serialized_chars = _compact_json_chars(evidence)
+    return {
+        "evidence": evidence,
+        "evidence_budget": {
+            "max_preview_chars": UPSTREAM_EVIDENCE_PREVIEW_MAX_CHARS,
+            "max_serialized_chars": (
+                UPSTREAM_EVIDENCE_SERIALIZED_MAX_CHARS
+            ),
+            "serialized_chars": serialized_chars,
+            "overflow": bool(omitted_evidence_ids),
+            "omitted_evidence_ids": omitted_evidence_ids,
+            "preview_truncated_evidence_ids": (
+                preview_truncated_evidence_ids
+            ),
+        },
+        "evidence_lineage": evidence_lineage,
+    }
 
 
 async def _execute_worker_plan_dag(
@@ -989,32 +1096,26 @@ self-dependency, missing dependency и cycles. Независимые чтени
 """.strip()
 
 _UPSTREAM_DATA_DECISION_PROMPT = f"""
-Проверь `evidence` и `execution_manifest` для `original_task`.
-Верни один native call
-`{_UPSTREAM_DATA_DECISION_TOOL_NAME}`:
+Проверь `evidence` и обязательный `execution_manifest` для `original_task`.
+Верни один native call `{_UPSTREAM_DATA_DECISION_TOOL_NAME}`. Выбери
+`decision="pass"`, если конечный ответ обоснован, иначе `decision="reroute"`.
 
-- `decision="pass"`, если можно дать конечный ответ;
-- `decision="reroute"`, если нужен новый цикл чтения.
+При `pass` передай в `selected_evidence_ids` только релевантный subset; если
+evidence есть, он не пуст. При `reroute` список пуст, а непустой `problem`
+описывает только недостающий факт/чтение: не предлагай имена таблиц, колонок или
+значения вне входа. Не формируй пользовательский ответ и не выбирай display.
 
-При reroute непустой `problem` описывает недостающие данные новому плану.
-Не формируй пользовательский ответ и не выбирай display-results.
+Evidence содержит ID, `producer_step_id`, tool, точные args, preview и признаки
+truncation/display. Args подтверждают scope, preview — данные. Truncation и
+`evidence_budget.overflow=true` не подтверждают полноту или пустой результат.
+Manifest `failed`/`blocked_by_dependency` не является успехом; `partial`
+подтверждает лишь имеющиеся evidence/results.
 
-В `problem` не предлагай имена таблиц, колонок, схем, технические синонимы или
-значения, которых нет во входе. Описывай только недостающий факт или чтение.
-
-В evidence: `evidence_id`, `tool_name`, точные `args`, фактический `preview`,
-`truncated`, `displayable`. Args подтверждают область чтения, preview — данные.
-Не додумывай; `truncated=true` не подтверждает полный набор.
-В manifest `failed`/`blocked_by_dependency` не являются успехом, а `partial`
-подтверждает лишь переданные evidence/results.
-
-Сопоставь каждый запрошенный результат и scope с прямым evidence. Для сравнения,
-разности множеств или производной метрики нужны evidence всех операндов;
-отсутствующий операнд не доказывает пустое множество или ноль. Нельзя считать
-значение одной метрики подтверждением другой.
-
-Промежуточный список кандидатов не подтверждает связь, правило, маппинг или
-lineage. Если original_task требует следующего источника, верни `reroute`.
+Каждый запрошенный результат сопоставь с прямым evidence. Для сравнения,
+разности и производной метрики нужны evidence всех операндов; отсутствие
+операнда не доказывает пустое множество или ноль. Значение одной метрики не
+заменяет другую. Промежуточный список кандидатов не подтверждает связь, mapping
+или lineage. Если нужен следующий источник, верни `reroute`.
 """.strip()
 
 _UPSTREAM_ANSWER_PROMPT = f"""
@@ -1022,13 +1123,16 @@ _UPSTREAM_ANSWER_PROMPT = f"""
 Вход содержит `original_task`, обязательный `execution_manifest` и принятые
 `evidence`. Сам выполни запрошенный
 анализ и верни ровно один native call `{_UPSTREAM_ANSWER_TOOL_NAME}` с готовым
-`answer`. При наличии подтверждающих evidence передай `used_evidence_ids` и
-нужные `display_evidence_ids`.
+`answer`. Вход уже содержит только выбранный decision subset evidence. Если он
+не пуст, передай хотя бы один `used_evidence_id`; используй только этот subset.
+Нужные `display_evidence_ids` также должны входить в used.
 
-Evidence содержит `evidence_id`, `tool_name`, точные `args`, фактический
-`preview`, `truncated` и признак `displayable`. Аргументы подтверждают область
-чтения, preview — найденные данные. Не додумывай отсутствующее; при
-`truncated=true` не утверждай полноту набора. `display_evidence_ids` выбирай
+Evidence содержит `evidence_id`, `producer_step_id`, `tool_name`, точные `args`,
+фактический `preview`, `truncated`, `preview_truncated` и `displayable`.
+Аргументы подтверждают область чтения, preview — найденные данные. Не додумывай
+отсутствующее; при `truncated=true` не утверждай полноту набора.
+`evidence_budget.overflow=true` явно сообщает о не вошедших evidence.
+`display_evidence_ids` выбирай
 как `evidence_id` только у результатов с `displayable=true` и включай также в
 `used_evidence_ids`.
 Manifest содержит terminal status всех шагов. Не представляй failed/blocked
@@ -1059,7 +1163,8 @@ _UPSTREAM_DATA_DECISION_REPAIR_PROMPT = f"""
 Предыдущий native call решения о данных не соответствует схеме. Верни ровно один
 `{_UPSTREAM_DATA_DECISION_TOOL_NAME}` с обязательным `decision`: `pass` или
 `reroute`. Для `reroute` обязателен непустой bounded `problem`. Не формируй
-ответ и не выбирай evidence.
+ответ. Верни `selected_evidence_ids`: релевантный непустой subset доступных ID
+для `pass` при наличии evidence либо пустой список для `reroute`.
 """.strip()
 
 _UPSTREAM_ANSWER_REPAIR_PROMPT = f"""
@@ -1530,9 +1635,18 @@ def _upstream_data_decision_tool_schema() -> Dict[str, Any]:
                         "description": (
                             "Необязательное уточнение нехватки данных для нового плана."
                         ),
-                    }
+                    },
+                    "selected_evidence_ids": {
+                        "type": "array",
+                        "uniqueItems": True,
+                        "items": {"type": "string"},
+                        "description": (
+                            "Релевантные evidence_id для answer; пусто только "
+                            "если evidence нет либо выбран reroute."
+                        ),
+                    },
                 },
-                "required": ["decision"],
+                "required": ["decision", "selected_evidence_ids"],
                 "additionalProperties": False,
             },
         },
@@ -2682,11 +2796,30 @@ def build_coordinator_graph(
         message: Any,
         *,
         can_reroute: bool,
+        available_evidence_ids: set[str],
     ) -> UpstreamDecision:
         decision = _native_upstream_decision(message)
         if decision.decision == "reroute" and not can_reroute:
             raise CoordinatorResponseError(
                 "На последнем цикле data decision должен быть pass."
+            )
+        unknown_ids = sorted(
+            set(decision.selected_evidence_ids)
+            - available_evidence_ids
+        )
+        if unknown_ids:
+            raise CoordinatorResponseError(
+                "Upstream data decision выбрал неизвестные evidence_id: "
+                + ", ".join(unknown_ids)
+            )
+        if (
+            decision.decision == "pass"
+            and available_evidence_ids
+            and not decision.selected_evidence_ids
+        ):
+            raise CoordinatorResponseError(
+                "Data-backed pass обязан выбрать хотя бы один "
+                "selected_evidence_id."
             )
         return decision
 
@@ -2719,7 +2852,7 @@ def build_coordinator_graph(
             and not output.used_evidence_ids
         ):
             raise CoordinatorResponseError(
-                "Data-backed SQL-risk answer обязан сослаться хотя бы на "
+                "Data-backed answer обязан сослаться хотя бы на "
                 "один доступный used_evidence_id."
             )
         return output
@@ -2741,30 +2874,33 @@ def build_coordinator_graph(
             stage="upstream",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
-        available_evidence_ids: set[str] = set()
-        available_display_refs: Dict[str, str] = {}
-        evidence_payload: List[Dict[str, Any]] = []
         execution_manifest = _worker_run_manifest(state["worker_runs"])
+        evidence_bundle = _build_upstream_evidence_bundle(
+            state["worker_runs"]
+        )
+        evidence_payload = list(evidence_bundle["evidence"])
+        evidence_by_id = {
+            item["evidence_id"]: item for item in evidence_payload
+        }
+        available_evidence_ids = set(evidence_by_id)
+        available_display_refs: Dict[str, str] = {}
         for run in state["worker_runs"]:
             outcome = run["outcome"]
             if outcome is None:
                 continue
-            outcome_payload = outcome.upstream_payload()
-            evidence_payload.extend(outcome_payload["evidence"])
             for artifact in outcome.evidence:
-                if artifact.evidence_id in available_evidence_ids:
-                    raise CoordinatorResponseError(
-                        "Workers вернули дублирующий evidence_id: "
-                        + artifact.evidence_id
-                    )
-                available_evidence_ids.add(artifact.evidence_id)
-                if artifact.display_ref is not None:
+                if (
+                    artifact.evidence_id in available_evidence_ids
+                    and artifact.display_ref is not None
+                ):
                     available_display_refs[
                         artifact.evidence_id
                     ] = artifact.display_ref
         upstream_payload = {
             "original_task": state["task"],
             "evidence": evidence_payload,
+            "evidence_budget": evidence_bundle["evidence_budget"],
+            "evidence_lineage": evidence_bundle["evidence_lineage"],
             "execution_manifest": execution_manifest,
         }
         decision_messages: List[BaseMessage] = [
@@ -2794,19 +2930,6 @@ def build_coordinator_graph(
                 )
             ),
         ]
-        evidence_context = (
-            "\nДоступные used_evidence_ids (копируй дословно): "
-            + json.dumps(
-                sorted(available_evidence_ids),
-                ensure_ascii=False,
-            )
-            + "\nДоступные display_evidence_ids: "
-            + json.dumps(
-                sorted(available_display_refs),
-                ensure_ascii=False,
-            )
-        )
-
         async def invoke_decision(
             messages: Sequence[BaseMessage],
         ) -> tuple[Any, UpstreamDecision]:
@@ -2820,6 +2943,7 @@ def build_coordinator_graph(
                 decision = validate_upstream_decision(
                     result,
                     can_reroute=can_reroute,
+                    available_evidence_ids=available_evidence_ids,
                 )
             except CoordinatorResponseError as first_error:
                 logger.warning(
@@ -2841,15 +2965,27 @@ def build_coordinator_graph(
                 decision = validate_upstream_decision(
                     result,
                     can_reroute=can_reroute,
+                    available_evidence_ids=available_evidence_ids,
                 )
             return result, decision
 
         async def invoke_answer(
             messages: Sequence[BaseMessage],
+            *,
+            selected_evidence_ids: set[str],
+            selected_display_refs: Dict[str, str],
         ) -> tuple[Any, UpstreamOutput]:
-            require_used_evidence = bool(
-                available_evidence_ids
-                and "Анализ SQL-рисков" in selected_operation_skills
+            evidence_context = (
+                "\nДоступные used_evidence_ids (копируй дословно): "
+                + json.dumps(
+                    sorted(selected_evidence_ids),
+                    ensure_ascii=False,
+                )
+                + "\nДоступные display_evidence_ids: "
+                + json.dumps(
+                    sorted(selected_display_refs),
+                    ensure_ascii=False,
+                )
             )
             result = await invoke(
                 upstream_answer_model,
@@ -2859,9 +2995,9 @@ def build_coordinator_graph(
             try:
                 output = validate_upstream_answer(
                     result,
-                    available_evidence_ids=available_evidence_ids,
-                    available_display_refs=available_display_refs,
-                    require_used_evidence=require_used_evidence,
+                    available_evidence_ids=selected_evidence_ids,
+                    available_display_refs=selected_display_refs,
+                    require_used_evidence=bool(selected_evidence_ids),
                 )
             except CoordinatorResponseError as first_error:
                 logger.warning(
@@ -2883,9 +3019,9 @@ def build_coordinator_graph(
                 )
                 output = validate_upstream_answer(
                     result,
-                    available_evidence_ids=available_evidence_ids,
-                    available_display_refs=available_display_refs,
-                    require_used_evidence=require_used_evidence,
+                    available_evidence_ids=selected_evidence_ids,
+                    available_display_refs=selected_display_refs,
+                    require_used_evidence=bool(selected_evidence_ids),
                 )
             return result, output
 
@@ -2914,7 +3050,26 @@ def build_coordinator_graph(
         if decision.decision == "reroute":
             return data_request_update(decision.problem)
 
-        answer_payload = dict(upstream_payload)
+        selected_ids = set(decision.selected_evidence_ids)
+        selected_display_ref_map = {
+            evidence_id: display_ref
+            for evidence_id, display_ref in available_display_refs.items()
+            if evidence_id in selected_ids
+        }
+        answer_payload = {
+            "original_task": state["task"],
+            "evidence": [
+                evidence_by_id[evidence_id]
+                for evidence_id in decision.selected_evidence_ids
+            ],
+            "evidence_budget": evidence_bundle["evidence_budget"],
+            "evidence_lineage": [
+                item
+                for item in evidence_bundle["evidence_lineage"]
+                if set(item["source_evidence_ids"]) & selected_ids
+            ],
+            "execution_manifest": execution_manifest,
+        }
         if decision.problem:
             answer_payload["data_problem"] = decision.problem
         incomplete_steps = [
@@ -2956,7 +3111,11 @@ def build_coordinator_graph(
                 content=json.dumps(answer_payload, ensure_ascii=False)
             ),
         ]
-        _, evidence = await invoke_answer(answer_messages)
+        _, evidence = await invoke_answer(
+            answer_messages,
+            selected_evidence_ids=selected_ids,
+            selected_display_refs=selected_display_ref_map,
+        )
 
         final_answer = evidence.answer
         if (
@@ -2969,7 +3128,7 @@ def build_coordinator_graph(
             "answer": final_answer,
         }
         selected_display_refs = [
-            available_display_refs[evidence_id]
+            selected_display_ref_map[evidence_id]
             for evidence_id in evidence.display_evidence_ids
         ]
         record_upstream_output(

@@ -649,7 +649,9 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
             ),
             description="run_sql: t_example содержит 42 строки.",
             dataset_ref=descriptor.result_ref,
+            source_evidence_ids=["evidence-source"],
         )
+        assert reference.source_evidence_ids == ["evidence-source"]
         assert reference.result_schema is not None
         assert reference.result_schema.result_ref == descriptor.result_ref
         assert reference.result_schema.row_count == 1
@@ -670,11 +672,15 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
             {"result_id": reference.result_id}
         )
         assert resolved["source_tool"] == "run_sql"
+        assert resolved["source_evidence_ids"] == ["evidence-source"]
         assert resolved["result"]["rows"][0]["target_table"] == "t_example"
         batched = read_previous_result.invoke(
             {"result_ids": [reference.result_id]}
         )
         assert batched["results"][0]["source_tool"] == "run_sql"
+        assert batched["results"][0]["source_evidence_ids"] == [
+            "evidence-source"
+        ]
         assert batched["results"][0]["result"]["rows"][0][
             "target_table"
         ] == "t_example"

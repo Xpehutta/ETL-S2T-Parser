@@ -317,6 +317,7 @@ class SavedResultStore:
         content: str,
         description: str,
         dataset_ref: Optional[str] = None,
+        source_evidence_ids: Sequence[str] = (),
     ) -> PreviousResultReference:
         """Store one accepted tool result behind an opaque run-scoped id."""
         clean_dataset_ref = str(dataset_ref or "").strip() or None
@@ -346,6 +347,7 @@ class SavedResultStore:
             reference = PreviousResultReference(
                 result_id=f"result_{uuid4().hex}",
                 description=description,
+                source_evidence_ids=list(source_evidence_ids),
                 result_schema=(
                     PreviousResultSchema(
                         result_ref=descriptor.result_ref,
@@ -365,6 +367,7 @@ class SavedResultStore:
                 "source_tool": str(source_tool or "unknown_tool"),
                 "source_tool_call_id": str(source_tool_call_id or "").strip(),
                 "content": str(content or ""),
+                "source_evidence_ids": list(reference.source_evidence_ids),
             }
             if clean_dataset_ref is not None:
                 self._result_datasets[reference.result_id] = clean_dataset_ref
@@ -392,6 +395,9 @@ class SavedResultStore:
         result = {
             "result_id": clean_id,
             "source_tool": payload["source_tool"],
+            "source_evidence_ids": list(
+                payload.get("source_evidence_ids") or []
+            ),
             "result": decoded if decoded is not None else content,
         }
         return result

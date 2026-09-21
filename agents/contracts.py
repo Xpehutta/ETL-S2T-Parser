@@ -112,6 +112,10 @@ class PreviousResultReference(BaseModel):
     result_id: str = Field(min_length=1)
     description: str = Field(min_length=1, max_length=600)
     result_schema: Optional[PreviousResultSchema] = None
+    source_evidence_ids: List[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
 
     @field_validator("result_id", "description")
     @classmethod
@@ -120,6 +124,18 @@ class PreviousResultReference(BaseModel):
         if not clean_value:
             raise ValueError("previous result fields must not be blank")
         return clean_value
+
+    @field_validator("source_evidence_ids")
+    @classmethod
+    def _clean_source_evidence_ids(cls, values: List[str]) -> List[str]:
+        result: List[str] = []
+        for value in values:
+            clean_value = str(value or "").strip()
+            if not clean_value:
+                raise ValueError("source evidence ids must not contain blanks")
+            if clean_value not in result:
+                result.append(clean_value)
+        return result
 
 
 class DependencyBundle(BaseModel):
@@ -466,6 +482,10 @@ class EvidenceArtifact(BaseModel):
     truncated: bool = False
     display_ref: Optional[str] = Field(default=None, exclude=True)
     dataset_ref: Optional[str] = Field(default=None, exclude=True)
+    lineage_evidence_ids: List[str] = Field(
+        default_factory=list,
+        exclude=True,
+    )
 
     @field_validator("evidence_id", "tool_name")
     @classmethod
@@ -482,6 +502,18 @@ class EvidenceArtifact(BaseModel):
             return None
         clean_value = str(value).strip()
         return clean_value or None
+
+    @field_validator("lineage_evidence_ids")
+    @classmethod
+    def _clean_lineage_evidence_ids(cls, values: List[str]) -> List[str]:
+        result: List[str] = []
+        for value in values:
+            clean_value = str(value or "").strip()
+            if not clean_value:
+                raise ValueError("lineage evidence ids must not contain blanks")
+            if clean_value not in result:
+                result.append(clean_value)
+        return result
 
 
 class SavedResultDescriptor(BaseModel):
@@ -606,6 +638,7 @@ class WorkerOutcome(BaseModel):
                     "displayable": item.display_ref is not None,
                 }
                 for item in self.evidence
+                if not item.lineage_evidence_ids
             ],
         }
 
@@ -960,6 +993,19 @@ class UpstreamDecision(BaseModel):
 
     decision: UpstreamAction
     problem: str = ""
+    selected_evidence_ids: List[str]
+
+    @field_validator("selected_evidence_ids")
+    @classmethod
+    def _clean_selected_evidence_ids(cls, values: List[str]) -> List[str]:
+        result: List[str] = []
+        for value in values:
+            clean_value = str(value or "").strip()
+            if not clean_value:
+                raise ValueError("selected evidence ids must not contain blanks")
+            if clean_value not in result:
+                result.append(clean_value)
+        return result
 
     @field_validator("problem", mode="before")
     @classmethod
@@ -978,6 +1024,8 @@ class UpstreamDecision(BaseModel):
     def _reroute_requires_problem(self) -> "UpstreamDecision":
         if self.decision == "reroute" and not self.problem:
             raise ValueError("reroute decision requires a non-empty problem")
+        if self.decision == "reroute" and self.selected_evidence_ids:
+            raise ValueError("reroute decision cannot select evidence")
         if len(self.problem) > 2000:
             raise ValueError("upstream problem exceeds 2000 characters")
         return self

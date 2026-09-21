@@ -25,6 +25,10 @@ from agents.tools.saved_results import (
 
 def _tool_message(name, args, call_id):
     clean_args = dict(args)
+    auto_select_evidence = (
+        name == "submit_upstream_data_decision"
+        and "selected_evidence_ids" not in clean_args
+    )
     if name == "submit_worker_plan":
         raw_steps = clean_args.get("steps")
         if isinstance(raw_steps, list) and all(
@@ -51,12 +55,18 @@ def _tool_message(name, args, call_id):
             clean_args = {
                 "decision": "reroute",
                 "problem": clean_args.get("problem", ""),
+                "selected_evidence_ids": [],
             }
         else:
             name = "submit_upstream_answer"
             clean_args.pop("problem", None)
+    if name == "submit_upstream_data_decision":
+        clean_args.setdefault("selected_evidence_ids", [])
     return AIMessage(
         content="",
+        additional_kwargs={
+            "test_auto_select_evidence": auto_select_evidence,
+        },
         tool_calls=[
             {
                 "name": name,
@@ -132,6 +142,23 @@ class _BoundModel:
         response = self.parent.responses[self.tool_name].pop(0)
         if callable(response):
             return response(messages)
+        if (
+            self.tool_name == "submit_upstream_data_decision"
+            and response.additional_kwargs.get("test_auto_select_evidence")
+            and response.tool_calls[0]["args"].get("decision") == "pass"
+        ):
+            payload = json.loads(messages[-1].content)
+            response = _tool_message(
+                "submit_upstream_data_decision",
+                {
+                    "decision": "pass",
+                    "selected_evidence_ids": [
+                        item["evidence_id"]
+                        for item in payload.get("evidence", [])
+                    ],
+                },
+                response.tool_calls[0]["id"],
+            )
         return response
 
 
@@ -181,7 +208,14 @@ class _CoordinatorModel:
                     decisions.append(
                         _tool_message(
                             "submit_upstream_data_decision",
-                            {"decision": "pass"},
+                            {
+                                "decision": "pass",
+                                "selected_evidence_ids": list(
+                                    calls[0]
+                                    .get("args", {})
+                                    .get("used_evidence_ids", [])
+                                ),
+                            },
                             str(calls[0].get("id") or "upstream")
                             + "-decision",
                         )
@@ -1455,6 +1489,8 @@ def test_agentic_write_semantics_keeps_analysis_model_owned(
     assert set(decision_payload) == {
         "original_task",
         "evidence",
+        "evidence_budget",
+        "evidence_lineage",
         "execution_manifest",
     }
     assert "deterministic_write_semantics" not in decision_payload
@@ -2720,6 +2756,7 @@ def test_upstream_data_decision_is_separate_from_answer_payload():
         {
             "decision": "reroute",
             "problem": "Не получена вторая запрошенная метрика.",
+            "selected_evidence_ids": [],
         }
     )
 
@@ -3026,12 +3063,19 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     request_schema = _upstream_data_decision_tool_schema()["function"][
         "parameters"
     ]
-    assert request_schema["required"] == ["decision"]
+    assert request_schema["required"] == [
+        "decision",
+        "selected_evidence_ids",
+    ]
     assert request_schema["properties"]["decision"]["enum"] == [
         "pass",
         "reroute",
     ]
-    assert set(request_schema["properties"]) == {"decision", "problem"}
+    assert set(request_schema["properties"]) == {
+        "decision",
+        "problem",
+        "selected_evidence_ids",
+    }
     plan_schema = _plan_tool_schema()["function"]["parameters"]
     step_schema = plan_schema["properties"]["steps"]["items"]
     assert step_schema["required"] == ["id", "task", "depends_on"]
@@ -3055,7 +3099,10 @@ def test_upstream_native_tools_enforce_linear_payloads():
             tool_calls=[
                 {
                     "name": "submit_upstream_data_decision",
-                    "args": {"decision": "pass"},
+                    "args": {
+                        "decision": "pass",
+                        "selected_evidence_ids": [],
+                    },
                     "id": "decision-pass",
                     "type": "tool_call",
                 }
@@ -3073,6 +3120,7 @@ def test_upstream_native_tools_enforce_linear_payloads():
                     "args": {
                         "decision": "reroute",
                         "problem": "Не найден исходный путь.",
+                        "selected_evidence_ids": [],
                     },
                     "id": "decision-reroute",
                     "type": "tool_call",
@@ -3093,7 +3141,10 @@ def test_upstream_native_tools_enforce_linear_payloads():
                 tool_calls=[
                     {
                         "name": "submit_upstream_data_decision",
-                        "args": {"decision": "reroute"},
+                        "args": {
+                            "decision": "reroute",
+                            "selected_evidence_ids": [],
+                        },
                         "id": "request-without-problem",
                         "type": "tool_call",
                     }
@@ -3310,6 +3361,8 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     assert set(upstream) == {
         "original_task",
         "evidence",
+        "evidence_budget",
+        "evidence_lineage",
         "execution_manifest",
     }
     assert upstream["original_task"] == (
@@ -3318,18 +3371,22 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     assert upstream["evidence"] == [
         {
             "evidence_id": "evidence-first",
+            "producer_step_id": "step_1",
             "tool_name": "lookup",
             "args": {"query": "t_example"},
             "preview": '{"name":"t_example"}',
             "truncated": False,
+            "preview_truncated": False,
             "displayable": True,
         },
         {
             "evidence_id": "evidence-second",
+            "producer_step_id": "step_2",
             "tool_name": "inspect",
             "args": {"name": "t_example"},
             "preview": '{"name":"t_example","valid":true}',
             "truncated": False,
+            "preview_truncated": False,
             "displayable": True,
         },
     ]
@@ -3439,7 +3496,10 @@ def test_coordinator_passes_lazy_result_references_between_workers():
                     "submit_upstream_output",
                     {
                         "answer": "Проверка завершена.",
-                        "used_evidence_ids": [],
+                        "used_evidence_ids": [
+                            "evidence-first",
+                            "evidence-second",
+                        ],
                         "display_evidence_ids": [],
                     },
                     "upstream-1",
@@ -3514,7 +3574,12 @@ def test_upstream_receives_partial_worker_evidence():
     from agents.coordinator import coordinator_chat
 
     answer = "Не удалось подтвердить требуемый факт."
-    model = _CoordinatorModel(_responses(answer=answer))
+    model = _CoordinatorModel(
+        _responses(
+            answer=answer,
+            used_evidence_ids=("evidence-partial",),
+        )
+    )
     worker_result = _outcome(
         "Tool вернул данные не по той сущности; факт не подтверждён.",
         status="partial",
@@ -3545,15 +3610,19 @@ def test_upstream_receives_partial_worker_evidence():
     assert set(upstream) == {
         "original_task",
         "evidence",
+        "evidence_budget",
+        "evidence_lineage",
         "execution_manifest",
     }
     assert upstream["evidence"] == [
         {
             "evidence_id": "evidence-partial",
+            "producer_step_id": "step_1",
             "tool_name": "lookup",
             "args": {},
             "preview": '{"value":"partial"}',
             "truncated": False,
+            "preview_truncated": False,
             "displayable": True,
         }
     ]
@@ -3671,6 +3740,135 @@ def test_upstream_repairs_json_serialization_noise_with_model():
     ]
     assert len(upstream_calls) == 2
     assert "неизвестные evidence_id" in str(upstream_calls[1][-1].content)
+
+
+def test_upstream_repairs_unknown_selected_id_and_passes_only_subset():
+    from agents.coordinator import coordinator_chat
+
+    responses = _responses(answer="unused")
+    responses["submit_upstream_data_decision"] = [
+        _tool_message(
+            "submit_upstream_data_decision",
+            {
+                "decision": "pass",
+                "selected_evidence_ids": ["evidence-unknown"],
+            },
+            "decision-invalid",
+        ),
+        _tool_message(
+            "submit_upstream_data_decision",
+            {
+                "decision": "pass",
+                "selected_evidence_ids": ["evidence-second"],
+            },
+            "decision-repaired",
+        ),
+    ]
+    responses["submit_upstream_answer"] = [
+        _tool_message(
+            "submit_upstream_answer",
+            {
+                "answer": "Второй факт использован.",
+                "used_evidence_ids": ["evidence-second"],
+                "display_evidence_ids": [],
+            },
+            "answer-subset",
+        )
+    ]
+    model = _CoordinatorModel(responses)
+    worker_result = _outcome(
+        "Получены два факта.",
+        evidence=[
+            _artifact(None, "lookup", "first", evidence_id="evidence-first"),
+            _artifact(None, "lookup", "second", evidence_id="evidence-second"),
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.worker_chat", return_value=worker_result),
+    ):
+        result = coordinator_chat("Используй второй факт.")
+
+    assert result.answer == "Второй факт использован."
+    decision_calls = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_upstream_data_decision"
+    ]
+    assert len(decision_calls) == 2
+    assert "неизвестные evidence_id" in decision_calls[1][-1].content
+    answer_payload = _payload(model, "submit_upstream_answer")
+    assert [item["evidence_id"] for item in answer_payload["evidence"]] == [
+        "evidence-second"
+    ]
+
+
+def test_any_data_backed_answer_repairs_empty_used_evidence_ids():
+    from agents.coordinator import coordinator_chat
+
+    responses = _responses(answer="unused")
+    responses["submit_upstream_data_decision"] = [
+        _tool_message(
+            "submit_upstream_data_decision",
+            {
+                "decision": "pass",
+                "selected_evidence_ids": ["evidence-result"],
+            },
+            "decision-pass",
+        )
+    ]
+    responses["submit_upstream_answer"] = [
+        _tool_message(
+            "submit_upstream_answer",
+            {
+                "answer": "Факт получен.",
+                "used_evidence_ids": [],
+                "display_evidence_ids": [],
+            },
+            "answer-invalid",
+        ),
+        _tool_message(
+            "submit_upstream_answer",
+            {
+                "answer": "Факт получен.",
+                "used_evidence_ids": ["evidence-result"],
+                "display_evidence_ids": [],
+            },
+            "answer-repaired",
+        ),
+    ]
+    model = _CoordinatorModel(responses)
+    worker_result = _outcome(
+        "Факт получен.",
+        evidence=[
+            _artifact(
+                None,
+                "lookup",
+                '{"value":1}',
+                evidence_id="evidence-result",
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.worker_chat", return_value=worker_result),
+    ):
+        result = coordinator_chat("Получи факт.")
+
+    assert result.answer == "Факт получен."
+    answer_calls = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_upstream_answer"
+    ]
+    assert len(answer_calls) == 2
+    assert "Data-backed answer" in answer_calls[1][-1].content
 
 
 @pytest.mark.parametrize(
@@ -4384,6 +4582,8 @@ def test_upstream_restarts_cleanly_with_only_problem():
     assert set(final_upstream_payload) == {
         "original_task",
         "evidence",
+        "evidence_budget",
+        "evidence_lineage",
         "execution_manifest",
     }
     assert [

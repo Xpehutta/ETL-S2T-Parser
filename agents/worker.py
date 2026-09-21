@@ -150,6 +150,9 @@ def _store_evidence_items(
                         if item.result_ref in known_dataset_refs
                         else None
                     ),
+                    lineage_evidence_ids=list(
+                        item.lineage_evidence_ids
+                    ),
                 )
             )
     return artifacts
@@ -196,6 +199,9 @@ def _register_previous_results(
                 item.result_ref
                 if item.result_ref in known_dataset_refs
                 else None
+            ),
+            source_evidence_ids=(
+                [item.evidence_id] if item.evidence_id else []
             ),
         )
         for item in items
