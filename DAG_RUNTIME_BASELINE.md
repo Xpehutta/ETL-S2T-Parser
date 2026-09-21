@@ -29,7 +29,7 @@ tests/test_async_runtime.py
 ```text
 1228 passed, 80 skipped in 26.30s
 statement coverage: 88.74%
-branch coverage: 85.66%
+coverage.py combined line+branch: 85.66%
 ```
 
 Локальный untracked `tests/test_word9_small_model_benchmark.py` намеренно не
@@ -38,7 +38,7 @@ branch coverage: 85.66%
 
 ## Покрытие критических компонентов
 
-| Компонент | Statement | Branch |
+| Компонент | Statement | Combined line+branch |
 | --- | ---: | ---: |
 | `agents/coordinator.py` | 91.32% | 89.13% |
 | `agents/contracts.py` | 91.62% | 87.55% |

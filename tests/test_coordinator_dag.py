@@ -175,6 +175,16 @@ async def test_dag_executes_roots_concurrently_and_passes_only_dependencies(
     assert len(dag["workers"]) == 6
     assert all(item["status"] == "complete" for item in dag["workers"])
     assert all(item["ready_at_seconds"] is not None for item in dag["workers"])
+    workers_by_id = {item["step_id"]: item for item in dag["workers"]}
+    assert workers_by_id["a"]["input_result_ids"] == []
+    assert workers_by_id["a"]["output_result_ids"] == ["result_a"]
+    assert workers_by_id["d"]["input_result_ids"] == [
+        "result_a",
+        "result_b",
+        "result_c",
+    ]
+    assert workers_by_id["d"]["output_result_ids"] == ["result_d"]
+    assert workers_by_id["f"]["input_result_ids"] == ["result_d"]
 
 
 @pytest.mark.asyncio

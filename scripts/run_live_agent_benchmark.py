@@ -64,6 +64,15 @@ class ModeResult:
     tool_errors: int = 0
     reroutes: int = 0
     pipelines: dict[str, int] = field(default_factory=dict)
+    dag_cycles: int = 0
+    dag_depth: int = 0
+    dag_max_parallel_width: int = 0
+    dag_observed_concurrency: int = 0
+    dag_blocked: int = 0
+    dag_cancelled: int = 0
+    dag_statuses: dict[str, int] = field(default_factory=dict)
+    dag_input_result_ids: list[str] = field(default_factory=list)
+    dag_output_result_ids: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -285,6 +294,59 @@ def _parse_transcript(result: ModeResult) -> None:
         _metric_values(text, r"^tool_errors: (\d+)$")
     )
     result.reroutes = sum(_metric_values(text, r"^reroutes: (\d+)$"))
+    result.dag_cycles = sum(
+        _metric_values(text, r"^dag_cycles: (\d+)$")
+    )
+    result.dag_depth = max(
+        _metric_values(text, r"^dag_depth: (\d+)$") or [0]
+    )
+    result.dag_max_parallel_width = max(
+        _metric_values(text, r"^dag_max_parallel_width: (\d+)$") or [0]
+    )
+    result.dag_observed_concurrency = max(
+        _metric_values(text, r"^dag_observed_concurrency: (\d+)$") or [0]
+    )
+    result.dag_blocked = sum(
+        _metric_values(text, r"^dag_blocked: (\d+)$")
+    )
+    result.dag_cancelled = sum(
+        _metric_values(text, r"^dag_cancelled: (\d+)$")
+    )
+    for raw_statuses in re.findall(
+        r"^dag_statuses: (.+)$",
+        text,
+        re.MULTILINE,
+    ):
+        try:
+            statuses = json.loads(raw_statuses)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(statuses, dict):
+            continue
+        for status, count in statuses.items():
+            clean_status = str(status or "unknown").strip()
+            result.dag_statuses[clean_status] = (
+                result.dag_statuses.get(clean_status, 0) + int(count or 0)
+            )
+    for metric_name, destination in (
+        ("dag_input_result_ids", result.dag_input_result_ids),
+        ("dag_output_result_ids", result.dag_output_result_ids),
+    ):
+        for raw_ids in re.findall(
+            rf"^{metric_name}: (.+)$",
+            text,
+            re.MULTILINE,
+        ):
+            try:
+                values = json.loads(raw_ids)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                clean_value = str(value or "").strip()
+                if clean_value and clean_value not in destination:
+                    destination.append(clean_value)
     for pipelines_line in re.findall(r"^pipelines: (.+)$", text, re.MULTILINE):
         for pipeline in pipelines_line.split(","):
             clean_pipeline = pipeline.strip()
@@ -546,6 +608,37 @@ def _comparison_report(
                     f"{usage['cache_read_tokens']} | "
                     f"{usage['elapsed_seconds']:.3f} |"
                 )
+
+    if any(result.dag_cycles for result in results):
+        lines.extend(
+            [
+                "",
+                "## DAG execution",
+                "",
+                "| Режим | Cycles | Depth | Max width | Observed concurrency | "
+                "Blocked | Cancelled | Terminal statuses | Input result IDs | "
+                "Output result IDs |",
+                "|---|---:|---:|---:|---:|---:|---:|---|---|---|",
+            ]
+        )
+        for result in results:
+            statuses = ", ".join(
+                f"{status}×{count}"
+                for status, count in sorted(result.dag_statuses.items())
+            ) or "—"
+            input_ids = ", ".join(
+                f"`{value}`" for value in result.dag_input_result_ids
+            ) or "—"
+            output_ids = ", ".join(
+                f"`{value}`" for value in result.dag_output_result_ids
+            ) or "—"
+            lines.append(
+                f"| {result.mode} | {result.dag_cycles} | "
+                f"{result.dag_depth} | {result.dag_max_parallel_width} | "
+                f"{result.dag_observed_concurrency} | {result.dag_blocked} | "
+                f"{result.dag_cancelled} | {statuses} | {input_ids} | "
+                f"{output_ids} |"
+            )
 
     scenario_names = sorted(
         {

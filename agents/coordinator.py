@@ -511,6 +511,8 @@ async def _execute_worker_plan_dag(
             "dependency_wait_seconds": None,
             "semaphore_wait_seconds": None,
             "server_semaphore_wait_seconds": None,
+            "input_result_ids": [],
+            "output_result_ids": [],
             "status": None,
         }
         for step_id in step_numbers
@@ -566,6 +568,9 @@ async def _execute_worker_plan_dag(
             dependency_bundles=(bundles if step.depends_on else None),
         )
         timing = timings[step_id]
+        timing["input_result_ids"] = [
+            reference.result_id for reference in previous_results
+        ]
         queued_at = scheduler_started + float(
             timing["queued_at_seconds"] or 0.0
         )
@@ -608,6 +613,10 @@ async def _execute_worker_plan_dag(
                 )
                 outcome = await runner(request)
                 timing["status"] = outcome.status
+                timing["output_result_ids"] = [
+                    reference.result_id
+                    for reference in outcome.previous_results
+                ]
         except asyncio.CancelledError as exc:
             timing["status"] = (
                 "cancelled_running"

@@ -499,6 +499,47 @@ def _record_live_exchange(
             )
             for item in metrics.llm_stages
         )
+        dag_statuses: dict[str, int] = {}
+        dag_input_result_ids: list[str] = []
+        dag_output_result_ids: list[str] = []
+        for dag in metrics.coordinator_dag:
+            for worker in dag.get("workers") or []:
+                if not isinstance(worker, Mapping):
+                    continue
+                status = str(worker.get("status") or "unknown")
+                dag_statuses[status] = dag_statuses.get(status, 0) + 1
+                for field_name, destination in (
+                    ("input_result_ids", dag_input_result_ids),
+                    ("output_result_ids", dag_output_result_ids),
+                ):
+                    for value in worker.get(field_name) or []:
+                        clean_value = str(value or "").strip()
+                        if clean_value and clean_value not in destination:
+                            destination.append(clean_value)
+        dag_depth = max(
+            (int(item.get("dag_depth") or 0) for item in metrics.coordinator_dag),
+            default=0,
+        )
+        dag_max_parallel_width = max(
+            (
+                int(item.get("max_parallel_width") or 0)
+                for item in metrics.coordinator_dag
+            ),
+            default=0,
+        )
+        dag_observed_concurrency = max(
+            (
+                int(item.get("max_observed_concurrency") or 0)
+                for item in metrics.coordinator_dag
+            ),
+            default=0,
+        )
+        dag_blocked = dag_statuses.get("blocked_by_dependency", 0)
+        dag_cancelled = sum(
+            count
+            for status, count in dag_statuses.items()
+            if status.startswith("cancelled_")
+        )
         metrics_block = (
             f"agent_seconds: {metrics.elapsed_seconds:.3f}\n"
             f"http_seconds: {http_elapsed_seconds:.3f}\n"
@@ -507,6 +548,26 @@ def _record_live_exchange(
             f"tool_errors: {tool_errors}\n"
             f"reroutes: {reroutes}\n"
             f"pipelines: {', '.join(pipelines) or 'Нет'}\n"
+            f"dag_cycles: {len(metrics.coordinator_dag)}\n"
+            f"dag_depth: {dag_depth}\n"
+            f"dag_max_parallel_width: {dag_max_parallel_width}\n"
+            f"dag_observed_concurrency: {dag_observed_concurrency}\n"
+            f"dag_blocked: {dag_blocked}\n"
+            f"dag_cancelled: {dag_cancelled}\n"
+            "dag_statuses: "
+            + json.dumps(
+                dag_statuses,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            "dag_input_result_ids: "
+            + json.dumps(dag_input_result_ids, ensure_ascii=False)
+            + "\n"
+            "dag_output_result_ids: "
+            + json.dumps(dag_output_result_ids, ensure_ascii=False)
+            + "\n"
             f"tokens: input={metrics.input_tokens}, "
             f"output={metrics.output_tokens}, total={metrics.total_tokens}, "
             f"cache_read={metrics.cache_read_tokens}\n"
@@ -542,6 +603,7 @@ def _record_live_exchange(
                     else None
                 ),
                 "coordinator_plan": metrics.coordinator_plan,
+                "coordinator_dag": metrics.coordinator_dag,
                 "worker_tasks": metrics.worker_tasks,
                 "worker_routes": [
                     item.model_dump(mode="json")
@@ -2964,7 +3026,10 @@ def test_live_agent_runs_dependent_workers_sequentially(
         if str(step.get("pipeline") or "") == "agentic"
     ]
     assert len(recorded_plan) == 2, recorded_plan
-    assert all("dependencies" not in step for step in recorded_plan), recorded_plan
+    assert recorded_plan[0]["depends_on"] == [], recorded_plan
+    assert recorded_plan[1]["depends_on"] == [
+        recorded_plan[0]["id"]
+    ], recorded_plan
     assert len(exchange.metrics.worker_tasks) == 2, exchange.metrics.worker_tasks
     assert all(
         str(outcome.get("status") or "") == "complete"

@@ -31,6 +31,15 @@ reader_calls: 1
 tool_errors: 0
 reroutes: 0
 pipelines: agentic
+dag_cycles: 1
+dag_depth: 3
+dag_max_parallel_width: 4
+dag_observed_concurrency: 3
+dag_blocked: 0
+dag_cancelled: 0
+dag_statuses: {"complete":4}
+dag_input_result_ids: ["result_a"]
+dag_output_result_ids: ["result_b"]
 tools: run_sql
 judge_model: GigaChat-2-Max
 judge_calls: attempts=3, completed=2, errors=1
@@ -46,6 +55,15 @@ reader_calls: 2
 tool_errors: 1
 reroutes: 2
 pipelines: validation_protocol, agentic
+dag_cycles: 2
+dag_depth: 2
+dag_max_parallel_width: 2
+dag_observed_concurrency: 2
+dag_blocked: 1
+dag_cancelled: 1
+dag_statuses: {"complete":2,"blocked_by_dependency":1,"cancelled_running":1}
+dag_input_result_ids: ["result_b","result_c"]
+dag_output_result_ids: ["result_d"]
 tools: run_sql, run_cypher
 judge_model: GigaChat-2-Max
 judge_calls: attempts=1, completed=1, errors=0
@@ -73,6 +91,23 @@ judge_tokens: input=150, output=15, total=165, cache_read=5
     assert result.tool_errors == 1
     assert result.reroutes == 2
     assert result.pipelines == {"agentic": 2, "validation_protocol": 1}
+    assert result.dag_cycles == 3
+    assert result.dag_depth == 3
+    assert result.dag_max_parallel_width == 4
+    assert result.dag_observed_concurrency == 3
+    assert result.dag_blocked == 1
+    assert result.dag_cancelled == 1
+    assert result.dag_statuses == {
+        "complete": 6,
+        "blocked_by_dependency": 1,
+        "cancelled_running": 1,
+    }
+    assert result.dag_input_result_ids == [
+        "result_a",
+        "result_b",
+        "result_c",
+    ]
+    assert result.dag_output_result_ids == ["result_b", "result_d"]
     assert result.input_tokens == 300
     assert result.output_tokens == 50
     assert result.total_tokens == 350
@@ -187,6 +222,15 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
         judge_output_tokens=30,
         judge_total_tokens=230,
         judge_cache_read_tokens=5,
+        dag_cycles=2,
+        dag_depth=3,
+        dag_max_parallel_width=4,
+        dag_observed_concurrency=3,
+        dag_blocked=1,
+        dag_cancelled=1,
+        dag_statuses={"complete": 5, "blocked_by_dependency": 1},
+        dag_input_result_ids=["result_a"],
+        dag_output_result_ids=["result_b"],
     )
 
     _comparison_report(
@@ -219,6 +263,11 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
     assert "agentic×1" in text
     assert "100.0%" in text
     assert "| multiagent | upstream | 2 | 0 | 100 | 20 | 120 | 10 | 1.250 |" in text
+    assert "## DAG execution" in text
+    assert "| multiagent | 2 | 3 | 4 | 3 | 1 | 1 |" in text
+    assert "blocked_by_dependency×1" in text
+    assert "`result_a`" in text
+    assert "`result_b`" in text
 
 
 def test_benchmark_mark_uses_llm_judge_verdict():

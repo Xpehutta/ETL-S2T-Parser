@@ -33,14 +33,13 @@ jobs:
           --cov=.
           --cov-config=.coveragerc
           --cov-report=term-missing
+          --cov-report=json:coverage.json
           --cov-report=xml:coverage.xml
           --cov-report=html:htmlcov
-      - name: Publish coverage summary
-        if: ${{ always() && hashFiles('.coverage') != '' }}
-        run: |
-          echo "## Test coverage" >> "$GITHUB_STEP_SUMMARY"
-          echo >> "$GITHUB_STEP_SUMMARY"
-          uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      - name: Enforce and publish coverage gates
+        run: >-
+          uv run python scripts/check_coverage.py coverage.json
+          --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -48,6 +47,7 @@ jobs:
           name: coverage-report
           path: |
             coverage.xml
+            coverage.json
             htmlcov/
           if-no-files-found: warn
           retention-days: 14
