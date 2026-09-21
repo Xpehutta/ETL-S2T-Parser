@@ -44,6 +44,37 @@ def _available_fallback_tool_names():
     ]
 
 
+def test_langfuse_callbacks_are_empty_when_integration_is_unavailable(monkeypatch):
+    from agents import agent
+
+    monkeypatch.setattr(agent, "LANGFUSE_AVAILABLE", False)
+
+    assert agent._get_langfuse_callbacks() == []
+
+
+def test_langfuse_callback_creation_failure_is_non_fatal(monkeypatch):
+    from agents import agent
+
+    monkeypatch.setattr(agent, "LANGFUSE_AVAILABLE", True)
+    monkeypatch.setattr(
+        agent,
+        "get_callback_handler",
+        MagicMock(side_effect=RuntimeError("langfuse unavailable")),
+    )
+
+    assert agent._get_langfuse_callbacks() == []
+
+
+def test_single_agent_sync_api_rejects_empty_query(monkeypatch):
+    from agents import agent
+
+    implementation = MagicMock()
+    monkeypatch.setattr(agent, "_agent_chat_impl", implementation)
+
+    assert agent.agent_chat("   ") == "Запрос не должен быть пустым."
+    implementation.assert_not_called()
+
+
 @pytest.fixture
 def mock_llm_success():
     with (

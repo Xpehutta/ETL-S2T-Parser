@@ -1,10 +1,12 @@
 import json
 
-from langchain_core.messages import AIMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel
 
+import agents.native_call_adapter as adapter
 from agents.native_call_adapter import (
     CompatibleChatOllama,
     json_mapping_from_message,
@@ -273,3 +275,226 @@ def test_text_mode_coerces_explicit_unknown_name_to_only_bound_tool(
     ).invoke("test")
 
     assert parsed == Delegate()
+
+
+def test_message_text_handles_multiblock_and_non_message_content():
+    message = AIMessage(
+        content=[
+            "prefix",
+            {"type": "text", "text": "middle"},
+            {"content": "suffix"},
+            {"value": 7},
+        ]
+    )
+
+    assert adapter._message_text(object()) == ""
+    assert adapter._message_text(message) == (
+        'prefix\nmiddle\nsuffix\n{"value": 7}'
+    )
+
+    object.__setattr__(message, "content", 17)
+    assert adapter._message_text(message) == "17"
+
+
+def test_json_helpers_handle_empty_invalid_and_array_payloads():
+    assert adapter._json_value({"ready": True}) == {"ready": True}
+    assert adapter._json_value("   ") == "   "
+    assert adapter._json_value("not-json") == "not-json"
+    assert adapter._first_json_value("{broken} then [1, 2]") == [1, 2]
+    assert json_mapping_from_message(AIMessage(content="[1, 2]")) is None
+    assert json_mapping_from_message(object()) is None
+
+
+def test_tool_metadata_falls_back_when_conversion_fails(monkeypatch):
+    class NamedTool:
+        name = "fallback_tool"
+
+    monkeypatch.setattr(
+        adapter,
+        "convert_to_openai_tool",
+        lambda _tool: (_ for _ in ()).throw(ValueError("invalid schema")),
+    )
+
+    assert adapter._tool_name(NamedTool()) == "fallback_tool"
+    assert adapter._positional_spec(NamedTool()) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("formatted", "expected"),
+    [
+        ({}, ("", "")),
+        ({"function": {}}, ("", "")),
+        (
+            {
+                "function": {
+                    "parameters": {
+                        "properties": {"value": {"type": "string"}}
+                    }
+                }
+            },
+            ("value", ""),
+        ),
+    ],
+)
+def test_positional_spec_handles_incomplete_schemas(monkeypatch, formatted, expected):
+    monkeypatch.setattr(adapter, "convert_to_openai_tool", lambda _tool: formatted)
+
+    assert adapter._positional_spec(object()) == expected
+
+
+@pytest.mark.parametrize(
+    ("choice", "allowed", "expected"),
+    [
+        ("auto", ["one", "two"], ""),
+        ("one", ["one", "two"], "one"),
+        ({"function": {"name": "two"}}, ["one", "two"], "two"),
+        ({"name": "one"}, ["one", "two"], "one"),
+        ("unknown", ["only"], "only"),
+    ],
+)
+def test_choice_name_normalizes_supported_tool_choice(choice, allowed, expected):
+    assert adapter._choice_name(choice, allowed) == expected
+
+
+def test_payload_helpers_cover_nested_and_rejected_shapes():
+    assert adapter._explicit_call("not-a-mapping") is None
+    assert adapter._payload_calls(7) == []
+    assert adapter._payload_calls(
+        {"function_call": {"name": "run", "args": {"x": 1}}}
+    ) == [("run", {"x": 1})]
+    assert adapter._required_args(
+        {"run": {"arguments": '{"x": 2}'}},
+        "run",
+    ) == {"x": 2}
+    assert adapter._required_args(
+        {"tool_calls": [{"name": "other", "args": {}}]},
+        "run",
+    ) is None
+    assert adapter._required_args(
+        {"function": {"name": "other"}, "x": 3},
+        "run",
+    ) is None
+    assert adapter._required_args(
+        {"name": "run", "args": '{"x": 4}'},
+        "run",
+    ) == {"x": 4}
+    assert adapter._required_args({"args": {"x": 4}}, "run") == {"x": 4}
+    assert adapter._required_args(
+        {"run": True, "name": "run", "x": 5},
+        "run",
+    ) == {"x": 5}
+
+
+def test_normalizer_preserves_non_ai_and_rejects_unknown_native_calls():
+    human = HumanMessage(content="hello")
+    assert normalize_tool_call_message(human, ["run"]) is human
+
+    native_unknown = AIMessage(
+        content="",
+        tool_calls=[{"name": "other", "args": {}, "id": "call-1"}],
+    )
+    assert normalize_tool_call_message(native_unknown, ["run"]) is native_unknown
+
+    envelope_unknown = AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [{"name": "other", "args": {}}],
+        },
+    )
+    assert normalize_tool_call_message(envelope_unknown, ["run"]) is envelope_unknown
+
+
+def test_text_parser_merges_nested_positional_lists_and_skips_invalid_call():
+    calls = adapter._calls_from_text(
+        'Plan(not-json) Plan({"steps":[{"task":"one"}]}) '
+        'Plan({"task":"two"}) Plan(3)',
+        ["Plan"],
+        "",
+        {"Plan": ("steps", "task")},
+        False,
+    )
+
+    assert calls == [
+        (
+            "Plan",
+            {
+                "steps": [
+                    {"task": "one"},
+                    {"task": "two"},
+                    {"task": 3},
+                ]
+            },
+        )
+    ]
+
+    assert adapter._calls_from_text(
+        "Values(3)",
+        ["Values"],
+        "",
+        {"Values": ("values", "")},
+        False,
+    ) == [("Values", {"values": [3]})]
+
+
+def test_text_parser_rejects_ambiguous_or_unknown_calls():
+    assert adapter._calls_from_text(
+        '{"name":"unknown","arguments":{}}',
+        ["run", "finish"],
+        "",
+        {},
+        False,
+    ) == []
+    assert adapter._calls_from_text(
+        "run and finish",
+        ["run", "finish"],
+        "",
+        {},
+        False,
+    ) == []
+
+
+def test_ollama_wrapper_rejects_invalid_tool_call_mode(monkeypatch):
+    monkeypatch.setenv("OLLAMA_TOOL_CALL_MODE", "broken")
+    model = CompatibleChatOllama(model="test")
+
+    with pytest.raises(ValueError, match="must be auto, native, or text"):
+        model.bind_tools([])
+
+
+@pytest.mark.parametrize("input_kind", ["messages", "prompt", "other"])
+def test_text_mode_accepts_supported_prompt_input_shapes(monkeypatch, input_kind):
+    seen = {}
+    raw = AIMessage(content='{"name":"finish","arguments":{}}')
+
+    def fake_bind(self, **kwargs):
+        def invoke(value):
+            seen["value"] = value
+            return raw
+
+        return RunnableLambda(invoke)
+
+    class PromptValue:
+        def to_messages(self):
+            return [HumanMessage(content="from prompt")]
+
+    monkeypatch.setattr(ChatOllama, "bind", fake_bind, raising=False)
+    monkeypatch.setenv("OLLAMA_TOOL_CALL_MODE", "text")
+    model = CompatibleChatOllama(model="llama3.1:8b")
+    bound = model.bind_tools(
+        [{"name": "finish", "description": "done", "parameters": {}}]
+    )
+    value = {
+        "messages": [HumanMessage(content="from list")],
+        "prompt": PromptValue(),
+        "other": 7,
+    }[input_kind]
+
+    result = bound.invoke(value)
+
+    assert result.tool_calls[0]["name"] == "finish"
+    if input_kind == "messages":
+        assert seen["value"][1].content == "from list"
+    elif input_kind == "prompt":
+        assert seen["value"][1].content == "from prompt"
+    else:
+        assert seen["value"] == 7

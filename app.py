@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -111,7 +112,7 @@ def _chat_request_timeout() -> float:
         value = float(raw)
     except ValueError as exc:
         raise ValueError("CHAT_REQUEST_TIMEOUT must be a positive number") from exc
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError("CHAT_REQUEST_TIMEOUT must be a positive number")
     return value
 

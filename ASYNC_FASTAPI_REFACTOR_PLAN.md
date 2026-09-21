@@ -178,10 +178,12 @@ Baseline реализован 2026-09-21:
   coverage.
 
 Финальный контрольный прогон чистого опубликованного состава после DAG-этапа:
-`1143 passed, 80 skipped`; суммарное покрытие всего репозитория — `87.59%`
-(`12 729 / 14 533`
-statements). Для основного async/DAG-контура (`app`, supervisor/coordinator/
-worker, graph/router/runtime) — `86.22%` (`2 446 / 2 837`).
+`1228 passed, 80 skipped`; суммарное покрытие всего репозитория — `88.74%`
+(`12 898 / 14 535` statements). Для основного async/DAG-контура (`app`,
+single-agent, supervisor/coordinator/worker, graph/router/runtime) — `90.10%`
+(`2 558 / 2 839`). Критические границы FastAPI и совместимости вызовов имеют
+отдельные регрессионные проверки: `app.py` — `99.73%`, `async_runtime.py` и
+`native_call_adapter.py` — `100%`.
 DAG реализован в той же ветке `refactor/async-dag-runtime`: `PlanStep` содержит
 `id`/`depends_on`, контракт отклоняет duplicate/missing/self/cyclic зависимости,
 а coordinator исполняет ready groups через fail-fast `asyncio.TaskGroup` с

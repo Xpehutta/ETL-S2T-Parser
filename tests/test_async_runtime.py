@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
-from agents.async_runtime import ainvoke_compat, worker_max_concurrency
+from agents.async_runtime import (
+    DEFAULT_WORKER_MAX_CONCURRENCY,
+    ainvoke_compat,
+    ainvoke_graph_compat,
+    concurrency_slot,
+    run_coroutine_sync,
+    worker_max_concurrency,
+)
 
 
 class _NativeAsyncRunnable:
@@ -101,3 +109,211 @@ def test_worker_max_concurrency_is_strictly_positive(monkeypatch):
     monkeypatch.setenv("WORKER_MAX_CONCURRENCY", "0")
     with pytest.raises(ValueError, match="positive integer"):
         worker_max_concurrency()
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_compat_passes_config_and_kwargs_to_native_async():
+    seen = {}
+
+    class Runnable:
+        async def ainvoke(self, value, **kwargs):
+            seen.update(value=value, kwargs=kwargs)
+            return "done"
+
+    result = await ainvoke_compat(
+        Runnable(),
+        "value",
+        config={"tags": ["async"]},
+        marker=7,
+    )
+
+    assert result == "done"
+    assert seen == {
+        "value": "value",
+        "kwargs": {"config": {"tags": ["async"]}, "marker": 7},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_config", [False, True])
+async def test_ainvoke_compat_offloads_sync_only_runnable(with_config):
+    event_loop_thread = threading.get_ident()
+    seen = {}
+
+    class SyncRunnable:
+        def invoke(self, value, **kwargs):
+            seen.update(value=value, kwargs=kwargs, thread=threading.get_ident())
+            return "sync-result"
+
+    config = {"run_name": "compat"} if with_config else None
+    result = await ainvoke_compat(
+        SyncRunnable(),
+        "value",
+        config=config,
+        marker=3,
+    )
+
+    assert result == "sync-result"
+    assert seen["value"] == "value"
+    assert seen["kwargs"] == (
+        {"config": config, "marker": 3} if with_config else {"marker": 3}
+    )
+    assert seen["thread"] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_compat_rejects_object_without_invoke_methods():
+    with pytest.raises(TypeError, match="neither ainvoke nor invoke"):
+        await ainvoke_compat(object(), "value")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["invalid", "0", "-1", "nan", "inf"])
+async def test_ainvoke_compat_rejects_invalid_timeout_env(monkeypatch, value):
+    monkeypatch.setenv("TOOL_TIMEOUT", value)
+
+    with pytest.raises(ValueError, match="positive number"):
+        await ainvoke_compat(_NativeAsyncRunnable(), "value", category="tool")
+
+
+@pytest.mark.asyncio
+async def test_tool_concurrency_slot_uses_tool_limit(monkeypatch):
+    monkeypatch.setenv("TOOL_MAX_CONCURRENCY", "1")
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def occupy_slot():
+        async with concurrency_slot("tool"):
+            first_entered.set()
+            await release_first.wait()
+
+    first = asyncio.create_task(occupy_slot())
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    second = asyncio.create_task(
+        ainvoke_compat(
+            _NativeAsyncRunnable(),
+            "second",
+            category="tool",
+        )
+    )
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    release_first.set()
+    await first
+    assert await second == "async:second"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_slot_rejects_unknown_category():
+    with pytest.raises(ValueError, match="Unknown async concurrency category"):
+        async with concurrency_slot("database"):
+            pass
+
+
+@pytest.mark.parametrize("value", ["invalid", "1.5"])
+def test_worker_max_concurrency_rejects_non_integer(monkeypatch, value):
+    monkeypatch.setenv("WORKER_MAX_CONCURRENCY", value)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        worker_max_concurrency()
+
+
+def test_worker_max_concurrency_uses_default_for_missing_or_blank(monkeypatch):
+    monkeypatch.delenv("WORKER_MAX_CONCURRENCY", raising=False)
+    assert worker_max_concurrency() == DEFAULT_WORKER_MAX_CONCURRENCY
+
+    monkeypatch.setenv("WORKER_MAX_CONCURRENCY", "   ")
+    assert worker_max_concurrency() == DEFAULT_WORKER_MAX_CONCURRENCY
+
+
+class _NativeGraph:
+    def __init__(self):
+        self.seen = None
+
+    async def ainvoke(self, value, **kwargs):
+        self.seen = (value, kwargs)
+        return "native-graph"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_config", [False, True])
+async def test_ainvoke_graph_compat_uses_native_async(with_config):
+    graph = _NativeGraph()
+    config = {"thread_id": "test"} if with_config else None
+
+    result = await ainvoke_graph_compat(graph, "state", config=config)
+
+    assert result == "native-graph"
+    assert graph.seen == (
+        "state",
+        {"config": config} if with_config else {},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_config", [False, True])
+async def test_ainvoke_graph_compat_offloads_sync_graph(with_config):
+    event_loop_thread = threading.get_ident()
+    seen = {}
+
+    class SyncGraph:
+        def invoke(self, value, **kwargs):
+            seen.update(value=value, kwargs=kwargs, thread=threading.get_ident())
+            return "sync-graph"
+
+    config = {"thread_id": "test"} if with_config else None
+    result = await ainvoke_graph_compat(SyncGraph(), "state", config=config)
+
+    assert result == "sync-graph"
+    assert seen["kwargs"] == ({"config": config} if with_config else {})
+    assert seen["thread"] != event_loop_thread
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returns_awaitable", [False, True])
+async def test_ainvoke_graph_compat_supports_wrapped_async_method(
+    returns_awaitable,
+):
+    class WrappedGraph:
+        def ainvoke(self, value, **kwargs):
+            result = f"wrapped:{value}:{kwargs.get('config', 'none')}"
+
+            async def deferred():
+                return result
+
+            return deferred() if returns_awaitable else result
+
+    result = await ainvoke_graph_compat(
+        WrappedGraph(),
+        "state",
+        config="config",
+    )
+
+    assert result == "wrapped:state:config"
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_graph_compat_rejects_unknown_graph():
+    with pytest.raises(TypeError, match="neither ainvoke nor invoke"):
+        await ainvoke_graph_compat(object(), {})
+
+
+def test_run_coroutine_sync_returns_result_without_running_loop():
+    async def operation():
+        return "done"
+
+    assert run_coroutine_sync(operation()) == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_coroutine_sync_rejects_active_event_loop_and_closes_coroutine():
+    async def operation():
+        return "never"
+
+    awaitable = operation()
+
+    with pytest.raises(RuntimeError, match="use the corresponding .*_async"):
+        run_coroutine_sync(awaitable)
+
+    assert awaitable.cr_frame is None

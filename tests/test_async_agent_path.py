@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -196,3 +198,74 @@ async def test_async_router_rejects_invalid_ingress(query, tools, stage, message
             available_tools=tools,
             catalog_stage=stage,
         )
+
+
+@pytest.mark.asyncio
+async def test_single_agent_chat_uses_complete_native_async_pipeline(monkeypatch):
+    from agents import agent
+    from agents.tools.routing import ToolRoute
+
+    callback = object()
+    metrics_callback = object()
+    available_tool = SimpleNamespace(name="available")
+    selected_tool = SimpleNamespace(name="selected")
+    router = AsyncMock(
+        return_value=ToolRoute(
+            tools=["selected"],
+            skills=["S2T-строки"],
+            schemas=["s2t_transformations"],
+        )
+    )
+    graph = AsyncMock(return_value="async answer")
+    monkeypatch.setattr(agent, "capture_agent_run", lambda _session_id: nullcontext())
+    monkeypatch.setattr(agent, "_get_langfuse_callbacks", lambda: [callback])
+    monkeypatch.setattr(agent, "get_run_metrics_callback", lambda: metrics_callback)
+    monkeypatch.setattr(agent, "get_tools", lambda: [available_tool])
+    monkeypatch.setattr(agent, "_select_chat_route_async", router)
+    monkeypatch.setattr(agent, "get_tools_for_names", lambda _names: [selected_tool])
+    monkeypatch.setattr(agent, "load_skills", lambda names: {"skills": names})
+    monkeypatch.setattr(agent, "load_schemas", lambda names: {"schemas": names})
+    monkeypatch.setattr(agent, "build_chat_system_prompt", lambda *_args: "prompt")
+    monkeypatch.setattr(agent, "run_agent_graph_async", graph)
+    history = [{"role": "user", "content": "context"}]
+
+    result = await agent.agent_chat_async(
+        "  inspect mappings  ",
+        max_steps=7,
+        history=history,
+        session_id="session-1",
+        user_id="user-1",
+    )
+
+    assert result == "async answer"
+    router.assert_awaited_once_with(
+        "inspect mappings",
+        history,
+        model=agent.chat_model,
+        available_tools=[available_tool],
+        callbacks=[callback, metrics_callback],
+    )
+    graph.assert_awaited_once_with(
+        user_query="inspect mappings",
+        system_prompt="prompt",
+        model=agent.chat_model,
+        tools=[selected_tool],
+        max_steps=7,
+        history=history,
+        session_id="session-1",
+        user_id="user-1",
+        callbacks=[callback, metrics_callback],
+        trace_tags=["chat"],
+        trace_metadata={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_agent_chat_rejects_empty_query_without_graph_call(monkeypatch):
+    from agents import agent
+
+    graph = AsyncMock()
+    monkeypatch.setattr(agent, "run_agent_graph_async", graph)
+
+    assert await agent.agent_chat_async("   ") == "Запрос не должен быть пустым."
+    graph.assert_not_awaited()

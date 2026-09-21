@@ -420,7 +420,7 @@ pytest tests/ -q
 pytest tests/ --cov=. --cov-config=.coveragerc
 ```
 
-CI требует не менее 85% statement coverage. Таблица покрытия публикуется в
+CI требует не менее 88% statement coverage. Таблица покрытия публикуется в
 GitHub Job Summary, а `coverage.xml` и интерактивный HTML-отчёт сохраняются в
 artifact `coverage-report` на 14 дней.
 
