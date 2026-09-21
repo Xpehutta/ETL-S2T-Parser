@@ -7,4 +7,6 @@ omit =
     conftest.py
 
 [report]
-fail_under = 0
+fail_under = 85
+precision = 2
+show_missing = True

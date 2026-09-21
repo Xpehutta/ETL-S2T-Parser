@@ -177,8 +177,9 @@ Baseline реализован 2026-09-21:
 - добавлен GitHub Actions pipeline с locked install, compile check, tests и
   coverage.
 
-Финальный контрольный прогон после DAG-этапа: `1146 passed, 80 skipped`;
-суммарное покрытие всего репозитория — `86.20%` (`12 865 / 14 925`
+Финальный контрольный прогон чистого опубликованного состава после DAG-этапа:
+`1143 passed, 80 skipped`; суммарное покрытие всего репозитория — `87.59%`
+(`12 729 / 14 533`
 statements). Для основного async/DAG-контура (`app`, supervisor/coordinator/
 worker, graph/router/runtime) — `86.22%` (`2 446 / 2 837`).
 DAG реализован в той же ветке `refactor/async-dag-runtime`: `PlanStep` содержит

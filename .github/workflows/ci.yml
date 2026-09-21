@@ -28,4 +28,26 @@ jobs:
       - name: Verify ASGI application import
         run: uv run python -c "from app import app; assert app.title == 'ETL S2T Agent'"
       - name: Run tests with coverage
-        run: uv run pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term --cov-report=xml
+        run: >-
+          uv run pytest tests/ -q
+          --cov=.
+          --cov-config=.coveragerc
+          --cov-report=term-missing
+          --cov-report=xml:coverage.xml
+          --cov-report=html:htmlcov
+      - name: Publish coverage summary
+        if: ${{ always() && hashFiles('.coverage') != '' }}
+        run: |
+          echo "## Test coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: warn
+          retention-days: 14
