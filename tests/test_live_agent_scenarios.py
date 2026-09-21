@@ -5815,12 +5815,13 @@ def test_live_dag_ab_fan_out(live_chat_client):
 def test_live_dag_ab_failed_parent(live_chat_client):
     exchange = _chat(
         live_chat_client,
-        "Проверь отказоустойчивый DAG. Root A пытается точным catalog-reader "
-        "прочитать заведомо отсутствующую target_table "
-        "__dag_ab_missing_target_7f31__. C зависит от A и не должен запускаться, "
-        "если A завершился failed без usable result. Независимый root B считает "
-        "COUNT(*) таблицы files и должен завершиться. Честно сообщи отсутствие "
-        "A/C и верни files=<число>.",
+        "Проверь отказоустойчивый DAG. Root A обязан вызвать run_sql ровно с "
+        "SELECT COUNT(*) FROM \"__dag_ab_missing_target_7f31__\"; SQLite обязан "
+        "вернуть tool error, поэтому A должен завершиться failed без usable "
+        "result. C зависит от A и не должен запускаться. Независимый root B "
+        "считает COUNT(*) таблицы files и должен завершиться. Не заменяй ошибочный "
+        "SQL catalog-reader или поиском. Честно сообщи отсутствие A/C и верни "
+        "files=<число>.",
     )
     _assert_public_answer(exchange.result.answer)
     assert exchange.metrics.coordinator_dag, exchange.metrics

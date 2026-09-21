@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 from dataclasses import replace
@@ -17,6 +18,7 @@ from scripts.run_dag_concurrency_ab import (
     permanent_external_failure,
     read_trace,
     record_failures,
+    resume_configuration_errors,
     topology_errors,
     validate_journal_prefix,
     validate_spec,
@@ -159,6 +161,27 @@ def test_preregistered_spec_is_complete():
     assert dag_ab.COMMON_ENVIRONMENT["EMBEDDING_PROFILE"] == (
         "plain-normalized-v1"
     )
+    assert dag_ab.COMMON_ENVIRONMENT["LLM_MAX_CONCURRENCY"] == "1"
+    assert dag_ab.COMMON_ENVIRONMENT["GIGACHAT_MAX_RETRIES"] == "3"
+    assert dag_ab.COMMON_ENVIRONMENT["GIGACHAT_RETRY_BACKOFF_FACTOR"] == "1"
+
+
+def test_failed_parent_live_case_forces_a_structured_worker_failure():
+    tree = ast.parse(dag_ab.SCENARIO_FILE.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_live_dag_ab_failed_parent"
+    )
+    scenario = " ".join(
+        str(node.value)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+    assert "run_sql" in scenario
+    assert 'SELECT COUNT(*) FROM "__dag_ab_missing_target_7f31__"' in scenario
 
 
 def test_fixture_preflight_requires_public_tables(tmp_path):
@@ -516,6 +539,16 @@ def test_journal_round_trip_and_prefix_validation(tmp_path):
         raise AssertionError("invalid journal prefix was accepted")
 
 
+def test_resume_rejects_changed_preregistered_transport_settings():
+    config = dag_ab._json_value(dag_ab.frozen_experiment_config())
+    assert resume_configuration_errors(config) == []
+
+    config["common_environment"]["LLM_MAX_CONCURRENCY"] = "2"
+    assert resume_configuration_errors(config) == [
+        "preregistered field changed: common_environment"
+    ]
+
+
 def test_permanent_external_failure_detects_payment_required(tmp_path):
     result = _result(
         tmp_path,
@@ -607,3 +640,35 @@ def test_main_finalizes_existing_partial_journal_without_live_calls(
         "run finalized incomplete after an external service failure",
         "completed 1/48 runs",
     ]
+
+
+def test_main_refuses_to_resume_a_changed_preregistration(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    db_path = tmp_path / "fixture.db"
+    _fixture_db(db_path)
+    run_dir = tmp_path / "20260921_000001"
+    run_dir.mkdir()
+    timestamp = run_dir.name
+    config = dag_ab._json_value(dag_ab.frozen_experiment_config())
+    config["common_environment"]["LLM_MAX_CONCURRENCY"] = "2"
+    config["initial_db_sha256"] = dag_ab.sqlite_sha256(db_path)
+    dag_ab._write_json(run_dir / f"{timestamp}_config.json", config)
+    dag_ab._write_json(run_dir / f"{timestamp}_journal.json", [])
+    monkeypatch.setattr(dag_ab, "validate_spec", lambda: None)
+    monkeypatch.setattr(
+        dag_ab,
+        "_run_mode",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("changed experiment must not resume")
+        ),
+    )
+
+    assert dag_ab.main(
+        ["--db-path", str(db_path), "--resume-dir", str(run_dir)]
+    ) == 2
+    assert "preregistered field changed: common_environment" in (
+        capsys.readouterr().out
+    )

@@ -19,10 +19,10 @@ gate-скрипту. Порог statement не снижен. Branch gate заф�
 ## Итоговый non-live прогон
 
 ```text
-1277 passed, 88 skipped in 26.87s
-statement coverage: 88.93%
-branch coverage: 76.81%
-coverage.py combined line+branch: 85.90%
+1285 passed, 88 skipped in 22.65s
+statement coverage: 88.94%
+branch coverage: 76.83%
+coverage.py combined line+branch: 85.91%
 ```
 
 ## Критические компоненты
@@ -33,7 +33,7 @@ coverage.py combined line+branch: 85.90%
 | `agents/contracts.py` | 90.67% | 71.84% |
 | `agents/worker.py` | 90.64% | 82.00% |
 | `agents/tools/saved_results.py` | 89.24% | 77.33% |
-| `agents/async_runtime.py` | 93.37% | 86.96% |
+| `agents/async_runtime.py` | 93.57% | 86.96% |
 
 Значения берутся из одного Coverage JSON тем же скриптом, который применяет
 пороги в CI. Исторический `DAG_RUNTIME_BASELINE.md` теперь явно называет старую

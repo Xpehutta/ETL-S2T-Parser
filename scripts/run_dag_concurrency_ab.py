@@ -144,6 +144,11 @@ ORDERS = {
 COMMON_ENVIRONMENT = {
     "CHAT_AGENT_MODE": "multiagent",
     "SERVER_WORKER_MAX_CONCURRENCY": "4",
+    # GigaChat rejected overlapping model calls in the first live attempt.
+    # Workers remain concurrent; only provider calls are admitted one at a time.
+    "LLM_MAX_CONCURRENCY": "1",
+    "GIGACHAT_MAX_RETRIES": "3",
+    "GIGACHAT_RETRY_BACKOFF_FACTOR": "1",
     "GIGACHAT_JUDGE_MODEL": MODEL,
     # Keep the isolated live subprocess compatible with strict binary flags
     # even when a developer's legacy .env still uses ``false``.
@@ -195,6 +200,10 @@ def validate_spec() -> None:
         raise ValueError("DAG A/B arms must remain baseline and candidate")
     if {arm.worker_max_concurrency for arm in ARMS} != {1, 4}:
         raise ValueError("DAG A/B concurrency values must remain 1 and 4")
+    if COMMON_ENVIRONMENT.get("LLM_MAX_CONCURRENCY") != "1":
+        raise ValueError("GigaChat DAG A/B must serialize provider calls")
+    if COMMON_ENVIRONMENT.get("GIGACHAT_MAX_RETRIES") != "3":
+        raise ValueError("GigaChat DAG A/B must retry transient failures")
 
 
 def fixture_errors(path: Path) -> list[str]:
@@ -548,6 +557,32 @@ def _write_json(path: Path, value: Any) -> None:
     )
 
 
+def frozen_experiment_config() -> dict[str, Any]:
+    """Return fields that must not change while a journal is resumed."""
+
+    return {
+        "provider": PROVIDER,
+        "model": MODEL,
+        "judge_model": MODEL,
+        "repeats": REPEATS,
+        "arms": ARMS,
+        "cases": CASES,
+        "common_environment": COMMON_ENVIRONMENT,
+        "pytest_args": HARD_PYTEST_ARGS,
+        "latency_improvement_ratio": LATENCY_IMPROVEMENT_RATIO,
+        "token_guard_ratio": TOKEN_GUARD_RATIO,
+    }
+
+
+def resume_configuration_errors(config: Mapping[str, Any]) -> list[str]:
+    expected = _json_value(frozen_experiment_config())
+    errors: list[str] = []
+    for key, expected_value in expected.items():
+        if config.get(key) != expected_value:
+            errors.append(f"preregistered field changed: {key}")
+    return errors
+
+
 def load_journal(path: Path) -> list[RunRecord]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
@@ -768,6 +803,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         config = json.loads(config_path.read_text(encoding="utf-8"))
         initial_hash = str(config.get("initial_db_sha256") or "")
+        if not args.finalize_incomplete:
+            resume_errors = resume_configuration_errors(config)
+            if resume_errors:
+                print(
+                    f"resume preflight failed: {resume_errors[0]}",
+                    flush=True,
+                )
+                return 2
         records = load_journal(journal_path)
         try:
             validate_journal_prefix(records)
@@ -793,17 +836,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_json(
             output_dir / f"{timestamp}_config.json",
             {
-                "provider": PROVIDER,
-                "model": MODEL,
-                "judge_model": MODEL,
+                **frozen_experiment_config(),
                 "db_path": db_path,
-                "repeats": REPEATS,
-                "arms": ARMS,
-                "cases": CASES,
-                "common_environment": COMMON_ENVIRONMENT,
-                "pytest_args": HARD_PYTEST_ARGS,
-                "latency_improvement_ratio": LATENCY_IMPROVEMENT_RATIO,
-                "token_guard_ratio": TOKEN_GUARD_RATIO,
                 "initial_db_sha256": initial_hash,
             },
         )

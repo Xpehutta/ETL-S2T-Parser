@@ -47,6 +47,23 @@ Default не изменён: `WORKER_MAX_CONCURRENCY=1`.
   `failed`, поэтому ожидаемая ветка `failed → blocked` не возникла. Gate это
   зафиксировал, результат не был ошибочно засчитан как доказательство семантики.
 
+## Исправления после прогона
+
+- Default worker concurrency явно возвращён к `1`; значение `4` остаётся
+  экспериментальным opt-in до успешного live gate.
+- Для GigaChat общий admission limit LLM-вызовов равен `1`, хотя сами DAG-workers
+  продолжают работать конкурентно. Другие providers сохраняют default `8`.
+- GigaChat SDK теперь делает три retry временных `429/500/502/503/504` с
+  exponential backoff и jitter; `402` не повторяется.
+- `failed_parent` теперь намеренно вызывает read-only `run_sql` к отсутствующей
+  таблице, то есть воспроизводит настоящий tool error вместо корректного пустого
+  catalog-result.
+- Resume сверяет текущие transport/runtime-настройки с сохранённой
+  preregistration и fail-closed отклоняет смешивание конфигураций.
+- Post-fix smoke `2026-09-21 15:40 MSK` остановился до построения DAG: GigaChat
+  снова вернул точный HTTP `402 Payment Required`. Ответ пришёл за 0,54 секунды,
+  то есть non-retryable `402` корректно не расходовал три transient retry.
+
 ## Воспроизводимость
 
 Полные локальные артефакты находятся в
@@ -55,13 +72,13 @@ journal, transcripts, JUnit, DAG metrics, semantic verdicts, latency/tokens,
 failures и итоговый report. Каталог намеренно не коммитится: transcripts могут
 содержать значения из рабочей базы.
 
-Runner поддерживает продолжение строго с очередной записи фиксированного
-расписания. После восстановления лимита GigaChat:
+Этот журнал терминальный: после transport-исправлений продолжать его нельзя,
+поскольку это смешало бы две конфигурации. После восстановления лимита GigaChat
+нужен новый полный preregistered запуск:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_dag_concurrency_ab.py `
-  --db-path excel_data.db `
-  --resume-dir .test_runs\dag_concurrency_ab\20260921_140814
+  --db-path excel_data.db
 ```
 
 До полного выполнения 48/48 и прохождения всех hard gates статус остаётся
