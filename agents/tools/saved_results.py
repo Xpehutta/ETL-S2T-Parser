@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
@@ -283,6 +284,31 @@ class SavedResultStore:
             item = self._descriptors.get(str(result_ref or "").strip())
             return item.model_copy(deep=True) if item is not None else None
 
+    def descriptors_for_worker(
+        self,
+        worker_execution_id: str,
+        result_refs: Sequence[str],
+    ) -> List[SavedResultDescriptor]:
+        """Return exact datasets produced by one worker execution."""
+        clean_execution_id = str(worker_execution_id or "").strip()
+        clean_refs = list(
+            dict.fromkeys(
+                clean_ref
+                for value in result_refs
+                if (clean_ref := str(value or "").strip())
+            )
+        )
+        with self._lock:
+            return [
+                descriptor.model_copy(deep=True)
+                for result_ref in clean_refs
+                if (
+                    (descriptor := self._descriptors.get(result_ref))
+                    is not None
+                    and descriptor.worker_execution_id == clean_execution_id
+                )
+            ]
+
     def register_previous_result(
         self,
         *,
@@ -307,6 +333,16 @@ class SavedResultStore:
                 if clean_dataset_ref is not None
                 else None
             )
+            access = get_active_worker_result_access()
+            if (
+                descriptor is not None
+                and access is not None
+                and descriptor.worker_execution_id != access.worker_execution_id
+            ):
+                raise ValueError(
+                    "previous result cannot register a dataset owned by "
+                    "another worker execution"
+                )
             reference = PreviousResultReference(
                 result_id=f"result_{uuid4().hex}",
                 description=description,
@@ -337,6 +373,12 @@ class SavedResultStore:
     def read_previous_result(self, result_id: str) -> Dict[str, Any]:
         """Resolve one accepted result inside the current coordinator run."""
         clean_id = str(result_id or "").strip()
+        access = get_active_worker_result_access()
+        if access is not None and clean_id not in access.allowed_result_ids:
+            return {
+                "error": "Previous result is not allowed for this worker",
+                "result_id": clean_id,
+            }
         with self._lock:
             stored = self._previous_results.get(clean_id)
             payload = dict(stored) if stored is not None else None
@@ -359,10 +401,18 @@ class SavedResultStore:
         result_ids: Sequence[str],
     ) -> List[SavedResultDescriptor]:
         """Return saved tabular datasets linked to accepted lazy results."""
+        access = get_active_worker_result_access()
+        selected_ids = [str(result_id or "").strip() for result_id in result_ids]
+        if access is not None:
+            selected_ids = [
+                result_id
+                for result_id in selected_ids
+                if result_id in access.allowed_result_ids
+            ]
         with self._lock:
             refs = [
-                self._result_datasets.get(str(result_id or "").strip())
-                for result_id in result_ids
+                self._result_datasets.get(result_id)
+                for result_id in selected_ids
             ]
             return [
                 self._descriptors[result_ref].model_copy(deep=True)
@@ -388,6 +438,7 @@ class SavedResultStore:
             for name in column_names
         ]
         result_ref = f"saved_{uuid4().hex}"
+        access = get_active_worker_result_access()
 
         with self._lock:
             table_name = f"saved_result_{len(self._descriptors) + 1}"
@@ -423,6 +474,9 @@ class SavedResultStore:
                 source_tool_call_id=(
                     str(source_tool_call_id or "").strip() or None
                 ),
+                worker_execution_id=(
+                    access.worker_execution_id if access is not None else None
+                ),
                 row_count=len(rows),
                 source_total=tabular["source_total"],
                 truncated=bool(tabular["truncated"]),
@@ -454,6 +508,13 @@ class SavedResultStore:
     ) -> Dict[str, Any]:
         clean_ref = str(result_ref or "").strip()
         text = str(query or "").strip()
+        access = get_active_worker_result_access()
+        if access is not None and clean_ref not in access.allowed_result_refs:
+            return {
+                "error": "Saved result is not allowed for this worker",
+                "result_ref": clean_ref,
+                "query": text,
+            }
         validation_error = _validate_readonly_sql(text)
         if validation_error:
             return {
@@ -558,6 +619,52 @@ _ACTIVE_SAVED_RESULT_STORE: ContextVar[Optional[SavedResultStore]] = ContextVar(
     "active_saved_result_store",
     default=None,
 )
+
+
+@dataclass(frozen=True)
+class WorkerResultAccess:
+    """Fail-closed result capabilities for one worker execution."""
+
+    worker_execution_id: str
+    allowed_result_ids: frozenset[str]
+    allowed_result_refs: frozenset[str]
+
+
+_ACTIVE_WORKER_RESULT_ACCESS: ContextVar[Optional[WorkerResultAccess]] = (
+    ContextVar("active_worker_result_access", default=None)
+)
+
+
+@contextmanager
+def worker_result_access_scope(
+    previous_results: Sequence[PreviousResultReference],
+    *,
+    worker_execution_id: Optional[str] = None,
+) -> Iterator[WorkerResultAccess]:
+    """Bind direct dependency references to one isolated worker execution."""
+    access = WorkerResultAccess(
+        worker_execution_id=(
+            str(worker_execution_id or "").strip()
+            or f"worker_{uuid4().hex}"
+        ),
+        allowed_result_ids=frozenset(
+            item.result_id for item in previous_results
+        ),
+        allowed_result_refs=frozenset(
+            item.result_schema.result_ref
+            for item in previous_results
+            if item.result_schema is not None
+        ),
+    )
+    token = _ACTIVE_WORKER_RESULT_ACCESS.set(access)
+    try:
+        yield access
+    finally:
+        _ACTIVE_WORKER_RESULT_ACCESS.reset(token)
+
+
+def get_active_worker_result_access() -> Optional[WorkerResultAccess]:
+    return _ACTIVE_WORKER_RESULT_ACCESS.get()
 
 
 @contextmanager
@@ -679,7 +786,7 @@ def bind_saved_result_schemas(
         item.result_id for item in (request_parts.previous_results or [])
     ]
     descriptors = store.descriptors_for_result_ids(result_ids)
-    if not descriptors:
+    if not descriptors and get_active_worker_result_access() is None:
         descriptors = [
             item
             for item in store.descriptors()
@@ -801,10 +908,13 @@ __all__ = [
     "SavedResultColumn",
     "SavedResultDescriptor",
     "SavedResultStore",
+    "WorkerResultAccess",
     "bind_saved_result_schemas",
     "get_active_saved_result_store",
+    "get_active_worker_result_access",
     "persist_sqlite_tool_message",
     "query_saved_result",
     "read_previous_result",
     "saved_result_store_scope",
+    "worker_result_access_scope",
 ]

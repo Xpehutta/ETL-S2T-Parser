@@ -2430,6 +2430,7 @@ def test_worker_graph_materializes_sqlite_tool_rows_in_active_store():
         assert descriptor.row_count == 2
         assert descriptor.truncated is False
         assert "saved_result" in result.display_items[0].content
+        assert result.display_items[0].result_ref == descriptor.result_ref
         assert "saved_result" in result.cycle_history[0].tool_results[0][
             "content"
         ]
@@ -2444,6 +2445,7 @@ def test_worker_graph_materializes_sqlite_tool_rows_in_active_store():
 
 
 def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
+    from agents.contracts import WorkerRequestParts
     from agents.tools.saved_results import saved_result_store_scope
     from agents.worker import worker_chat
 
@@ -2467,7 +2469,19 @@ def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
             },
         )
         assert descriptor is not None
-        task = f"Отфильтруй сохранённый результат {descriptor.result_ref}."
+        previous_result = store.register_previous_result(
+            source_tool="run_sql",
+            source_tool_call_id="call-source",
+            content=json.dumps(
+                {"rows": [{"target_table": "t_example", "row_count": 1}]}
+            ),
+            description="Исходный табличный результат",
+            dataset_ref=descriptor.result_ref,
+        )
+        task = WorkerRequestParts(
+            current_task="Отфильтруй сохранённый результат.",
+            previous_results=[previous_result],
+        )
 
         with (
             patch("agents.worker.select_chat_route", return_value=route) as router,
@@ -2511,11 +2525,12 @@ def test_worker_exposes_only_saved_results_accepted_by_observer():
             source_tool_call_id="call-wrong",
             payload={"rows": [{"value": "wrong"}]},
         )
-        store.save_payload(
+        correct_descriptor = store.save_payload(
             source_tool="run_sql",
             source_tool_call_id="call-correct",
             payload={"rows": [{"value": "correct"}]},
         )
+        assert correct_descriptor is not None
         return WorkerRunResult(
             answer="Получен correct.",
             goal_satisfied=True,
@@ -2525,6 +2540,7 @@ def test_worker_exposes_only_saved_results_accepted_by_observer():
                     content=json.dumps({"rows": [{"value": "correct"}]}),
                     evidence_id="evidence-correct",
                     tool_call_id="call-correct",
+                    result_ref=correct_descriptor.result_ref,
                     arguments={"query": "SELECT value FROM result"},
                 )
             ],

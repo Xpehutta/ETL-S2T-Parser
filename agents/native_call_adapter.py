@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from typing import Any, Mapping, Optional, Sequence
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
@@ -345,10 +346,10 @@ def normalize_tool_call_message(
         {
             "name": name,
             "args": dict(args),
-            "id": f"recovered-{name}-{index}",
+            "id": f"recovered-{name}-{uuid4().hex}",
             "type": "tool_call",
         }
-        for index, (name, args) in enumerate(calls, start=1)
+        for name, args in calls
     ]
     return AIMessage(
         content=message.content,

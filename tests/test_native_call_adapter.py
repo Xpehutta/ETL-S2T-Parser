@@ -23,14 +23,22 @@ def test_required_call_recovers_plain_argument_object():
     )
 
     assert recovered.content.startswith("```json")
-    assert recovered.tool_calls == [
-        {
-            "name": "select_operation_skills",
-            "args": {"skills": ["S2T-строки"]},
-            "id": "recovered-select_operation_skills-1",
-            "type": "tool_call",
-        }
-    ]
+    assert len(recovered.tool_calls) == 1
+    assert recovered.tool_calls[0]["name"] == "select_operation_skills"
+    assert recovered.tool_calls[0]["args"] == {"skills": ["S2T-строки"]}
+    assert recovered.tool_calls[0]["id"].startswith(
+        "recovered-select_operation_skills-"
+    )
+    assert recovered.tool_calls[0]["type"] == "tool_call"
+
+
+def test_recovered_tool_call_ids_are_unique_across_messages():
+    message = AIMessage(content='{"skills": ["S2T-строки"]}')
+
+    first = recover_required_tool_call(message, "select_operation_skills")
+    second = recover_required_tool_call(message, "select_operation_skills")
+
+    assert first.tool_calls[0]["id"] != second.tool_calls[0]["id"]
 
 
 def test_named_call_requires_explicit_allowed_tool():

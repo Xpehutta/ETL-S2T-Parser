@@ -53,6 +53,7 @@ from .tools import get_worker_tools, load_schemas, load_skills
 from .tools.saved_results import (
     bind_saved_result_schemas,
     get_active_saved_result_store,
+    worker_result_access_scope,
 )
 from .tools.routing import select_chat_route, select_chat_route_async
 
@@ -127,11 +128,7 @@ def _store_evidence_items(
     datasets: Sequence[SavedResultDescriptor],
 ) -> List[EvidenceArtifact]:
     artifacts: List[EvidenceArtifact] = []
-    dataset_by_tool_call = {
-        str(item.source_tool_call_id or ""): item.result_ref
-        for item in datasets
-        if str(item.source_tool_call_id or "").strip()
-    }
+    known_dataset_refs = {item.result_ref for item in datasets}
     with _DISPLAY_RESULTS_LOCK:
         for item in items:
             display_ref = None
@@ -148,7 +145,11 @@ def _store_evidence_items(
                     preview=item.preview,
                     truncated=item.truncated,
                     display_ref=display_ref,
-                    dataset_ref=dataset_by_tool_call.get(item.tool_call_id),
+                    dataset_ref=(
+                        item.result_ref
+                        if item.result_ref in known_dataset_refs
+                        else None
+                    ),
                 )
             )
     return artifacts
@@ -184,18 +185,18 @@ def _register_previous_results(
     store = get_active_saved_result_store()
     if store is None:
         return []
-    dataset_by_tool_call = {
-        str(item.source_tool_call_id or ""): item.result_ref
-        for item in datasets
-        if str(item.source_tool_call_id or "").strip()
-    }
+    known_dataset_refs = {item.result_ref for item in datasets}
     return [
         store.register_previous_result(
             source_tool=item.name,
             source_tool_call_id=item.tool_call_id,
             content=item.content,
             description=_handoff_description(item),
-            dataset_ref=dataset_by_tool_call.get(item.tool_call_id),
+            dataset_ref=(
+                item.result_ref
+                if item.result_ref in known_dataset_refs
+                else None
+            ),
         )
         for item in items
         if item.name != _READ_PREVIOUS_RESULT_TOOL_NAME
@@ -287,8 +288,10 @@ def _final_outcome_summary(
     return f"{clean_answer}\nПричина незавершённости: {clean_gap}"
 
 
-async def worker_chat_async(
+async def _worker_chat_async(
     task: str | WorkerRequestParts,
+    *,
+    worker_execution_id: str,
 ) -> WorkerOutcome:
     """Execute one self-contained task in an isolated generic worker."""
     request_parts = parse_worker_request(task)
@@ -308,28 +311,16 @@ async def worker_chat_async(
     if metrics_callback is not None and metrics_callback not in callbacks:
         callbacks.append(metrics_callback)
     saved_store = get_active_saved_result_store()
-    initial_saved_refs = {
-        item.result_ref for item in saved_store.descriptors()
-    } if saved_store is not None else set()
 
-    def newly_saved_datasets(
-        accepted_tool_call_ids: Sequence[str] | None = None,
+    def accepted_datasets(
+        items: Sequence[WorkerDisplayItem],
     ) -> List[SavedResultDescriptor]:
         if saved_store is None:
             return []
-        descriptors = [
-            item
-            for item in saved_store.descriptors()
-            if item.result_ref not in initial_saved_refs
-        ]
-        if accepted_tool_call_ids is None:
-            return descriptors
-        accepted_ids = set(accepted_tool_call_ids)
-        return [
-            item
-            for item in descriptors
-            if item.source_tool_call_id in accepted_ids
-        ]
+        return saved_store.descriptors_for_worker(
+            worker_execution_id,
+            [item.result_ref for item in items],
+        )
 
     attempted_palettes: List[Tuple[str, ...]] = []
     cycle_history: List[WorkerCycleTrace] = []
@@ -515,9 +506,7 @@ async def worker_chat_async(
                 )[:8000],
             )
         if graph_result.status != "reroute":
-            datasets = newly_saved_datasets(
-                graph_result.accepted_tool_call_ids
-            )
+            datasets = accepted_datasets(graph_result.display_items)
             summary = _final_outcome_summary(
                 graph_result.answer,
                 internal_gap=graph_result.gap,
@@ -557,9 +546,7 @@ async def worker_chat_async(
             )
 
         if reroute_count >= WORKER_MAX_REROUTES:
-            datasets = newly_saved_datasets(
-                graph_result.accepted_tool_call_ids
-            )
+            datasets = accepted_datasets(graph_result.display_items)
             evidence = _store_evidence_items(
                 graph_result.display_items,
                 datasets,
@@ -614,6 +601,20 @@ async def worker_chat_async(
             "Worker returns to tool-router: attempt=%s gap=%s",
             reroute_count,
             graph_result.gap,
+        )
+
+
+async def worker_chat_async(
+    task: str | WorkerRequestParts,
+) -> WorkerOutcome:
+    """Execute one task with isolated saved-result ownership and access."""
+    request_parts = parse_worker_request(task)
+    with worker_result_access_scope(
+        request_parts.previous_results or [],
+    ) as access:
+        return await _worker_chat_async(
+            request_parts,
+            worker_execution_id=access.worker_execution_id,
         )
 
 

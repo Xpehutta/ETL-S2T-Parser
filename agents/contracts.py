@@ -462,6 +462,7 @@ class SavedResultDescriptor(BaseModel):
     result_ref: str
     source_tool: str
     source_tool_call_id: Optional[str] = Field(default=None, exclude=True)
+    worker_execution_id: Optional[str] = Field(default=None, exclude=True)
     row_count: int = Field(ge=0)
     source_total: Optional[int] = Field(default=None, ge=0)
     truncated: bool = False

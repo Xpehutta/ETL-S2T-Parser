@@ -495,6 +495,22 @@ def _tool_display_content(content: Any) -> str:
         return original
 
 
+def _tool_saved_result_ref(content: Any) -> str:
+    """Read the exact materialized result identity from one tool message."""
+    try:
+        from .tools.saved_results import _decode_tool_content
+
+        payload = _decode_tool_content(content)
+        if not isinstance(payload, Mapping):
+            return ""
+        saved_result = payload.get("saved_result")
+        if not isinstance(saved_result, Mapping):
+            return ""
+        return str(saved_result.get("result_ref") or "").strip()
+    except (TypeError, ValueError):
+        return ""
+
+
 def _tool_message_preview(content: Any, max_chars: int) -> str:
     text = _tool_model_content(content).strip()
     limit = max(1, int(max_chars))
@@ -720,6 +736,7 @@ class WorkerDisplayItem(BaseModel):
     content: str
     evidence_id: str = Field(default="", exclude=True)
     tool_call_id: str = Field(default="", exclude=True)
+    result_ref: str = Field(default="", exclude=True)
     arguments: Dict[str, Any] = Field(default_factory=dict, exclude=True)
     preview: str = Field(default="", exclude=True)
     truncated: bool = Field(default=False, exclude=True)
@@ -2374,6 +2391,7 @@ async def run_worker_graph_async(
                     "",
                 ),
                 tool_call_id=str(message.tool_call_id or ""),
+                result_ref=_tool_saved_result_ref(message.content),
                 arguments=tool_arguments.get(message.tool_call_id, {}),
                 preview=_tool_message_preview(message.content, preview_chars),
                 truncated=(
