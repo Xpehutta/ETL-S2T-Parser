@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Optional
 
@@ -19,6 +20,9 @@ SUPPORTED_LLM_PROVIDERS = ("gigachat", "openrouter", "ollama")
 DEFAULT_GIGACHAT_BASE_URL = "https://api.giga.chat/v1"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
 DEFAULT_GIGACHAT_JUDGE_MODEL = "GigaChat-2-Pro"
+DEFAULT_GIGACHAT_MAX_RETRIES = 3
+DEFAULT_GIGACHAT_RETRY_BACKOFF_FACTOR = 1.0
+DEFAULT_GIGACHAT_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
@@ -53,6 +57,20 @@ def _env_optional_int(name: str) -> Optional[int]:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    value = _env_int(name, default)
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    value = _env_float(name, default)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
 
 
 def get_llm_provider() -> str:
@@ -158,6 +176,15 @@ def _create_gigachat_chat_model(
             timeout if timeout is not None else _env_int("GIGACHAT_TIMEOUT", 120)
         ),
         temperature=_env_float("GIGACHAT_TEMPERATURE", 0.0),
+        max_retries=_env_nonnegative_int(
+            "GIGACHAT_MAX_RETRIES",
+            DEFAULT_GIGACHAT_MAX_RETRIES,
+        ),
+        retry_backoff_factor=_env_positive_float(
+            "GIGACHAT_RETRY_BACKOFF_FACTOR",
+            DEFAULT_GIGACHAT_RETRY_BACKOFF_FACTOR,
+        ),
+        retry_on_status_codes=DEFAULT_GIGACHAT_RETRY_STATUS_CODES,
     )
 
 

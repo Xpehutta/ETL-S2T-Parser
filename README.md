@@ -291,25 +291,31 @@ uv run uvicorn app:app --host 127.0.0.1 --port 8000
 ### Async runtime
 
 `/chat` ожидает supervisor → coordinator → workers → upstream через native
-`ainvoke`. Coordinator валидирует DAG (duplicate/missing/self/cycle), запускает
-каждый готовый topological layer через `asyncio.TaskGroup` и отменяет siblings
-при ошибке. Синхронные SQLite, Excel, файловые и Neo4j-границы вынесены из event
-loop в рабочие потоки. Основные защитные настройки:
+`ainvoke`. Coordinator валидирует DAG (duplicate/missing/self/cycle) и запускает
+workers по готовности зависимостей, не ожидая завершения всего топологического
+слоя. Structured failure блокирует только descendants; инфраструктурная ошибка
+отменяет текущий runtime. Синхронные SQLite, Excel, файловые и Neo4j-границы
+вынесены из event loop в рабочие потоки. Основные защитные настройки:
 
 ```ini
 CHAT_REQUEST_TIMEOUT=900
 LLM_TIMEOUT=120
 TOOL_TIMEOUT=120
-LLM_MAX_CONCURRENCY=8
+# Для GigaChat default=1; для остальных providers default=8
+LLM_MAX_CONCURRENCY=1
 TOOL_MAX_CONCURRENCY=16
-WORKER_MAX_CONCURRENCY=4
+# Параллельный DAG включается явно после live gate
+WORKER_MAX_CONCURRENCY=1
+GIGACHAT_MAX_RETRIES=3
+GIGACHAT_RETRY_BACKOFF_FACTOR=1
 ```
 
 Миграция не меняет SQLite-схему и формат HTTP-ответов. Для аварийного отката
 достаточно развернуть предыдущий образ/commit приложения: миграция данных или
-обратное преобразование базы не требуются. Legacy-планы без `id`/`depends_on`
-нормализуются в прежнюю линейную цепочку; новые DAG-планы исполняются с
-ограниченным параллелизмом.
+обратное преобразование базы не требуются. Legacy-планы преобразуются только
+явным внутренним adapter; model ingress требует `id`, `task` и `depends_on`.
+Новый DAG исполняется с ограниченным параллелизмом при явном
+`WORKER_MAX_CONCURRENCY > 1`.
 
 ## Настройка LLM
 

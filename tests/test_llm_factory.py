@@ -41,6 +41,47 @@ def test_gigachat_factory_uses_model_fallback(monkeypatch):
     assert get_chat_model_name() == "GigaChat-Pro"
 
 
+def test_gigachat_factory_retries_transient_transport_errors(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "gigachat")
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.delenv("GIGACHAT_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("GIGACHAT_RETRY_BACKOFF_FACTOR", raising=False)
+
+    model = create_chat_model(timeout=5)
+
+    assert model.max_retries == 3
+    assert model.retry_backoff_factor == 1.0
+    assert model.retry_on_status_codes == (429, 500, 502, 503, 504)
+
+    monkeypatch.setenv("GIGACHAT_MAX_RETRIES", "5")
+    monkeypatch.setenv("GIGACHAT_RETRY_BACKOFF_FACTOR", "0.25")
+    overridden = create_chat_model(timeout=5)
+    assert overridden.max_retries == 5
+    assert overridden.retry_backoff_factor == 0.25
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("GIGACHAT_MAX_RETRIES", "-1", "non-negative integer"),
+        ("GIGACHAT_RETRY_BACKOFF_FACTOR", "0", "positive number"),
+        ("GIGACHAT_RETRY_BACKOFF_FACTOR", "nan", "positive number"),
+    ],
+)
+def test_gigachat_factory_rejects_invalid_retry_settings(
+    monkeypatch,
+    name,
+    value,
+    message,
+):
+    monkeypatch.setenv("LLM_PROVIDER", "gigachat")
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=message):
+        create_chat_model(timeout=5)
+
+
 @pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
 def test_gigachat_factory_passes_binary_verify_ssl(
     monkeypatch,

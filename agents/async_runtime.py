@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 DEFAULT_LLM_MAX_CONCURRENCY = 8
+DEFAULT_GIGACHAT_LLM_MAX_CONCURRENCY = 1
 DEFAULT_TOOL_MAX_CONCURRENCY = 16
-DEFAULT_WORKER_MAX_CONCURRENCY = 4
+DEFAULT_WORKER_MAX_CONCURRENCY = 1
 DEFAULT_SERVER_WORKER_MAX_CONCURRENCY = 16
 DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 120.0
@@ -94,6 +95,18 @@ def worker_max_concurrency() -> int:
     )
 
 
+def llm_max_concurrency() -> int:
+    """Return a provider-safe process-wide limit for concurrent LLM calls."""
+
+    provider = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+    default = (
+        DEFAULT_GIGACHAT_LLM_MAX_CONCURRENCY
+        if provider == "gigachat"
+        else DEFAULT_LLM_MAX_CONCURRENCY
+    )
+    return _positive_int_env("LLM_MAX_CONCURRENCY", default)
+
+
 def server_worker_max_concurrency() -> int:
     """Return the server-wide worker limit shared by concurrent requests."""
 
@@ -113,10 +126,7 @@ def _sync_fallback_enabled() -> bool:
 def _semaphore(category: str) -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     if category == "llm":
-        limit = _positive_int_env(
-            "LLM_MAX_CONCURRENCY",
-            DEFAULT_LLM_MAX_CONCURRENCY,
-        )
+        limit = llm_max_concurrency()
     elif category == "tool":
         limit = _positive_int_env(
             "TOOL_MAX_CONCURRENCY",
@@ -307,6 +317,7 @@ def run_coroutine_sync(awaitable: Awaitable[T]) -> T:
 
 __all__ = [
     "DEFAULT_LLM_MAX_CONCURRENCY",
+    "DEFAULT_GIGACHAT_LLM_MAX_CONCURRENCY",
     "DEFAULT_TOOL_MAX_CONCURRENCY",
     "DEFAULT_WORKER_MAX_CONCURRENCY",
     "DEFAULT_SERVER_WORKER_MAX_CONCURRENCY",
@@ -315,6 +326,7 @@ __all__ = [
     "ainvoke_graph_compat",
     "ainvoke_compat",
     "concurrency_slot",
+    "llm_max_concurrency",
     "offloaded_job_scope",
     "run_sync_compat",
     "run_coroutine_sync",

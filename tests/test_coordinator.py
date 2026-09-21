@@ -406,6 +406,7 @@ async def test_public_async_coordinator_executes_full_fan_in_graph(monkeypatch):
     from agents.run_metrics import capture_agent_run, consume_agent_run_metrics
 
     monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    monkeypatch.setenv("WORKER_MAX_CONCURRENCY", "2")
     model = _CoordinatorModel(
         {
             "submit_worker_plan": [

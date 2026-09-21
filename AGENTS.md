@@ -4,7 +4,7 @@
 
 ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниями, сохраняет исходные данные и каталоги в SQLite, строит Neo4j-lineage и отвечает на вопросы через read-only инструментального агента.
 
-## Текущее состояние — 2026-09-15
+## Текущее состояние — 2026-09-21
 
 - Рабочая ветка может отличаться. Перед изменениями проверять `git status`;
   незакоммиченные пользовательские изменения и каталог `artifacts/` не удалять
@@ -12,6 +12,7 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - `/chat` по умолчанию использует multiagent; `CHAT_AGENT_MODE=single_agent` оставлен как baseline.
 - Актуальный общий поток: `supervisor → operation router → downstream plan → workers → upstream decision → upstream answer`. Специализированные ветки выбираются только после supervisor.
 - Downstream создаёт полный DAG из 1–8 задач чтения; coordinator допускает максимум два цикла. Независимые ready-workers выполняются конкурентно с bounded limit, а зависимые получают lazy-ссылки только прямых `depends_on`. Legacy-план без DAG-полей сохраняет последовательную семантику.
+- Безопасный runtime default — `WORKER_MAX_CONCURRENCY=1`. Параллельный DAG включается явно; для GigaChat общий LLM admission limit по умолчанию равен 1, а временные `429/5xx` повторяются до трёх раз с backoff. Незавершённый live A/B `20260921_140814` имеет verdict `inconclusive` и не разрешает продвигать concurrency 4 без нового полного прогона.
 - Router одновременно выбирает tools, retrieval-skills и schemas; planner вызывает выбранные tools; observer проверяет каждый data-tool result и возвращает только `complete`, `continue` или `reroute`.
 - Upstream получает исходную задачу и принятые evidence, решает `pass/reroute`, затем анализирует данные, формирует ответ и выбирает display-results.
 - Полные tool-results живут только в run-scoped хранилище; последующим workers передаются короткие `result_id`/schema references. SQLite проекта не изменяется.

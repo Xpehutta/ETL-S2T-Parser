@@ -12,6 +12,7 @@ from agents.async_runtime import (
     ainvoke_compat,
     ainvoke_graph_compat,
     concurrency_slot,
+    llm_max_concurrency,
     offloaded_job_scope,
     run_coroutine_sync,
     worker_max_concurrency,
@@ -227,6 +228,22 @@ def test_worker_max_concurrency_is_strictly_positive(monkeypatch):
     monkeypatch.setenv("WORKER_MAX_CONCURRENCY", "0")
     with pytest.raises(ValueError, match="positive integer"):
         worker_max_concurrency()
+
+
+def test_safe_concurrency_defaults_for_gigachat(monkeypatch):
+    monkeypatch.delenv("WORKER_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("LLM_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+    assert DEFAULT_WORKER_MAX_CONCURRENCY == 1
+    assert worker_max_concurrency() == 1
+    assert llm_max_concurrency() == 1
+
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    assert llm_max_concurrency() == 8
+
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "3")
+    assert llm_max_concurrency() == 3
 
 
 @pytest.mark.asyncio
