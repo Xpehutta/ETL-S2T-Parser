@@ -19,10 +19,10 @@ gate-скрипту. Порог statement не снижен. Branch gate заф�
 ## Итоговый non-live прогон
 
 ```text
-1259 passed, 80 skipped in 56.41s
-statement coverage: 88.86%
-branch coverage: 76.48%
-coverage.py combined line+branch: 85.79%
+1277 passed, 88 skipped in 26.87s
+statement coverage: 88.93%
+branch coverage: 76.81%
+coverage.py combined line+branch: 85.90%
 ```
 
 ## Критические компоненты

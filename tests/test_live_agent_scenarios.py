@@ -5734,3 +5734,149 @@ def test_live_validation_and_agentic_use_same_resolution_semantics(live_chat_cli
         rejected_mention=mention,
     )
     _assert_no_worker_reroute(agentic_exchange)
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_independent_roots(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Выполни двумя независимыми root workers два отдельных чтения SQLite: "
+        "A — точный COUNT(*) таблицы source_tables, B — точный COUNT(*) "
+        "таблицы target_tables. Не связывай A и B зависимостью. Верни строго "
+        "source_tables=<число>, target_tables=<число>.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_ready_child(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Построй DAG чтений: A быстро находит MAX(file_id) в files; B независимо "
+        "читает общий S2T summary по всем target tables и возвращает три лидера "
+        "по mapping_count; C зависит только от A и считает точный COUNT(*) "
+        "target_tables для найденного file_id. C не должен ждать B. Верни "
+        "file_id, target_count и три target_table из B.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_fan_in(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Построй fan-in DAG. Root A отдельно находит самый частый непустой "
+        "source_table в s2t_transformations. Root B отдельно находит самый "
+        "частый непустой target_table. MERGE зависит прямо от A и B и читает "
+        "точное число S2T-строк для направленной пары A→B. Верни source_table, "
+        "target_table и pair_count.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_fan_out(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Построй fan-out DAG. Root A находит target_table с максимальным числом "
+        "S2T-строк. После A параллельно запусти B и C: B считает все строки "
+        "этого target_table, C считает различные непустые source_table для "
+        "него. B и C зависят только от A. Верни target_table, row_count и "
+        "source_count.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_failed_parent(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Проверь отказоустойчивый DAG. Root A пытается точным catalog-reader "
+        "прочитать заведомо отсутствующую target_table "
+        "__dag_ab_missing_target_7f31__. C зависит от A и не должен запускаться, "
+        "если A завершился failed без usable result. Независимый root B считает "
+        "COUNT(*) таблицы files и должен завершиться. Честно сообщи отсутствие "
+        "A/C и верни files=<число>.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_partial_parent(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Построй DAG с partial parent. A пытается прочитать все строки общего "
+        "target column catalog через list_column_catalog с scope=target_columns "
+        "и limit=50; bounded/truncated preview обязан завершиться как structured "
+        "partial с usable previous result. B зависит прямо от A, лениво читает "
+        "этот result и одним batch-вызовом ищет S2T для полученных технических "
+        "имён. Не выдавай preview за полный набор; верни первые кандидаты и "
+        "доступные mappings.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_eight_roots(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Создай максимально допустимый DAG ровно из восьми независимых root "
+        "workers без dependencies. Каждый делает отдельный точный COUNT(*) "
+        "одной таблицы: files, source_tables, target_tables, source_columns, "
+        "target_columns, additional_objects, pxf_to_a, s2t_transformations. "
+        "Верни восемь подписанных значений и ничего не объединяй в один worker.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
+
+
+@pytest.mark.live_handoff
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="DAG concurrency A/B is multiagent-only",
+)
+def test_live_dag_ab_sequential_control(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Построй последовательный контрольный DAG A→B→C. A находит file_id "
+        "самого нового файла. B зависит только от A и находит target_table этого "
+        "файла с максимальным числом catalog-колонок. C зависит только от B и "
+        "читает точное число S2T-строк для найденного target_table. Верни "
+        "file_id, target_table и s2t_count.",
+    )
+    _assert_public_answer(exchange.result.answer)
+    assert exchange.metrics.coordinator_dag, exchange.metrics
