@@ -2518,6 +2518,7 @@ def test_run_agent_graph_adds_langfuse_callback_config():
     from agents.chat_graph import run_agent_graph
 
     graph = MagicMock()
+    graph.ainvoke = None
     graph.invoke.return_value = {"messages": [AIMessage(content="ok")]}
     handler = object()
     trace_context = MagicMock()

@@ -564,3 +564,78 @@ async def test_ready_queue_preserves_declared_order_under_one_permit():
     )
 
     assert started == ["A", "B", "C", "D"]
+
+
+@pytest.mark.asyncio
+async def test_server_worker_limit_is_separate_from_per_run_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv("SERVER_WORKER_MAX_CONCURRENCY", "1")
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    first_plan = WorkerPlan.model_validate(
+        {"steps": [{"id": "one", "task": "one", "depends_on": []}]}
+    )
+    second_plan = WorkerPlan.model_validate(
+        {"steps": [{"id": "two", "task": "two", "depends_on": []}]}
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def runner(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if request.current_task == "one":
+            first_started.set()
+            await release_first.wait()
+        active -= 1
+        return _result_outcome(request.current_task)
+
+    session_id = f"dag-global-limit-{uuid4()}"
+    with capture_agent_run(session_id):
+        first = asyncio.create_task(
+            _execute_worker_plan_dag(
+                first_plan,
+                cycle=1,
+                original_task="first run",
+                planner_context="",
+                observer_context="",
+                worker_runner=runner,
+                max_concurrency=2,
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second = asyncio.create_task(
+            _execute_worker_plan_dag(
+                second_plan,
+                cycle=1,
+                original_task="second run",
+                planner_context="",
+                observer_context="",
+                worker_runner=runner,
+                max_concurrency=2,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not second.done()
+        release_first.set()
+        await asyncio.gather(first, second)
+
+    assert peak == 1
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert len(metrics.coordinator_dag) == 2
+    assert all(
+        item["worker_max_concurrency"] == 2
+        and item["server_worker_max_concurrency"] == 1
+        for item in metrics.coordinator_dag
+    )
+    waits = [
+        worker["server_semaphore_wait_seconds"]
+        for item in metrics.coordinator_dag
+        for worker in item["workers"]
+    ]
+    assert all(value is not None and value >= 0 for value in waits)
+    assert any(value > 0 for value in waits)

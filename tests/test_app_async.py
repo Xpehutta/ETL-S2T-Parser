@@ -450,7 +450,7 @@ async def test_background_routes_propagate_cancellation(
     import app as app_module
 
     offload = AsyncMock(side_effect=asyncio.CancelledError)
-    monkeypatch.setattr(app_module.asyncio, "to_thread", offload)
+    monkeypatch.setattr(app_module, "run_sync_compat", offload)
 
     with pytest.raises(asyncio.CancelledError):
         await getattr(async_client, method)(path)
@@ -471,7 +471,7 @@ async def test_upload_propagates_background_cancellation(monkeypatch):
             }
 
     offload = AsyncMock(side_effect=asyncio.CancelledError)
-    monkeypatch.setattr(app_module.asyncio, "to_thread", offload)
+    monkeypatch.setattr(app_module, "run_sync_compat", offload)
 
     with pytest.raises(asyncio.CancelledError):
         await app_module.upload_file(Request())

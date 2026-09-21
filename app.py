@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.datastructures import UploadFile
 
 from agents.agent import agent_chat, agent_chat_async, get_model_name
+from agents.async_runtime import run_sync_compat
 from agents.env_flags import read_binary_env_flag
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from agents.supervisor import supervisor_chat, supervisor_chat_async
@@ -82,13 +83,13 @@ _DEFAULT_SYNC_SUPERVISOR_CHAT = supervisor_chat
 
 async def _call_agent_chat(query: str, **kwargs: Any) -> Any:
     if agent_chat is not _DEFAULT_SYNC_AGENT_CHAT:
-        return await asyncio.to_thread(agent_chat, query, **kwargs)
+        return await run_sync_compat(agent_chat, query, **kwargs)
     return await agent_chat_async(query, **kwargs)
 
 
 async def _call_supervisor_chat(query: str, **kwargs: Any) -> Any:
     if supervisor_chat is not _DEFAULT_SYNC_SUPERVISOR_CHAT:
-        return await asyncio.to_thread(supervisor_chat, query, **kwargs)
+        return await run_sync_compat(supervisor_chat, query, **kwargs)
     return await supervisor_chat_async(query, **kwargs)
 
 
@@ -339,7 +340,7 @@ def _safe_export_path(directory: Path, filename: str) -> Optional[Path]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    recovery_report, recovery_error = await asyncio.to_thread(
+    recovery_report, recovery_error = await run_sync_compat(
         try_sync_pending_graph_projections
     )
     if recovery_error:
@@ -437,7 +438,7 @@ async def upload_file(request: Request) -> Any:
         return _error("Empty file", 400)
 
     try:
-        return await asyncio.to_thread(
+        return await run_sync_compat(
             _process_upload,
             file_bytes,
             filename,
@@ -461,19 +462,19 @@ async def upload_file(request: Request) -> Any:
 
 @app.get("/summary/{file_id}")
 async def get_summary(file_id: int) -> Any:
-    file_record = await asyncio.to_thread(get_file, file_id)
+    file_record = await run_sync_compat(get_file, file_id)
     if file_record and file_record["summary"]:
         return {"file_id": file_id, "summary": file_record["summary"]}
-    summary, summary_error = await asyncio.to_thread(try_generate_summary, file_id)
+    summary, summary_error = await run_sync_compat(try_generate_summary, file_id)
     return {"file_id": file_id, "summary": summary, "summary_error": summary_error}
 
 
 @app.get("/description/{file_id}")
 async def get_description(file_id: int, refresh: bool = False) -> Any:
-    file_record = await asyncio.to_thread(get_file, file_id)
+    file_record = await run_sync_compat(get_file, file_id)
     if file_record and file_record["description"] and not refresh:
         return {"file_id": file_id, "description": file_record["description"]}
-    description, description_error = await asyncio.to_thread(
+    description, description_error = await run_sync_compat(
         try_generate_description,
         file_id,
         refresh=refresh,
@@ -508,7 +509,7 @@ async def _get_transformations_response(
                 "source_field",
                 "transformation_rule",
             ]
-        return await asyncio.to_thread(
+        return await run_sync_compat(
             list_s2t_transformations,
             file_id,
             limit=limit,
@@ -535,12 +536,12 @@ async def get_transformations(file_id: int, request: Request) -> Any:
 @app.delete("/transformations/{file_id}")
 async def delete_transformations(file_id: int) -> Any:
     try:
-        deleted = await asyncio.to_thread(clear_s2t_transformations, file_id)
-        graph_sync_report, graph_sync_error = await asyncio.to_thread(
+        deleted = await run_sync_compat(clear_s2t_transformations, file_id)
+        graph_sync_report, graph_sync_error = await run_sync_compat(
             try_sync_file_graph,
             file_id,
         )
-        graph_sync_state = await asyncio.to_thread(get_graph_sync_state, file_id)
+        graph_sync_state = await run_sync_compat(get_graph_sync_state, file_id)
         return {
             "status": "partial" if graph_sync_error else "ok",
             "file_id": file_id,
@@ -559,7 +560,7 @@ async def delete_transformations(file_id: int) -> Any:
 @app.delete("/storage")
 async def delete_all_storage() -> Any:
     try:
-        return await asyncio.to_thread(_delete_all_storage_sync)
+        return await run_sync_compat(_delete_all_storage_sync)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -576,7 +577,7 @@ async def classify_sheet_groups_route(file_id: int, request: Request) -> Any:
             "yes",
             "y",
         }
-        return await asyncio.to_thread(
+        return await run_sync_compat(
             classify_file_sheet_groups,
             file_id,
             use_llm=use_llm,

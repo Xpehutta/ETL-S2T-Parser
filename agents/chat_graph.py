@@ -44,7 +44,12 @@ from pydantic import (
     model_validator,
 )
 
-from .async_runtime import ainvoke_compat, ainvoke_graph_compat, run_coroutine_sync
+from .async_runtime import (
+    ainvoke_compat,
+    ainvoke_graph_compat,
+    run_coroutine_sync,
+    run_sync_compat,
+)
 from .contracts import (
     EvidenceFact,
     Observation,
@@ -1688,7 +1693,7 @@ def build_agent_graph(
             if not _tool_message_has_error(message):
                 from .tools.saved_results import persist_sqlite_tool_message
 
-                message = await asyncio.to_thread(
+                message = await run_sync_compat(
                     persist_sqlite_tool_message,
                     message,
                 )

@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from uuid import uuid4
 
 from .agent import build_chat_system_prompt, chat_model
-from .async_runtime import run_coroutine_sync
+from .async_runtime import run_coroutine_sync, run_sync_compat
 from .chat_graph import (
     DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     WorkerCycleTrace,
@@ -77,7 +77,7 @@ async def _select_chat_route_compat(*args: Any, **kwargs: Any) -> Any:
     """Use native async routing, with a legacy sync injection boundary."""
 
     if select_chat_route is not _DEFAULT_SYNC_SELECT_CHAT_ROUTE:
-        return await asyncio.to_thread(select_chat_route, *args, **kwargs)
+        return await run_sync_compat(select_chat_route, *args, **kwargs)
     return await select_chat_route_async(*args, **kwargs)
 
 
@@ -85,7 +85,7 @@ async def _run_worker_graph_compat(**kwargs: Any) -> Any:
     """Use native async graph execution unless a sync adapter is injected."""
 
     if run_worker_graph is not _DEFAULT_SYNC_RUN_WORKER_GRAPH:
-        return await asyncio.to_thread(run_worker_graph, **kwargs)
+        return await run_sync_compat(run_worker_graph, **kwargs)
     return await run_worker_graph_async(**kwargs)
 
 

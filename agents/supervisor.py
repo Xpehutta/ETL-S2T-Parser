@@ -12,7 +12,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, START, StateGraph
 
 from .agent import chat_model
-from .async_runtime import ainvoke_compat, ainvoke_graph_compat, run_coroutine_sync
+from .async_runtime import (
+    ainvoke_compat,
+    ainvoke_graph_compat,
+    run_coroutine_sync,
+    run_sync_compat,
+)
 from .chat_graph import WorkerRunResult
 from .coordinator import (
     COORDINATOR_CONTEXT_MAX_CHARS,
@@ -37,7 +42,7 @@ async def _call_coordinator_chat(task: str, **kwargs: Any) -> Any:
     """Keep legacy injected coordinators off the event loop."""
 
     if coordinator_chat is not _DEFAULT_SYNC_COORDINATOR_CHAT:
-        return await asyncio.to_thread(coordinator_chat, task, **kwargs)
+        return await run_sync_compat(coordinator_chat, task, **kwargs)
     return await coordinator_chat_async(task, **kwargs)
 
 _DELEGATE_TOOL_NAME = "delegate_to_coordinator"

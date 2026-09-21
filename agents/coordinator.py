@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import (
     Any,
@@ -40,7 +41,11 @@ from .agent import chat_model
 from .async_runtime import (
     ainvoke_compat,
     ainvoke_graph_compat,
+    concurrency_slot,
+    offloaded_job_scope,
+    run_sync_compat,
     run_coroutine_sync,
+    server_worker_max_concurrency,
     worker_max_concurrency,
 )
 from .contracts import (
@@ -151,8 +156,26 @@ async def _call_worker_chat(task: WorkerRequestParts) -> WorkerOutcome:
     """Keep legacy injected workers compatible without blocking ASGI."""
 
     if worker_chat is not _DEFAULT_SYNC_WORKER_CHAT:
-        return await asyncio.to_thread(worker_chat, task)
+        return await run_sync_compat(worker_chat, task)
     return await worker_chat_async(task)
+
+
+@asynccontextmanager
+async def _coordinator_runtime_scope() -> Any:
+    """Keep callbacks and saved results alive through offloaded cleanup."""
+    with (
+        saved_result_store_scope(),
+        langfuse_trace_context(
+            trace_name="worker_coordinator",
+            metadata={
+                "max_workers": COORDINATOR_MAX_WORKERS,
+                "max_cycles": COORDINATOR_MAX_CYCLES,
+            },
+            tags=["coordinator", "worker", "experiment"],
+        ),
+    ):
+        async with offloaded_job_scope():
+            yield
 
 COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
@@ -341,6 +364,7 @@ async def _execute_worker_plan_dag(
     )
     if concurrency_limit < 1:
         raise ValueError("worker DAG max_concurrency must be positive")
+    server_concurrency_limit = server_worker_max_concurrency()
 
     groups = plan.ready_groups()
     step_numbers = {
@@ -379,6 +403,7 @@ async def _execute_worker_plan_dag(
             "ended_at_seconds": None,
             "dependency_wait_seconds": None,
             "semaphore_wait_seconds": None,
+            "server_semaphore_wait_seconds": None,
             "status": None,
         }
         for step_id in step_numbers
@@ -443,32 +468,39 @@ async def _execute_worker_plan_dag(
         try:
             await semaphore.acquire()
             acquired = True
-            started_at = perf_counter()
-            async with activity_lock:
-                active_workers += 1
-                active_incremented = True
-                max_observed_concurrency = max(
-                    max_observed_concurrency,
-                    active_workers,
+            local_acquired_at = perf_counter()
+            timing["semaphore_wait_seconds"] = (
+                local_acquired_at - queued_at
+            )
+            async with concurrency_slot("worker"):
+                started_at = perf_counter()
+                timing["server_semaphore_wait_seconds"] = (
+                    started_at - local_acquired_at
                 )
-                concurrent_at_start = active_workers
-            timing.update(
-                {
-                    "started_at_seconds": started_at - scheduler_started,
-                    "semaphore_wait_seconds": started_at - queued_at,
-                    "concurrent_at_start": concurrent_at_start,
-                }
-            )
-            logger.info(
-                "Coordinator dispatches DAG worker step_id=%s step=%s "
-                "depends_on=%s previous_results=%s",
-                step_id,
-                step_numbers[step_id],
-                step.depends_on,
-                len(previous_results),
-            )
-            outcome = await runner(request)
-            timing["status"] = outcome.status
+                async with activity_lock:
+                    active_workers += 1
+                    active_incremented = True
+                    max_observed_concurrency = max(
+                        max_observed_concurrency,
+                        active_workers,
+                    )
+                    concurrent_at_start = active_workers
+                timing.update(
+                    {
+                        "started_at_seconds": started_at - scheduler_started,
+                        "concurrent_at_start": concurrent_at_start,
+                    }
+                )
+                logger.info(
+                    "Coordinator dispatches DAG worker step_id=%s step=%s "
+                    "depends_on=%s previous_results=%s",
+                    step_id,
+                    step_numbers[step_id],
+                    step.depends_on,
+                    len(previous_results),
+                )
+                outcome = await runner(request)
+                timing["status"] = outcome.status
         except asyncio.CancelledError as exc:
             timing["status"] = (
                 "cancelled_running"
@@ -640,6 +672,7 @@ async def _execute_worker_plan_dag(
                 "dag_depth": len(groups),
                 "max_parallel_width": max(len(group) for group in groups),
                 "worker_max_concurrency": concurrency_limit,
+                "server_worker_max_concurrency": server_concurrency_limit,
                 "max_observed_concurrency": max_observed_concurrency,
                 "blocked_count": sum(
                     item["status"] == "blocked_by_dependency"
@@ -2273,7 +2306,7 @@ def build_coordinator_graph(
                 }
             else:
                 try:
-                    resolution = await asyncio.to_thread(
+                    resolution = await run_sync_compat(
                         resolve_test_protocol_contract,
                         raw_protocol_contract,
                         callbacks=callback_list,
@@ -2341,12 +2374,12 @@ def build_coordinator_graph(
                     else:
                         protocol_contract = resolution.contract
                         assert protocol_contract is not None
-                        protocol_reader_results = await asyncio.to_thread(
+                        protocol_reader_results = await run_sync_compat(
                             read_test_protocol_inputs,
                             protocol_contract,
                             callbacks=callback_list,
                         )
-                        compiled_protocol = await asyncio.to_thread(
+                        compiled_protocol = await run_sync_compat(
                             compile_test_protocol,
                             protocol_contract,
                             reader_results=protocol_reader_results,
@@ -2587,7 +2620,7 @@ def build_coordinator_graph(
                     evidence_namespace=f"cycle-{state['cycle']}",
                 )
 
-            result = await asyncio.to_thread(run_pipeline)
+            result = await run_sync_compat(run_pipeline)
 
         operation_trace = {
             **result.metrics_payload(),
@@ -3060,17 +3093,7 @@ async def coordinator_chat_async(
         "run_name": "worker_coordinator",
     }
 
-    with (
-        saved_result_store_scope(),
-        langfuse_trace_context(
-            trace_name="worker_coordinator",
-            metadata={
-                "max_workers": COORDINATOR_MAX_WORKERS,
-                "max_cycles": COORDINATOR_MAX_CYCLES,
-            },
-            tags=["coordinator", "worker", "experiment"],
-        ),
-    ):
+    async with _coordinator_runtime_scope():
         try:
             final_state = await ainvoke_graph_compat(
                 graph,

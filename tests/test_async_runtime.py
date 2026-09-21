@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
 from agents.async_runtime import (
     DEFAULT_WORKER_MAX_CONCURRENCY,
+    active_offloaded_job_count,
     ainvoke_compat,
     ainvoke_graph_compat,
     concurrency_slot,
+    offloaded_job_scope,
     run_coroutine_sync,
     worker_max_concurrency,
 )
@@ -47,6 +50,121 @@ async def test_ainvoke_compat_enforces_timeout(monkeypatch):
 
     with pytest.raises(asyncio.TimeoutError):
         await ainvoke_compat(SlowRunnable(), "value")
+
+
+@pytest.mark.asyncio
+async def test_sync_timeout_keeps_job_and_permit_until_thread_finishes(
+    monkeypatch,
+):
+    monkeypatch.setenv("ASYNC_COMPAT_SYNC_FALLBACK", "1")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "1")
+    entered = threading.Event()
+    release = threading.Event()
+    native_calls = 0
+
+    class SlowSyncRunnable:
+        def invoke(self, _value):
+            entered.set()
+            release.wait(timeout=2)
+            return "late"
+
+    class NativeRunnable:
+        async def ainvoke(self, value):
+            nonlocal native_calls
+            native_calls += 1
+            return value
+
+    async with offloaded_job_scope():
+        timed = asyncio.create_task(
+            ainvoke_compat(SlowSyncRunnable(), "first", timeout=0.01)
+        )
+        deadline = time.monotonic() + 1
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        assert entered.is_set()
+
+        await asyncio.sleep(0.03)
+        assert not timed.done()
+        assert active_offloaded_job_count() == 1
+
+        second = asyncio.create_task(
+            ainvoke_compat(NativeRunnable(), "second", timeout=1)
+        )
+        await asyncio.sleep(0)
+        assert not second.done()
+        assert native_calls == 0
+
+        release.set()
+        with pytest.raises(asyncio.TimeoutError):
+            await timed
+        assert await second == "second"
+        assert active_offloaded_job_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_timeout_keeps_saved_result_store_open(monkeypatch):
+    from agents.tools.saved_results import saved_result_store_scope
+
+    monkeypatch.setenv("ASYNC_COMPAT_SYNC_FALLBACK", "1")
+    entered = threading.Event()
+    release = threading.Event()
+
+    with saved_result_store_scope() as store:
+        class StoreWriter:
+            def invoke(self, _value):
+                entered.set()
+                release.wait(timeout=2)
+                return store.save_payload(
+                    source_tool="run_sql",
+                    payload={"rows": [{"value": "late"}]},
+                )
+
+        async with offloaded_job_scope():
+            timed = asyncio.create_task(
+                ainvoke_compat(StoreWriter(), "value", timeout=0.01)
+            )
+            deadline = time.monotonic() + 1
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0)
+            assert entered.is_set()
+            await asyncio.sleep(0.03)
+            assert not timed.done()
+            assert store.path.exists()
+
+            release.set()
+            with pytest.raises(asyncio.TimeoutError):
+                await timed
+            assert len(store.descriptors()) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_drains_registered_sync_job():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_operation():
+        entered.set()
+        release.wait(timeout=2)
+        return "done"
+
+    from agents.async_runtime import run_sync_compat
+
+    async with offloaded_job_scope():
+        task = asyncio.create_task(run_sync_compat(blocking_operation))
+        deadline = time.monotonic() + 1
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        assert entered.is_set()
+
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert active_offloaded_job_count() == 1
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert active_offloaded_job_count() == 0
 
 
 @pytest.mark.asyncio
@@ -159,6 +277,18 @@ async def test_ainvoke_compat_offloads_sync_only_runnable(with_config):
         {"config": config, "marker": 3} if with_config else {"marker": 3}
     )
     assert seen["thread"] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_sync_fallback_must_be_explicitly_enabled(monkeypatch):
+    class SyncRunnable:
+        def invoke(self, value):
+            return value
+
+    monkeypatch.setenv("ASYNC_COMPAT_SYNC_FALLBACK", "0")
+
+    with pytest.raises(RuntimeError, match="sync fallback is disabled"):
+        await ainvoke_compat(SyncRunnable(), "value")
 
 
 @pytest.mark.asyncio
@@ -291,6 +421,27 @@ async def test_ainvoke_graph_compat_supports_wrapped_async_method(
     )
 
     assert result == "wrapped:state:config"
+
+
+@pytest.mark.asyncio
+async def test_graph_prefers_callable_ainvoke_before_sync_invoke():
+    class WrappedGraph:
+        def ainvoke(self, value, **kwargs):
+            async def deferred():
+                return f"async:{value}:{kwargs.get('config')}"
+
+            return deferred()
+
+        def invoke(self, value, **kwargs):
+            raise AssertionError(f"sync invoke used for {value}: {kwargs}")
+
+    result = await ainvoke_graph_compat(
+        WrappedGraph(),
+        "state",
+        config="config",
+    )
+
+    assert result == "async:state:config"
 
 
 @pytest.mark.asyncio

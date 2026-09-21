@@ -9,8 +9,9 @@ import math
 import os
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from threading import Lock
-from typing import Any, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 from weakref import WeakKeyDictionary
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ T = TypeVar("T")
 DEFAULT_LLM_MAX_CONCURRENCY = 8
 DEFAULT_TOOL_MAX_CONCURRENCY = 16
 DEFAULT_WORKER_MAX_CONCURRENCY = 4
+DEFAULT_SERVER_WORKER_MAX_CONCURRENCY = 16
 DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 120.0
 
@@ -28,6 +30,33 @@ _SEMAPHORES: WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     dict[str, asyncio.Semaphore],
 ] = WeakKeyDictionary()
+
+
+class OffloadedJobRegistry:
+    """Track sync compatibility work that can outlive task cancellation."""
+
+    def __init__(self) -> None:
+        self._jobs: set[asyncio.Task[Any]] = set()
+
+    def register(self, job: asyncio.Task[Any]) -> None:
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
+
+    @property
+    def pending_count(self) -> int:
+        return sum(not job.done() for job in self._jobs)
+
+    async def wait(self) -> None:
+        while pending := [job for job in self._jobs if not job.done()]:
+            await asyncio.gather(
+                *(asyncio.shield(job) for job in pending),
+                return_exceptions=True,
+            )
+
+
+_ACTIVE_OFFLOADED_JOBS: ContextVar[Optional[OffloadedJobRegistry]] = (
+    ContextVar("active_offloaded_jobs", default=None)
+)
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -65,6 +94,22 @@ def worker_max_concurrency() -> int:
     )
 
 
+def server_worker_max_concurrency() -> int:
+    """Return the server-wide worker limit shared by concurrent requests."""
+
+    return _positive_int_env(
+        "SERVER_WORKER_MAX_CONCURRENCY",
+        DEFAULT_SERVER_WORKER_MAX_CONCURRENCY,
+    )
+
+
+def _sync_fallback_enabled() -> bool:
+    raw = os.getenv("ASYNC_COMPAT_SYNC_FALLBACK", "0").strip()
+    if raw not in {"0", "1"}:
+        raise ValueError("ASYNC_COMPAT_SYNC_FALLBACK must be 0 or 1")
+    return raw == "1"
+
+
 def _semaphore(category: str) -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     if category == "llm":
@@ -77,6 +122,8 @@ def _semaphore(category: str) -> asyncio.Semaphore:
             "TOOL_MAX_CONCURRENCY",
             DEFAULT_TOOL_MAX_CONCURRENCY,
         )
+    elif category == "worker":
+        limit = server_worker_max_concurrency()
     else:
         raise ValueError(f"Unknown async concurrency category: {category}")
     key = f"{category}:{limit}"
@@ -92,6 +139,56 @@ async def concurrency_slot(category: str) -> AsyncIterator[None]:
     semaphore = _semaphore(category)
     async with semaphore:
         yield
+
+
+@asynccontextmanager
+async def offloaded_job_scope() -> AsyncIterator[OffloadedJobRegistry]:
+    """Wait for all registered sync jobs before run-scoped resources close."""
+    existing = _ACTIVE_OFFLOADED_JOBS.get()
+    if existing is not None:
+        yield existing
+        return
+    registry = OffloadedJobRegistry()
+    token = _ACTIVE_OFFLOADED_JOBS.set(registry)
+    try:
+        yield registry
+    finally:
+        await registry.wait()
+        _ACTIVE_OFFLOADED_JOBS.reset(token)
+
+
+def active_offloaded_job_count() -> int:
+    registry = _ACTIVE_OFFLOADED_JOBS.get()
+    return registry.pending_count if registry is not None else 0
+
+
+async def run_sync_compat(
+    function: Callable[..., T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    """Offload sync work and delay cancellation until the thread has ended."""
+    job = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    registry = _ACTIVE_OFFLOADED_JOBS.get()
+    if registry is not None:
+        registry.register(job)
+    try:
+        return await asyncio.shield(job)
+    except asyncio.CancelledError as cancellation:
+        while not job.done():
+            try:
+                await asyncio.shield(job)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if job.done() and not job.cancelled():
+            try:
+                job.result()
+            except BaseException:
+                pass
+        raise cancellation
 
 
 async def ainvoke_compat(
@@ -123,22 +220,30 @@ async def ainvoke_compat(
     async def call() -> Any:
         async_method = getattr(runnable, "ainvoke", None)
         if callable(async_method):
-            if config is None:
-                return await async_method(value, **kwargs)
-            return await async_method(value, config=config, **kwargs)
+            result = (
+                async_method(value, **kwargs)
+                if config is None
+                else async_method(value, config=config, **kwargs)
+            )
+            return await result if inspect.isawaitable(result) else result
 
         sync_method = getattr(runnable, "invoke", None)
         if not callable(sync_method):
             raise TypeError(
                 f"{type(runnable).__name__} exposes neither ainvoke nor invoke"
             )
+        if not _sync_fallback_enabled():
+            raise RuntimeError(
+                "sync fallback is disabled; set "
+                "ASYNC_COMPAT_SYNC_FALLBACK=1 only for compatibility"
+            )
         logger.debug(
             "Using thread fallback for sync-only runnable %s",
             type(runnable).__name__,
         )
         if config is None:
-            return await asyncio.to_thread(sync_method, value, **kwargs)
-        return await asyncio.to_thread(
+            return await run_sync_compat(sync_method, value, **kwargs)
+        return await run_sync_compat(
             sync_method,
             value,
             config=config,
@@ -162,26 +267,24 @@ async def ainvoke_graph_compat(
     """Run a compiled graph asynchronously with support for sync-only fakes."""
 
     async_method = getattr(graph, "ainvoke", None)
-    if callable(async_method) and inspect.iscoroutinefunction(async_method):
-        if config is None:
-            return await async_method(value)
-        return await async_method(value, config=config)
-
-    sync_method = getattr(graph, "invoke", None)
-    if callable(sync_method):
-        if config is None:
-            return await asyncio.to_thread(sync_method, value)
-        return await asyncio.to_thread(sync_method, value, config=config)
-
     if callable(async_method):
         result = (
             async_method(value)
             if config is None
             else async_method(value, config=config)
         )
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await result if inspect.isawaitable(result) else result
+
+    sync_method = getattr(graph, "invoke", None)
+    if callable(sync_method):
+        if not _sync_fallback_enabled():
+            raise RuntimeError(
+                "sync fallback is disabled; set "
+                "ASYNC_COMPAT_SYNC_FALLBACK=1 only for compatibility"
+            )
+        if config is None:
+            return await run_sync_compat(sync_method, value)
+        return await run_sync_compat(sync_method, value, config=config)
     raise TypeError(f"{type(graph).__name__} exposes neither ainvoke nor invoke")
 
 
@@ -206,9 +309,15 @@ __all__ = [
     "DEFAULT_LLM_MAX_CONCURRENCY",
     "DEFAULT_TOOL_MAX_CONCURRENCY",
     "DEFAULT_WORKER_MAX_CONCURRENCY",
+    "DEFAULT_SERVER_WORKER_MAX_CONCURRENCY",
+    "OffloadedJobRegistry",
+    "active_offloaded_job_count",
     "ainvoke_graph_compat",
     "ainvoke_compat",
     "concurrency_slot",
+    "offloaded_job_scope",
+    "run_sync_compat",
     "run_coroutine_sync",
+    "server_worker_max_concurrency",
     "worker_max_concurrency",
 ]
