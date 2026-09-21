@@ -718,6 +718,11 @@ def select_chat_route(
             item.model_dump(mode="json", exclude_none=True)
             for item in request_parts.previous_results
         ]
+    if request_parts.dependency_bundles is not None:
+        payload["dependency_bundles"] = [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in request_parts.dependency_bundles
+        ]
     if reroute_context:
         payload["reroute_context"] = dict(reroute_context)
     messages = [
@@ -848,6 +853,11 @@ async def select_chat_route_async(
         payload["previous_results"] = [
             item.model_dump(mode="json", exclude_none=True)
             for item in request_parts.previous_results
+        ]
+    if request_parts.dependency_bundles is not None:
+        payload["dependency_bundles"] = [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in request_parts.dependency_bundles
         ]
     if reroute_context:
         payload["reroute_context"] = dict(reroute_context)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,12 @@ from pydantic import (
 ObservationStatus = Literal["complete", "continue", "reroute"]
 UpstreamAction = Literal["pass", "reroute"]
 WorkerOutcomeStatus = Literal["complete", "partial", "failed"]
+DependencyStatus = Literal[
+    "complete",
+    "partial",
+    "failed",
+    "blocked_by_dependency",
+]
 WorkerStopReason = Literal[
     "no_results",
     "unresolved_entity",
@@ -62,6 +68,7 @@ OperationPipeline = Literal[
     "validation_protocol",
     "sql_risk_scope",
 ]
+PlanOrigin = Literal["explicit_model_dag", "legacy_adapter"]
 MAX_PLAN_STEPS = 8
 _LEGACY_WORKER_STABLE_CONTEXT_MARKER = (
     "\n\nУстойчивые правила контекста:\n"
@@ -115,6 +122,27 @@ class PreviousResultReference(BaseModel):
         return clean_value
 
 
+class DependencyBundle(BaseModel):
+    """Direct parent state delivered separately from its lazy result refs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1)
+    status: DependencyStatus
+    stop_reason: Optional[str] = None
+    previous_results: List[PreviousResultReference] = Field(
+        default_factory=list,
+    )
+
+    @field_validator("step_id")
+    @classmethod
+    def _strip_step_id(cls, value: str) -> str:
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            raise ValueError("dependency step_id must not be blank")
+        return clean_value
+
+
 @dataclass(frozen=True)
 class WorkerRequestParts:
     """Programmatic envelope around the current worker task."""
@@ -124,6 +152,7 @@ class WorkerRequestParts:
     operation_execution_context: str = ""
     operation_completeness_context: str = ""
     previous_results: Optional[List[PreviousResultReference]] = None
+    dependency_bundles: Optional[List[DependencyBundle]] = None
 
 
 def parse_worker_request(value: Any) -> WorkerRequestParts:
@@ -217,6 +246,7 @@ def parse_legacy_worker_request(value: Any) -> WorkerRequestParts:
         operation_execution_context=operation_execution_context.strip(),
         operation_completeness_context=operation_completeness_context.strip(),
         previous_results=previous_results,
+        dependency_bundles=None,
     )
 
 
@@ -660,7 +690,7 @@ class PlanStep(BaseModel):
 
 
 class WorkerPlan(BaseModel):
-    """Validated worker DAG with a legacy linear-plan compatibility path."""
+    """Validated runtime DAG. Legacy conversion is always explicit."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -673,23 +703,38 @@ class WorkerPlan(BaseModel):
             "принятые результаты только перечисленных depends_on."
         ),
     )
+    plan_origin: PlanOrigin = Field(
+        default="explicit_model_dag",
+        exclude=True,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_explicit_runtime_steps(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        raw_steps = value.get("steps")
+        if not isinstance(raw_steps, list):
+            return value
+        for index, raw_step in enumerate(raw_steps, start=1):
+            if not isinstance(raw_step, Mapping):
+                continue
+            missing = [
+                field
+                for field in ("id", "task", "depends_on")
+                if field not in raw_step
+            ]
+            if missing:
+                raise ValueError(
+                    "required runtime plan fields missing at step "
+                    f"{index}: {', '.join(missing)}"
+                )
+        return value
 
     @model_validator(mode="after")
     def _validate_and_normalize_dag(self) -> "WorkerPlan":
-        has_ids = [step.id is not None for step in self.steps]
-        if any(has_ids) and not all(has_ids):
-            raise ValueError("all DAG steps must either provide id or omit it")
-
-        if not any(has_ids):
-            if any(step.depends_on for step in self.steps):
-                raise ValueError("legacy steps without id cannot use depends_on")
-            previous_ids: List[str] = []
-            for index, step in enumerate(self.steps, start=1):
-                step.id = f"step_{index}"
-                # Preserve the old handoff contract exactly: every later
-                # worker can see all accepted results from earlier workers.
-                step.depends_on = list(previous_ids)
-                previous_ids.append(step.id)
+        if any(step.id is None for step in self.steps):
+            raise ValueError("runtime DAG steps require explicit id")
 
         ids = [str(step.id) for step in self.steps]
         duplicate_ids = sorted(
@@ -750,6 +795,97 @@ class WorkerPlan(BaseModel):
             groups.append(ready)
             completed.update(str(step.id) for step in ready)
         return groups
+
+
+class SubmittedPlanStep(PlanStep):
+    """Strict LLM-output step with no normalizing defaults."""
+
+    id: str = Field(
+        description="Уникальный стабильный ID шага.",
+    )
+    depends_on: List[str] = Field(
+        description="Точные ID прямых зависимостей; пусто для root.",
+    )
+
+
+class SubmittedWorkerPlan(BaseModel):
+    """Strict model ingress kept separate from runtime compatibility paths."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: List[SubmittedPlanStep] = Field(
+        min_length=1,
+        max_length=MAX_PLAN_STEPS,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_raw_step_fields(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        raw_steps = value.get("steps")
+        if not isinstance(raw_steps, list):
+            return value
+        for index, raw_step in enumerate(raw_steps, start=1):
+            if not isinstance(raw_step, Mapping):
+                continue
+            missing = [
+                field
+                for field in ("id", "task", "depends_on")
+                if field not in raw_step
+            ]
+            if missing:
+                raise ValueError(
+                    "required submitted plan fields missing at step "
+                    f"{index}: {', '.join(missing)}"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_dag(self) -> "SubmittedWorkerPlan":
+        WorkerPlan.model_validate(
+            {"steps": [step.model_dump() for step in self.steps]}
+        )
+        return self
+
+    def to_worker_plan(self) -> WorkerPlan:
+        return WorkerPlan.model_validate(
+            {
+                "steps": [step.model_dump() for step in self.steps],
+                "plan_origin": "explicit_model_dag",
+            }
+        )
+
+
+def adapt_legacy_worker_plan(
+    steps: Sequence[Mapping[str, Any] | str],
+) -> WorkerPlan:
+    """Explicitly convert the former ordered task list into a linear DAG."""
+    normalized: List[Dict[str, Any]] = []
+    prior_ids: List[str] = []
+    for index, raw_step in enumerate(steps, start=1):
+        if isinstance(raw_step, Mapping):
+            task = str(raw_step.get("task") or "")
+            unexpected = set(raw_step) - {"task"}
+            if unexpected:
+                raise ValueError(
+                    "legacy plan steps accept only task; unexpected fields: "
+                    + ", ".join(sorted(unexpected))
+                )
+        else:
+            task = str(raw_step or "")
+        step_id = f"step_{index}"
+        normalized.append(
+            {
+                "id": step_id,
+                "task": task,
+                "depends_on": list(prior_ids),
+            }
+        )
+        prior_ids.append(step_id)
+    return WorkerPlan.model_validate(
+        {"steps": normalized, "plan_origin": "legacy_adapter"}
+    )
 
 
 class UpstreamOutput(BaseModel):
@@ -838,18 +974,31 @@ class UpstreamDecision(BaseModel):
         clean_value = value.strip()
         return "" if clean_value.casefold() == "null" else clean_value
 
+    @model_validator(mode="after")
+    def _reroute_requires_problem(self) -> "UpstreamDecision":
+        if self.decision == "reroute" and not self.problem:
+            raise ValueError("reroute decision requires a non-empty problem")
+        if len(self.problem) > 2000:
+            raise ValueError("upstream problem exceeds 2000 characters")
+        return self
+
 
 __all__ = [
     "EvidenceArtifact",
     "EvidenceFact",
+    "DependencyBundle",
+    "DependencyStatus",
     "MAX_PLAN_STEPS",
     "Observation",
     "ObservationStatus",
     "PlanStep",
+    "PlanOrigin",
     "PreviousResultReference",
     "PreviousResultSchema",
     "SavedResultColumn",
     "SavedResultDescriptor",
+    "SubmittedPlanStep",
+    "SubmittedWorkerPlan",
     "SqlRiskAspect",
     "OperationPipeline",
     "UpstreamOutput",
@@ -861,6 +1010,7 @@ __all__ = [
     "WorkerOutcomeStatus",
     "WorkerStopReason",
     "WorkerPlan",
+    "adapt_legacy_worker_plan",
     "RerouteReason",
     "WORKER_ORIGINAL_TASK_MARKER",
     "WORKER_PREVIOUS_RESULTS_MARKER",

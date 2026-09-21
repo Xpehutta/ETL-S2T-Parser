@@ -4,11 +4,13 @@ from uuid import uuid4
 import pytest
 
 from agents.contracts import (
+    SubmittedWorkerPlan,
     PreviousResultReference,
     WorkerOutcome,
     WorkerPlan,
+    adapt_legacy_worker_plan,
 )
-from agents.coordinator import _execute_worker_plan_dag
+from agents.coordinator import _execute_worker_plan_dag, _worker_run_manifest
 from agents.run_metrics import capture_agent_run, consume_agent_run_metrics
 
 
@@ -22,6 +24,28 @@ def _result_outcome(name: str) -> WorkerOutcome:
             )
         ],
     )
+
+
+def test_submitted_plan_requires_explicit_id_and_dependencies():
+    with pytest.raises(ValueError, match="required submitted plan fields"):
+        SubmittedWorkerPlan.model_validate(
+            {"steps": [{"task": "A", "depends_on": []}]}
+        )
+    with pytest.raises(ValueError, match="required submitted plan fields"):
+        SubmittedWorkerPlan.model_validate(
+            {"steps": [{"id": "a", "task": "A"}]}
+        )
+
+
+def test_legacy_plan_requires_explicit_adapter():
+    with pytest.raises(ValueError):
+        WorkerPlan.model_validate({"steps": [{"task": "A"}]})
+
+    plan = adapt_legacy_worker_plan([{"task": "A"}, {"task": "B"}])
+
+    assert plan.plan_origin == "legacy_adapter"
+    assert [step.id for step in plan.steps] == ["step_1", "step_2"]
+    assert plan.steps[1].depends_on == ["step_1"]
 
 
 def test_worker_plan_validates_and_layers_a_mixed_dag():
@@ -72,11 +96,11 @@ def test_worker_plan_validates_and_layers_a_mixed_dag():
                 {"id": "a", "task": "A", "depends_on": []},
                 {"task": "B"},
             ],
-            "either provide id or omit it",
+            "required runtime plan fields",
         ),
         (
             [{"task": "A", "depends_on": ["legacy"]}],
-            "legacy steps without id",
+            "required runtime plan fields",
         ),
     ],
 )
@@ -153,8 +177,8 @@ async def test_dag_executes_roots_concurrently_and_passes_only_dependencies(
 
 @pytest.mark.asyncio
 async def test_legacy_plan_remains_linear_and_keeps_all_previous_results():
-    plan = WorkerPlan.model_validate(
-        {"steps": [{"task": "A"}, {"task": "B"}, {"task": "C"}]}
+    plan = adapt_legacy_worker_plan(
+        [{"task": "A"}, {"task": "B"}, {"task": "C"}]
     )
     active = 0
     max_active = 0
@@ -275,3 +299,138 @@ async def test_dag_worker_failure_cancels_running_sibling():
         for error in captured.value.exceptions
     )
     assert slow_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_structured_failed_parent_blocks_descendant_only():
+    plan = WorkerPlan.model_validate(
+        {
+            "steps": [
+                {"id": "a", "task": "A", "depends_on": []},
+                {"id": "b", "task": "B", "depends_on": []},
+                {"id": "c", "task": "C", "depends_on": ["a"]},
+            ]
+        }
+    )
+    called = []
+
+    async def runner(request):
+        called.append(request.current_task)
+        if request.current_task == "A":
+            return WorkerOutcome(
+                summary="A failed",
+                status="failed",
+                stop_reason="tool_error",
+                unmet_requirements=["source unavailable"],
+            )
+        return _result_outcome(request.current_task.lower())
+
+    runs = await _execute_worker_plan_dag(
+        plan,
+        cycle=1,
+        original_task="failure policy",
+        planner_context="",
+        observer_context="",
+        worker_runner=runner,
+        max_concurrency=2,
+    )
+
+    assert called == ["A", "B"]
+    assert [run["terminal_status"] for run in runs] == [
+        "failed",
+        "complete",
+        "blocked_by_dependency",
+    ]
+    assert runs[2]["outcome"] is None
+    manifest = _worker_run_manifest(runs)
+    assert manifest == [
+        {
+            "step_id": "a",
+            "depends_on": [],
+            "status": "failed",
+            "stop_reason": "tool_error",
+            "evidence_count": 0,
+            "result_count": 0,
+        },
+        {
+            "step_id": "b",
+            "depends_on": [],
+            "status": "complete",
+            "stop_reason": None,
+            "evidence_count": 0,
+            "result_count": 1,
+        },
+        {
+            "step_id": "c",
+            "depends_on": ["a"],
+            "status": "blocked_by_dependency",
+            "stop_reason": "blocked_by_dependency",
+            "evidence_count": 0,
+            "result_count": 0,
+        },
+    ]
+    assert all("summary" not in item for item in manifest)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_result", [False, True])
+async def test_partial_parent_requires_usable_result_for_child(has_result):
+    plan = WorkerPlan.model_validate(
+        {
+            "steps": [
+                {"id": "a", "task": "A", "depends_on": []},
+                {"id": "c", "task": "C", "depends_on": ["a"]},
+            ]
+        }
+    )
+    child_request = None
+
+    async def runner(request):
+        nonlocal child_request
+        if request.current_task == "A":
+            return WorkerOutcome(
+                summary="A partial",
+                status="partial",
+                stop_reason="truncated_source",
+                unmet_requirements=["remaining rows"],
+                previous_results=(
+                    [
+                        PreviousResultReference(
+                            result_id="result_a",
+                            description="partial result from A",
+                        )
+                    ]
+                    if has_result
+                    else []
+                ),
+            )
+        child_request = request
+        return _result_outcome("c")
+
+    runs = await _execute_worker_plan_dag(
+        plan,
+        cycle=1,
+        original_task="partial policy",
+        planner_context="",
+        observer_context="",
+        worker_runner=runner,
+        max_concurrency=2,
+    )
+
+    if not has_result:
+        assert child_request is None
+        assert runs[1]["terminal_status"] == "blocked_by_dependency"
+        return
+
+    assert child_request is not None
+    assert [item.result_id for item in child_request.previous_results] == [
+        "result_a"
+    ]
+    assert len(child_request.dependency_bundles) == 1
+    bundle = child_request.dependency_bundles[0]
+    assert bundle.step_id == "a"
+    assert bundle.status == "partial"
+    assert bundle.stop_reason == "truncated_source"
+    assert [item.result_id for item in bundle.previous_results] == [
+        "result_a"
+    ]

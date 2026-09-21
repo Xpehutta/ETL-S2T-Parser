@@ -44,11 +44,13 @@ from .async_runtime import (
     worker_max_concurrency,
 )
 from .contracts import (
+    DependencyBundle,
     EvidenceArtifact,
     MAX_PLAN_STEPS,
     OperationPipeline,
     PlanStep,
     SqlRiskAspect,
+    SubmittedWorkerPlan,
     UpstreamDecision,
     UpstreamOutput,
     WorkerOutcome,
@@ -264,7 +266,14 @@ class CoordinatorWorkerRun(TypedDict):
     step: int
     step_id: str
     depends_on: List[str]
-    outcome: WorkerOutcome
+    terminal_status: Literal[
+        "complete",
+        "partial",
+        "failed",
+        "blocked_by_dependency",
+    ]
+    stop_reason: Optional[str]
+    outcome: Optional[WorkerOutcome]
 
 
 class CoordinatorGraphState(TypedDict):
@@ -281,6 +290,32 @@ class CoordinatorGraphState(TypedDict):
     upstream_output: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     selected_display_refs: List[str]
+
+
+def _worker_run_manifest(
+    runs: Sequence[CoordinatorWorkerRun],
+) -> List[Dict[str, Any]]:
+    """Project terminal DAG state without summaries, rows or runtime refs."""
+    manifest: List[Dict[str, Any]] = []
+    for run in runs:
+        outcome = run["outcome"]
+        manifest.append(
+            {
+                "step_id": run["step_id"],
+                "depends_on": list(run["depends_on"]),
+                "status": run["terminal_status"],
+                "stop_reason": run["stop_reason"],
+                "evidence_count": (
+                    len(outcome.evidence) if outcome is not None else 0
+                ),
+                "result_count": (
+                    len(outcome.previous_results)
+                    if outcome is not None
+                    else 0
+                ),
+            }
+        )
+    return manifest
 
 
 async def _execute_worker_plan_dag(
@@ -320,12 +355,32 @@ async def _execute_worker_plan_dag(
     scheduler_started = perf_counter()
     timings: Dict[str, Dict[str, Any]] = {}
 
-    def dependency_results(step: PlanStep) -> List[Any]:
-        references: List[Any] = []
-        seen_ids: set[str] = set()
+    def dependency_bundles(step: PlanStep) -> List[DependencyBundle]:
+        bundles: List[DependencyBundle] = []
         for dependency_id in step.depends_on:
             dependency_run = completed[dependency_id]
-            for reference in dependency_run["outcome"].previous_results:
+            outcome = dependency_run["outcome"]
+            bundles.append(
+                DependencyBundle(
+                    step_id=dependency_id,
+                    status=dependency_run["terminal_status"],
+                    stop_reason=dependency_run["stop_reason"],
+                    previous_results=(
+                        list(outcome.previous_results)
+                        if outcome is not None
+                        else []
+                    ),
+                )
+            )
+        return bundles
+
+    def dependency_results(
+        bundles: Sequence[DependencyBundle],
+    ) -> List[Any]:
+        references: List[Any] = []
+        seen_ids: set[str] = set()
+        for bundle in bundles:
+            for reference in bundle.previous_results:
                 if reference.result_id in seen_ids:
                     continue
                 seen_ids.add(reference.result_id)
@@ -339,13 +394,17 @@ async def _execute_worker_plan_dag(
     ) -> CoordinatorWorkerRun:
         nonlocal active_workers, max_observed_concurrency
         step_id = str(step.id)
-        previous_results = dependency_results(step)
+        bundles = dependency_bundles(step)
+        previous_results = dependency_results(bundles)
         request = WorkerRequestParts(
             current_task=step.task,
             original_task=original_task,
             operation_execution_context=planner_context,
             operation_completeness_context=observer_context,
-            previous_results=(previous_results or None),
+            previous_results=(
+                previous_results if step.depends_on else None
+            ),
+            dependency_bundles=(bundles if step.depends_on else None),
         )
         queued_at = perf_counter()
         timing: Dict[str, Any] = {
@@ -417,16 +476,73 @@ async def _execute_worker_plan_dag(
             "step": step_numbers[step_id],
             "step_id": step_id,
             "depends_on": list(step.depends_on),
+            "terminal_status": outcome.status,
+            "stop_reason": outcome.stop_reason,
             "outcome": outcome,
         }
 
     try:
         for layer, ready_steps in enumerate(groups, start=1):
+            runnable_steps: List[PlanStep] = []
+            for step in ready_steps:
+                blockers = []
+                for dependency_id in step.depends_on:
+                    dependency_run = completed[dependency_id]
+                    dependency_outcome = dependency_run["outcome"]
+                    status = dependency_run["terminal_status"]
+                    if status in {"failed", "blocked_by_dependency"}:
+                        blockers.append(dependency_id)
+                    elif (
+                        status == "partial"
+                        and (
+                            dependency_outcome is None
+                            or not dependency_outcome.previous_results
+                        )
+                    ):
+                        blockers.append(dependency_id)
+                if not blockers:
+                    runnable_steps.append(step)
+                    continue
+
+                step_id = str(step.id)
+                now = perf_counter()
+                timings[step_id] = {
+                    "step_id": step_id,
+                    "depends_on": list(step.depends_on),
+                    "layer": layer,
+                    "queued_at_seconds": now - scheduler_started,
+                    "started_at_seconds": None,
+                    "ended_at_seconds": now - scheduler_started,
+                    "dependency_wait_seconds": now - scheduler_started,
+                    "semaphore_wait_seconds": 0.0,
+                    "status": "blocked_by_dependency",
+                    "blocked_by": blockers,
+                }
+                completed[step_id] = {
+                    "cycle": cycle,
+                    "step": step_numbers[step_id],
+                    "step_id": step_id,
+                    "depends_on": list(step.depends_on),
+                    "terminal_status": "blocked_by_dependency",
+                    "stop_reason": "blocked_by_dependency",
+                    "outcome": None,
+                }
+                record_worker_outcome(
+                    cycle=cycle,
+                    step=step_numbers[step_id],
+                    status="blocked_by_dependency",
+                    stop_reason="blocked_by_dependency",
+                    unmet_requirements=[
+                        "Blocked by dependency: " + ", ".join(blockers)
+                    ],
+                    evidence_count=0,
+                    dataset_count=0,
+                )
             tasks: List[
                 tuple[PlanStep, asyncio.Task[CoordinatorWorkerRun]]
             ] = []
             async with asyncio.TaskGroup() as task_group:
-                for step in ready_steps:
+                for step in runnable_steps:
                     tasks.append(
                         (
                             step,
@@ -752,13 +868,14 @@ self-dependency, missing dependency и cycles. Независимые чтени
 """.strip()
 
 _UPSTREAM_DATA_DECISION_PROMPT = f"""
-Проверь `evidence` для `original_task`. Верни один native call
+Проверь `evidence` и `execution_manifest` для `original_task`.
+Верни один native call
 `{_UPSTREAM_DATA_DECISION_TOOL_NAME}`:
 
 - `decision="pass"`, если можно дать конечный ответ;
 - `decision="reroute"`, если нужен новый цикл чтения.
 
-При reroute `problem` кратко описывает недостающие данные downstream-плану.
+При reroute непустой `problem` описывает недостающие данные новому плану.
 Не формируй пользовательский ответ и не выбирай display-results.
 
 В `problem` не предлагай имена таблиц, колонок, схем, технические синонимы или
@@ -767,10 +884,12 @@ _UPSTREAM_DATA_DECISION_PROMPT = f"""
 В evidence: `evidence_id`, `tool_name`, точные `args`, фактический `preview`,
 `truncated`, `displayable`. Args подтверждают область чтения, preview — данные.
 Не додумывай; `truncated=true` не подтверждает полный набор.
+В manifest `failed`/`blocked_by_dependency` не являются успехом, а `partial`
+подтверждает лишь переданные evidence/results.
 
 Сопоставь каждый запрошенный результат и scope с прямым evidence. Для сравнения,
 разности множеств или производной метрики нужны evidence всех операндов;
-отсутствующий операнд не равен пустому множеству или нулю. Нельзя считать
+отсутствующий операнд не доказывает пустое множество или ноль. Нельзя считать
 значение одной метрики подтверждением другой.
 
 Промежуточный список кандидатов не подтверждает связь, правило, маппинг или
@@ -779,7 +898,8 @@ lineage. Если original_task требует следующего источн
 
 _UPSTREAM_ANSWER_PROMPT = f"""
 Ты upstream answer coordinator. Предварительная проверка уже вернула `pass`.
-Вход содержит `original_task` и принятые `evidence`. Сам выполни запрошенный
+Вход содержит `original_task`, обязательный `execution_manifest` и принятые
+`evidence`. Сам выполни запрошенный
 анализ и верни ровно один native call `{_UPSTREAM_ANSWER_TOOL_NAME}` с готовым
 `answer`. При наличии подтверждающих evidence передай `used_evidence_ids` и
 нужные `display_evidence_ids`.
@@ -790,6 +910,8 @@ Evidence содержит `evidence_id`, `tool_name`, точные `args`, фа�
 `truncated=true` не утверждай полноту набора. `display_evidence_ids` выбирай
 как `evidence_id` только у результатов с `displayable=true` и включай также в
 `used_evidence_ids`.
+Manifest содержит terminal status всех шагов. Не представляй failed/blocked
+шаг как выполненный; на последнем цикле явно отрази связанную нехватку данных.
 
 Если `answer` вводит физический идентификатор таблицы, поля или схемы, которого
 нет в `original_task`, выбери подтверждающий его displayable evidence также в
@@ -815,7 +937,8 @@ workers, tools, previews, result refs и внутреннюю схему.
 _UPSTREAM_DATA_DECISION_REPAIR_PROMPT = f"""
 Предыдущий native call решения о данных не соответствует схеме. Верни ровно один
 `{_UPSTREAM_DATA_DECISION_TOOL_NAME}` с обязательным `decision`: `pass` или
-`reroute`. `problem` опционален. Не формируй ответ и не выбирай evidence.
+`reroute`. Для `reroute` обязателен непустой bounded `problem`. Не формируй
+ответ и не выбирай evidence.
 """.strip()
 
 _UPSTREAM_ANSWER_REPAIR_PROMPT = f"""
@@ -2265,10 +2388,10 @@ def build_coordinator_graph(
             stage="downstream_plan",
         )
         try:
-            plan = _native_payload(
+            submitted_plan = _native_payload(
                 plan_result,
                 _PLAN_TOOL_NAME,
-                WorkerPlan,
+                SubmittedWorkerPlan,
             )
         except CoordinatorResponseError as first_error:
             logger.warning(
@@ -2288,17 +2411,19 @@ def build_coordinator_graph(
                 ),
                 stage="downstream_plan",
             )
-            plan = _native_payload(
+            submitted_plan = _native_payload(
                 repaired_result,
                 _PLAN_TOOL_NAME,
-                WorkerPlan,
+                SubmittedWorkerPlan,
             )
-            assert isinstance(plan, WorkerPlan)
-        assert isinstance(plan, WorkerPlan)
+            assert isinstance(submitted_plan, SubmittedWorkerPlan)
+        assert isinstance(submitted_plan, SubmittedWorkerPlan)
+        plan = submitted_plan.to_worker_plan()
         recorded_plan = [
             {
                 "cycle": state["cycle"],
                 "step": index,
+                "plan_origin": plan.plan_origin,
                 **step.model_dump(mode="json", exclude_none=True),
                 "operation_skills": list(operation_skills),
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
@@ -2498,10 +2623,14 @@ def build_coordinator_graph(
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
         evidence_payload: List[Dict[str, Any]] = []
+        execution_manifest = _worker_run_manifest(state["worker_runs"])
         for run in state["worker_runs"]:
-            outcome_payload = run["outcome"].upstream_payload()
+            outcome = run["outcome"]
+            if outcome is None:
+                continue
+            outcome_payload = outcome.upstream_payload()
             evidence_payload.extend(outcome_payload["evidence"])
-            for artifact in run["outcome"].evidence:
+            for artifact in outcome.evidence:
                 if artifact.evidence_id in available_evidence_ids:
                     raise CoordinatorResponseError(
                         "Workers вернули дублирующий evidence_id: "
@@ -2515,6 +2644,7 @@ def build_coordinator_graph(
         upstream_payload = {
             "original_task": state["task"],
             "evidence": evidence_payload,
+            "execution_manifest": execution_manifest,
         }
         decision_messages: List[BaseMessage] = [
             SystemMessage(
@@ -2666,6 +2796,29 @@ def build_coordinator_graph(
         answer_payload = dict(upstream_payload)
         if decision.problem:
             answer_payload["data_problem"] = decision.problem
+        incomplete_steps = [
+            item
+            for item in execution_manifest
+            if item["status"] in {
+                "partial",
+                "failed",
+                "blocked_by_dependency",
+            }
+        ]
+        forced_final_problem = ""
+        if (
+            state["cycle"] >= COORDINATOR_MAX_CYCLES
+            and incomplete_steps
+        ):
+            forced_final_problem = (
+                "Не все чтения дали полный результат: "
+                + ", ".join(
+                    f"{item['step_id']} ({item['status']})"
+                    for item in incomplete_steps
+                )
+                + "."
+            )
+            answer_payload.setdefault("data_problem", forced_final_problem)
         answer_messages: List[BaseMessage] = [
             SystemMessage(
                 content="\n\n".join(
@@ -2684,7 +2837,16 @@ def build_coordinator_graph(
         ]
         _, evidence = await invoke_answer(answer_messages)
 
-        upstream_output = evidence.model_dump()
+        final_answer = evidence.answer
+        if (
+            forced_final_problem
+            and forced_final_problem.casefold() not in final_answer.casefold()
+        ):
+            final_answer = f"{final_answer}\n\n{forced_final_problem}"
+        upstream_output = {
+            **evidence.model_dump(),
+            "answer": final_answer,
+        }
         selected_display_refs = [
             available_display_refs[evidence_id]
             for evidence_id in evidence.display_evidence_ids
@@ -2698,7 +2860,7 @@ def build_coordinator_graph(
         )
         return {
             "upstream_output": upstream_output,
-            "final_answer": evidence.answer,
+            "final_answer": final_answer,
             "selected_display_refs": selected_display_refs,
         }
 

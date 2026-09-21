@@ -327,6 +327,7 @@ class AgentGraphState(TypedDict):
     planner_operation_context: str
     observer_operation_context: str
     previous_results: Optional[List[Dict[str, Any]]]
+    dependency_bundles: Optional[List[Dict[str, Any]]]
     planner_message: Optional[AIMessage]
     observations: List[Observation]
     cycle_history: List[WorkerCycleTrace]
@@ -912,11 +913,17 @@ def _previous_results_message(
 ) -> Optional[HumanMessage]:
     """Expose typed lazy references separately from the literal worker task."""
     previous_results = state.get("previous_results")
-    if not previous_results:
+    dependency_bundles = state.get("dependency_bundles")
+    if previous_results is None and dependency_bundles is None:
         return None
+    payload: Dict[str, Any] = {}
+    if previous_results is not None:
+        payload["previous_results"] = previous_results
+    if dependency_bundles is not None:
+        payload["dependency_bundles"] = dependency_bundles
     return HumanMessage(
         content=json.dumps(
-            {"previous_results": previous_results},
+            payload,
             ensure_ascii=False,
         )
     )
@@ -1800,6 +1807,7 @@ def build_agent_graph(
 
         current_user_request = _last_user_query(state["messages"])
         previous_results = state.get("previous_results")
+        dependency_bundles = state.get("dependency_bundles")
         operation_observer_context = str(
             state.get("observer_operation_context")
             or ""
@@ -1830,6 +1838,8 @@ def build_agent_graph(
         }
         if previous_results is not None:
             payload["previous_results"] = previous_results
+        if dependency_bundles is not None:
+            payload["dependency_bundles"] = dependency_bundles
 
         prior_state_rule = (
             "`prior_state` и `accepted_evidence` накоплены ранее. Верни "
@@ -2317,6 +2327,14 @@ async def run_worker_graph_async(
                 for item in request_parts.previous_results
             ]
             if request_parts.previous_results is not None
+            else None
+        ),
+        "dependency_bundles": (
+            [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in request_parts.dependency_bundles
+            ]
+            if request_parts.dependency_bundles is not None
             else None
         ),
         "planner_message": None,

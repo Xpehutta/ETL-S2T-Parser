@@ -24,6 +24,25 @@ from agents.tools.saved_results import (
 
 def _tool_message(name, args, call_id):
     clean_args = dict(args)
+    if name == "submit_worker_plan":
+        raw_steps = clean_args.get("steps")
+        if isinstance(raw_steps, list) and all(
+            isinstance(item, dict) and set(item) <= {"task"}
+            for item in raw_steps
+        ):
+            prior_ids = []
+            explicit_steps = []
+            for index, item in enumerate(raw_steps, start=1):
+                step_id = f"step_{index}"
+                explicit_steps.append(
+                    {
+                        "id": step_id,
+                        "task": item.get("task"),
+                        "depends_on": list(prior_ids),
+                    }
+                )
+                prior_ids.append(step_id)
+            clean_args["steps"] = explicit_steps
     if name == "submit_upstream_output":
         action = str(clean_args.pop("action", "answer") or "answer")
         if action == "request_more_data":
@@ -943,6 +962,7 @@ def test_coordinator_records_candidate_protocol_attestation(monkeypatch):
 
     assert result.answer == "JOIN может размножить строки."
     recorded_step = record_plan.call_args.args[0][0]
+    assert recorded_step["plan_origin"] == "explicit_model_dag"
     assert recorded_step["operation_sql_risk_protocol"] == candidate
     assert recorded_step["operation_sql_risk_protocol_sha256"] == (
         protocol_variant_sha256(candidate)
@@ -1306,7 +1326,11 @@ def test_agentic_write_semantics_keeps_analysis_model_owned(
     assert any(name == "submit_upstream_answer" for name, _ in model.messages)
 
     decision_payload = _payload(model, "submit_upstream_data_decision")
-    assert set(decision_payload) == {"original_task", "evidence"}
+    assert set(decision_payload) == {
+        "original_task",
+        "evidence",
+        "execution_manifest",
+    }
     assert "deterministic_write_semantics" not in decision_payload
     record_upstream.assert_called_once()
     recorded_output = record_upstream.call_args.args[0]
@@ -2417,16 +2441,14 @@ def test_sql_risk_operation_skill_separates_risk_layers_by_stage():
     assert "отсечение входных строк самим SQL" not in contexts["observer"]
 
 
-def test_plan_normalizes_legacy_steps_to_a_linear_dag():
-    from agents.coordinator import WorkerPlan
+def test_explicit_adapter_normalizes_legacy_steps_to_a_linear_dag():
+    from agents.contracts import adapt_legacy_worker_plan
 
-    plan = WorkerPlan.model_validate(
-        {
-            "steps": [
-                {"task": "  Первый шаг.  "},
-                {"task": "Второй шаг."},
-            ]
-        }
+    plan = adapt_legacy_worker_plan(
+        [
+            {"task": "  Первый шаг.  "},
+            {"task": "Второй шаг."},
+        ]
     )
     assert [step.task for step in plan.steps] == [
         "Первый шаг.",
@@ -2452,22 +2474,20 @@ def test_plan_normalizes_legacy_steps_to_a_linear_dag():
     }
     for field_name, field_value in obsolete_fields.items():
         with pytest.raises(ValueError, match=field_name):
-            WorkerPlan.model_validate(
-                {
-                    "steps": [
-                        {
-                            "task": "Первый шаг.",
-                            field_name: field_value,
-                        }
-                    ]
-                }
+            adapt_legacy_worker_plan(
+                [
+                    {
+                        "task": "Первый шаг.",
+                        field_name: field_value,
+                    }
+                ]
             )
 
     with pytest.raises(ValueError, match="task"):
-        WorkerPlan.model_validate({"steps": [{}]})
+        adapt_legacy_worker_plan([{}])
 
     with pytest.raises(ValueError, match="task"):
-        WorkerPlan.model_validate({"steps": [{"task": "   "}]})
+        adapt_legacy_worker_plan([{"task": "   "}])
 
 
 def test_contracts_keep_runtime_refs_out_of_llm_payloads():
@@ -2937,21 +2957,23 @@ def test_upstream_native_tools_enforce_linear_payloads():
     assert valid_request.decision == "reroute"
     assert valid_request.problem == "Не найден исходный путь."
 
-    request_without_problem = _native_upstream_decision(
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "submit_upstream_data_decision",
-                    "args": {"decision": "reroute"},
-                    "id": "request-without-problem",
-                    "type": "tool_call",
-                }
-            ],
+    with pytest.raises(
+        CoordinatorResponseError,
+        match="reroute decision requires a non-empty problem",
+    ):
+        _native_upstream_decision(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "submit_upstream_data_decision",
+                        "args": {"decision": "reroute"},
+                        "id": "request-without-problem",
+                        "type": "tool_call",
+                    }
+                ],
+            )
         )
-    )
-    assert request_without_problem.decision == "reroute"
-    assert request_without_problem.problem == ""
 
     with pytest.raises(CoordinatorResponseError, match="decision: Field required"):
         _native_upstream_decision(
@@ -3162,6 +3184,7 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     assert set(upstream) == {
         "original_task",
         "evidence",
+        "execution_manifest",
     }
     assert upstream["original_task"] == (
         "Найди имя для file_id=7 и проверь его."
@@ -3396,6 +3419,7 @@ def test_upstream_receives_partial_worker_evidence():
     assert set(upstream) == {
         "original_task",
         "evidence",
+        "execution_manifest",
     }
     assert upstream["evidence"] == [
         {
@@ -4234,6 +4258,7 @@ def test_upstream_restarts_cleanly_with_only_problem():
     assert set(final_upstream_payload) == {
         "original_task",
         "evidence",
+        "execution_manifest",
     }
     assert [
         item["evidence_id"] for item in final_upstream_payload["evidence"]
@@ -4304,6 +4329,69 @@ def test_coordinator_returns_limited_answer_after_two_data_cycles():
         ),
         display_refs=[],
     )
+
+
+def test_last_cycle_answer_explicitly_reports_failed_steps():
+    from agents.coordinator import coordinator_chat
+
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {"steps": [{"task": "Получи обязательный факт."}]},
+                    "plan-failed-1",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {"steps": [{"task": "Повтори обязательный факт."}]},
+                    "plan-failed-2",
+                ),
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "action": "request_more_data",
+                        "problem": "Обязательный факт не получен.",
+                    },
+                    "reroute-failed",
+                ),
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Подтверждённых данных нет.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-failed",
+                ),
+            ],
+        }
+    )
+    failed = _outcome(
+        "Источник недоступен.",
+        status="failed",
+        stop_reason="tool_error",
+        unmet_requirements=["Обязательный факт не получен."],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[failed, failed],
+        ),
+    ):
+        result = coordinator_chat("Получи обязательный факт.")
+
+    assert result.answer.startswith("Подтверждённых данных нет.")
+    assert "step_1 (failed)" in result.answer
+    answer_payload = _payload(model, "submit_upstream_answer")
+    assert answer_payload["execution_manifest"][0]["status"] == "failed"
+    assert "step_1 (failed)" in answer_payload["data_problem"]
 
 
 def test_coordinator_empty_task_does_not_call_llm():
