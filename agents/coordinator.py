@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import (
@@ -183,6 +184,7 @@ COORDINATOR_CONTEXT_MAX_CHARS = 4000
 UPSTREAM_EVIDENCE_PREVIEW_MAX_CHARS = 2000
 UPSTREAM_EVIDENCE_SERIALIZED_MAX_CHARS = 12000
 _PLAN_TOOL_NAME = "submit_worker_plan"
+_PLAN_STEP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _SQL_RISK_OPERATION_SKILL = "Анализ SQL-рисков"
 _DEFAULT_SQL_RISK_PROTOCOL = "default/current"
 _OPERATION_SKILL_TOOL_NAME = "select_operation_skills"
@@ -1019,8 +1021,9 @@ class CoordinatorResponseError(RuntimeError):
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
 Ты downstream planner. Верни native call `{_PLAN_TOOL_NAME}` с 1–{COORDINATOR_MAX_WORKERS}
-`steps` чтения. Задай уникальный `id`; `depends_on=[]` для независимых steps,
-иначе ID прямых входов. Missing/self dependencies и циклы запрещены.
+`steps` чтения. Задай короткий уникальный ASCII `id` до 64 символов;
+`depends_on=[]` для независимых steps, иначе ID прямых входов. Missing/self
+dependencies и циклы запрещены.
 
 Каждый step незаменим для ответа. Не добавляй незапрошенные проверки,
 обогащение, реализацию и чтение справочника без необходимости.
@@ -1092,7 +1095,8 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` нарушает схему или смысловой контракт.
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь
-уникальный `id`, непустую `task` и `depends_on` с существующими ID. Удали
+уникальный ASCII `id` из 1–64 символов `[A-Za-z0-9_.-]`, начинающийся с буквы
+или цифры, непустую `task` и `depends_on` с существующими ID. Удали
 self-dependency, missing dependency и cycles. Независимые чтения не связывай.
 Сохрани запрошенные роли, объекты, фильтры и результаты. Не придумывай
 идентификаторы, функции, tools или требования. Используй только реальные таблицы
@@ -1565,6 +1569,10 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                         "type": "string",
                                         "minLength": 1,
                                         "maxLength": 64,
+                                        "pattern": (
+                                            "^[A-Za-z0-9]"
+                                            "[A-Za-z0-9_.-]{0,63}$"
+                                        ),
                                     },
                                     "description": (
                                         "ID прямых зависимостей; пусто для "
@@ -1724,6 +1732,105 @@ def _native_call_arguments(message: Any, tool_name: str) -> Mapping[str, Any]:
             f"Coordinator вернул не-object arguments для {tool_name}."
         )
     return arguments
+
+
+def _normalize_plan_identifier_arguments(
+    arguments: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Renumber only lexically invalid opaque DAG IDs and their references.
+
+    Step IDs carry no domain meaning. Some providers occasionally return
+    otherwise valid plans with Cyrillic or other characters outside the
+    advertised ASCII schema. Renumbering the complete ID namespace by declared
+    order is semantics-preserving, while normalizing tasks, missing references,
+    duplicate IDs, or any other schema defect would not be.
+    """
+
+    if set(arguments) != {"steps"}:
+        return None
+    raw_steps = arguments.get("steps")
+    if not isinstance(raw_steps, list) or not (
+        1 <= len(raw_steps) <= COORDINATOR_MAX_WORKERS
+    ):
+        return None
+
+    raw_ids: List[str] = []
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, Mapping) or set(raw_step) != {
+            "id",
+            "task",
+            "depends_on",
+        }:
+            return None
+        raw_id = raw_step.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            return None
+        raw_ids.append(raw_id.strip())
+
+    if len(raw_ids) != len(set(raw_ids)):
+        return None
+    if all(_PLAN_STEP_ID_RE.fullmatch(raw_id) for raw_id in raw_ids):
+        return None
+
+    replacements = {
+        raw_id: f"step_{index}"
+        for index, raw_id in enumerate(raw_ids, start=1)
+    }
+    normalized_steps: List[Dict[str, Any]] = []
+    for raw_step, raw_id in zip(raw_steps, raw_ids):
+        dependencies = raw_step.get("depends_on")
+        if not isinstance(dependencies, list):
+            return None
+        normalized_dependencies: List[str] = []
+        for dependency in dependencies:
+            if not isinstance(dependency, str):
+                return None
+            replacement = replacements.get(dependency.strip())
+            if replacement is None:
+                return None
+            normalized_dependencies.append(replacement)
+        normalized_steps.append(
+            {
+                "id": replacements[raw_id],
+                "task": raw_step.get("task"),
+                "depends_on": normalized_dependencies,
+            }
+        )
+    return {"steps": normalized_steps}
+
+
+def _native_worker_plan(message: Any) -> SubmittedWorkerPlan:
+    """Parse a worker plan, repairing only its opaque ID alphabet locally."""
+
+    try:
+        output = _native_payload(
+            message,
+            _PLAN_TOOL_NAME,
+            SubmittedWorkerPlan,
+        )
+    except CoordinatorResponseError as original_error:
+        try:
+            arguments = _native_call_arguments(message, _PLAN_TOOL_NAME)
+        except CoordinatorResponseError:
+            raise original_error
+        normalized = _normalize_plan_identifier_arguments(arguments)
+        if normalized is None:
+            raise original_error
+        try:
+            output = SubmittedWorkerPlan.model_validate(normalized)
+        except (TypeError, ValueError) as exc:
+            raise CoordinatorResponseError(
+                "Coordinator вернул невалидную структуру "
+                f"{_PLAN_TOOL_NAME} после безопасной нормализации ID: "
+                + str(exc)[:1200]
+            ) from exc
+        logger.warning(
+            "Coordinator plan used non-ASCII/oversized opaque IDs; "
+            "renumbered %s DAG steps while preserving dependencies.",
+            len(output.steps),
+        )
+    assert isinstance(output, SubmittedWorkerPlan)
+    return output
 
 
 def _native_upstream_decision(message: Any) -> UpstreamDecision:
@@ -2632,11 +2739,7 @@ def build_coordinator_graph(
             stage="downstream_plan",
         )
         try:
-            submitted_plan = _native_payload(
-                plan_result,
-                _PLAN_TOOL_NAME,
-                SubmittedWorkerPlan,
-            )
+            submitted_plan = _native_worker_plan(plan_result)
         except CoordinatorResponseError as first_error:
             logger.warning(
                 "Coordinator plan call violated plan schema; requesting "
@@ -2655,11 +2758,7 @@ def build_coordinator_graph(
                 ),
                 stage="downstream_plan",
             )
-            submitted_plan = _native_payload(
-                repaired_result,
-                _PLAN_TOOL_NAME,
-                SubmittedWorkerPlan,
-            )
+            submitted_plan = _native_worker_plan(repaired_result)
             assert isinstance(submitted_plan, SubmittedWorkerPlan)
         assert isinstance(submitted_plan, SubmittedWorkerPlan)
         plan = submitted_plan.to_worker_plan()

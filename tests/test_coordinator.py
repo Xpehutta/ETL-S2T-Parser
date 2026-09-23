@@ -4801,6 +4801,123 @@ def test_coordinator_repairs_plan_that_exceeds_worker_limit():
     assert "непустую `task`" in plan_messages[1][-1].content
 
 
+def test_coordinator_normalizes_oversized_plan_ids_without_llm_repair():
+    from agents.coordinator import coordinator_chat
+
+    first_id = "read_source_" + "a" * 64
+    second_id = "read_dependent_" + "b" * 64
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "id": first_id,
+                                "task": "Получи исходный факт.",
+                                "depends_on": [],
+                            },
+                            {
+                                "id": second_id,
+                                "task": "Получи зависимый факт.",
+                                "depends_on": [first_id],
+                            },
+                        ]
+                    },
+                    "plan-non-ascii",
+                )
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Оба факта получены.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "upstream-normalized-plan",
+                )
+            ],
+        }
+    )
+    first_result = PreviousResultReference(
+        result_id="result-first",
+        description="first_lookup: исходный факт.",
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[
+                _outcome("Исходный факт.", previous_results=[first_result]),
+                _outcome("Зависимый факт."),
+            ],
+        ) as worker,
+    ):
+        result = coordinator_chat("Получи оба факта.")
+
+    assert result.answer == "Оба факта получены."
+    assert worker.call_count == 2
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 1
+    first_request = parse_worker_request(worker.call_args_list[0].args[0])
+    second_request = parse_worker_request(worker.call_args_list[1].args[0])
+    assert first_request.previous_results is None
+    assert [
+        item.result_id for item in (second_request.previous_results or [])
+    ] == ["result-first"]
+
+
+def test_plan_id_normalization_does_not_hide_duplicate_ids():
+    from agents.coordinator import (
+        CoordinatorResponseError,
+        _native_worker_plan,
+    )
+
+    message = _tool_message(
+        "submit_worker_plan",
+        {
+            "steps": [
+                {"id": "поиск", "task": "A", "depends_on": []},
+                {"id": "поиск", "task": "B", "depends_on": []},
+            ]
+        },
+        "duplicate-non-ascii-plan",
+    )
+
+    with pytest.raises(CoordinatorResponseError, match="ASCII letters"):
+        _native_worker_plan(message)
+
+
+def test_plan_id_normalization_does_not_hide_dependency_cycles():
+    from agents.coordinator import (
+        CoordinatorResponseError,
+        _native_worker_plan,
+    )
+
+    message = _tool_message(
+        "submit_worker_plan",
+        {
+            "steps": [
+                {"id": "поиск", "task": "A", "depends_on": ["проверка"]},
+                {"id": "проверка", "task": "B", "depends_on": ["поиск"]},
+            ]
+        },
+        "cyclic-non-ascii-plan",
+    )
+
+    with pytest.raises(CoordinatorResponseError, match="dependency cycle"):
+        _native_worker_plan(message)
+
+
 def test_schema_valid_model_tasks_bypass_semantic_origin_rejection():
     from agents.coordinator import coordinator_chat
 
