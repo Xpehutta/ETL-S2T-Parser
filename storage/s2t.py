@@ -119,7 +119,7 @@ def list_s2t_transformations(
             "rows": [],
         }
     params: List[Any] = []
-    where = ["IFNULL(row_num, 0) >= 0"]
+    where = ["COALESCE(row_num, 0) >= 0"]
     if file_id is not None:
         where.insert(0, "file_id = ?")
         params.append(int(file_id))
@@ -151,7 +151,9 @@ def list_s2t_transformations(
     }
     for field_name, field_value in exact_filters.items():
         if field_value:
-            where.append(f"TRIM({_sql_identifier(field_name)}) = ? COLLATE NOCASE")
+            where.append(
+                f"LOWER(TRIM({_sql_identifier(field_name)})) = LOWER(TRIM(?))"
+            )
             params.append(field_value)
     where_sql = " AND ".join(where)
     selected_columns_sql = ", ".join(
@@ -202,7 +204,7 @@ def verify_s2t_transformations(file_id: int, limit: int = 5) -> Dict[str, Any]:
         """
         SELECT COUNT(*) AS n
         FROM s2t_transformations
-        WHERE file_id = ? AND IFNULL(row_num, 0) >= 0
+        WHERE file_id = ? AND COALESCE(row_num, 0) >= 0
         """,
         (file_id,),
     )
@@ -211,7 +213,7 @@ def verify_s2t_transformations(file_id: int, limit: int = 5) -> Dict[str, Any]:
         f"""
         SELECT row_num, {", ".join(_sql_identifier(field) for field in S2T_RECORD_FIELDS)}
         FROM s2t_transformations
-        WHERE file_id = ? AND IFNULL(row_num, 0) >= 0
+        WHERE file_id = ? AND COALESCE(row_num, 0) >= 0
         ORDER BY row_num
         LIMIT ?
         """,
@@ -277,7 +279,7 @@ def list_s2t_table_names(
         )
         SELECT table_name
         FROM selected_names
-        ORDER BY table_name COLLATE NOCASE, table_name
+        ORDER BY LOWER(table_name), table_name
         LIMIT ?
     """
 
@@ -340,6 +342,13 @@ def summarize_s2t_transformations(
         params.append(clean_file_id)
     params.extend([clean_min_related, clean_limit])
 
+    from .database import is_postgres_backend
+
+    related_tables_aggregate = (
+        f"STRING_AGG(DISTINCT NULLIF(TRIM({related_table_column}), ''), ',')"
+        if is_postgres_backend()
+        else f"GROUP_CONCAT(DISTINCT NULLIF(TRIM({related_table_column}), ''))"
+    )
     query = f"""
         SELECT
             {table_column} AS table_name,
@@ -347,7 +356,7 @@ def summarize_s2t_transformations(
             COUNT(*) AS mapping_count,
             COUNT(DISTINCT NULLIF(TRIM({mapped_field}), '')) AS field_count,
             COUNT(DISTINCT NULLIF(TRIM({related_table_column}), '')) AS related_table_count,
-            GROUP_CONCAT(DISTINCT NULLIF(TRIM({related_table_column}), '')) AS related_tables,
+            {related_tables_aggregate} AS related_tables,
             SUM(
                 CASE
                     WHEN NULLIF(TRIM(transformation_rule), '') IS NOT NULL THEN 1
@@ -407,7 +416,7 @@ def load_s2t_table_graph_rows() -> List[Dict[str, Any]]:
                 target_field,
                 transformation_rule
             FROM s2t_transformations
-            WHERE IFNULL(row_num, 0) >= 0
+            WHERE COALESCE(row_num, 0) >= 0
             ORDER BY id
             """
         ).fetchall()

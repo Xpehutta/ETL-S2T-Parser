@@ -761,7 +761,7 @@ def summarize_table_descriptions(
                 catalog.description
             FROM source_tables AS catalog
             LEFT JOIN files ON files.file_id = catalog.file_id
-            WHERE TRIM(catalog.table_name) = ? COLLATE NOCASE
+            WHERE LOWER(TRIM(catalog.table_name)) = LOWER(TRIM(?))
               {scope_sql}
 
             UNION ALL
@@ -777,7 +777,7 @@ def summarize_table_descriptions(
                 catalog.description
             FROM target_tables AS catalog
             LEFT JOIN files ON files.file_id = catalog.file_id
-            WHERE TRIM(catalog.table_name) = ? COLLATE NOCASE
+            WHERE LOWER(TRIM(catalog.table_name)) = LOWER(TRIM(?))
               {scope_sql}
         )
         SELECT

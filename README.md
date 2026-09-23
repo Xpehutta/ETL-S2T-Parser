@@ -4,7 +4,7 @@
 [![Flask 3](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com/)
 [![LangGraph](https://img.shields.io/badge/agents-LangGraph-orange.svg)](https://www.langchain.com/langgraph)
 
-ETL S2T Agent — chat-first приложение для загрузки и анализа Excel-файлов с Source-to-Target-маппингами. Оно сохраняет исходные факты в SQLite, извлекает S2T- и SQL-lineage, при наличии Neo4j строит графовую проекцию и отвечает на вопросы через многоагентный LangGraph.
+ETL S2T Agent — chat-first приложение для загрузки и анализа Excel-файлов с Source-to-Target-маппингами. Оно сохраняет исходные факты в PostgreSQL (с SQLite fallback для локальной разработки), извлекает S2T- и SQL-lineage, при наличии Neo4j строит графовую проекцию и отвечает на вопросы через многоагентный LangGraph.
 
 > **Актуальное состояние функций:** [отчёт от 15 сентября 2026 года](LIVE_AGENT_ADDED_FEATURES_AND_WORD_9_REPORT_2026-09-15.md). Он описывает добавленные возможности и статус девяти основных Word-требований.
 
@@ -17,18 +17,20 @@ ETL S2T Agent — chat-first приложение для загрузки и а�
 
 - загрузка `.xlsx`, `.xls` и `.xlsm` из единого интерфейса чата;
 - автоматический выбор строки заголовка CatBoost-моделью;
-- сохранение заголовков и значений Excel без обрезки в SQLite;
+- сохранение заголовков и значений Excel без обрезки в основном SQL-хранилище;
 - классификация листов и настраиваемое сопоставление колонок;
 - извлечение S2T, каталогов таблиц, PXF-маппингов и дополнительных объектов;
 - разбор SQL дополнительных объектов через SQLGlot;
-- read-only вопросы к SQLite и Neo4j на естественном языке;
+- read-only вопросы к PostgreSQL/SQLite и Neo4j на естественном языке;
 - полные табличные результаты в отдельном scrollable-блоке, а не в тексте чата;
 - сравнение многоагентного режима с базовым одноагентным режимом;
 - метрики времени, LLM-вызовов, инструментов и токенов для live-сценариев.
 
 ## Архитектура
 
-SQLite является источником исходных фактов. Neo4j хранит только производную проекцию lineage и может быть отключён.
+Настроенное SQL-хранилище является источником исходных фактов: PostgreSQL в
+рабочем окружении либо SQLite fallback. Neo4j хранит только производную
+проекцию lineage и может быть отключён.
 
 ### Загрузка Excel
 
@@ -37,12 +39,12 @@ flowchart LR
     UI["Chat-first UI"] --> API["POST /upload"]
     API --> PARSE["Механический разбор Excel"]
     PARSE --> HEADER["CatBoost: строка заголовка"]
-    HEADER --> SQLITE[("SQLite")]
-    SQLITE --> GROUPS["Классификация групп листов"]
+    HEADER --> STORE[("PostgreSQL / SQLite fallback")]
+    STORE --> GROUPS["Классификация групп листов"]
     GROUPS --> SKILLS["Sheet skills"]
-    SKILLS --> SQLITE
-    SQLITE --> SUMMARY["Summary и description"]
-    SQLITE --> GRAPH["Neo4j projection (опционально)"]
+    SKILLS --> STORE
+    STORE --> SUMMARY["Summary и description"]
+    STORE --> GRAPH["Neo4j projection (опционально)"]
 ```
 
 `processing/excel.py` читает каждый лист один раз, сохраняет исходные номера строк, разворачивает объединённые ячейки данных и по умолчанию исключает скрытые строки. Включить их можно при загрузке в интерфейсе. Ответ загрузки содержит `data_row_count` для каждого листа и `total_data_row_count` для всей книги; это число разобранных строк данных после фильтрации скрытых строк, независимо от числа заполненных ячеек, а одинаковые строки считаются отдельно.
@@ -198,7 +200,7 @@ checks компилируются без него, а check, которому н
 Для impact по колонке `trace_neo4j_lineage` возвращает точные
 `transformation_id`, а `get_s2t_rules_by_ids` одним параметризованным чтением
 получает соответствующие S2T-правила. Planner не генерирует SQL для этого
-перехода между Neo4j и SQLite.
+перехода между Neo4j и основным SQL-хранилищем.
 
 Режим `single_agent` сохранён как базовая линия для live-сравнений:
 
@@ -208,7 +210,30 @@ CHAT_AGENT_MODE=single_agent
 
 ## Хранилище
 
-По умолчанию SQLite создаётся в `excel_data.db`.
+При заданном `DATABASE_URL` основное хранилище работает в PostgreSQL. Без него
+сохраняется совместимый локальный fallback `excel_data.db`. В PostgreSQL
+назначение каждой таблицы и колонки записывается нативно через
+`COMMENT ON TABLE` и `COMMENT ON COLUMN` и доступно в системном каталоге.
+
+Минимальная конфигурация:
+
+```ini
+DATABASE_URL=postgresql://etl_user:change_me@localhost:5432/etl_s2t
+POSTGRES_SCHEMA=public
+POSTGRES_STATEMENT_TIMEOUT_MS=30000
+```
+
+Одноразовая проверяемая миграция существующей SQLite-базы:
+
+```bash
+uv run python scripts/migrate_sqlite_to_postgres.py --source excel_data.db --dry-run
+uv run python scripts/migrate_sqlite_to_postgres.py --source excel_data.db
+```
+
+Миграция проверяет число строк и SHA-256 нормализованных данных каждой таблицы
+до фиксации транзакции. Непустая целевая схема отклоняется; `--replace` нужно
+указывать явно только для заранее проверенной целевой схемы. Временное
+run-scoped хранилище результатов агента остаётся SQLite и не входит в миграцию.
 
 | Таблица | Назначение |
 |---|---|
@@ -258,7 +283,10 @@ uv run python scripts/reindex_description_embeddings.py
 - `ETLColumn` и `TRANSFORMS_TO` — lineage колонок;
 - `ETLTable` и `TABLE_TRANSFORMS_TO` — lineage таблиц.
 
-Если Neo4j выключен или недоступен, SQLite-анализ сохраняется, а ошибка синхронизации возвращается отдельно. Для вопросов по S2T и трансформациям используется SQLite; Neo4j предназначен для путей и lineage.
+Если Neo4j выключен или недоступен, анализ основного SQL-хранилища сохраняется,
+а ошибка синхронизации возвращается отдельно. Для вопросов по S2T и
+трансформациям используется PostgreSQL/SQLite backend; Neo4j предназначен для
+путей и lineage.
 
 ## Быстрый запуск
 
@@ -359,7 +387,7 @@ NEO4J_DATABASE=neo4j
 |---|---|
 | `config/sheet_groups.json` | группы листов и их алиасы |
 | `config/column_mapping.json` | роли и варианты названий Excel-колонок |
-| `config/usefull_col_extraction.json` | группа листа, целевая SQLite-таблица и поля |
+| `config/usefull_col_extraction.json` | группа листа, целевая таблица SQL-хранилища и поля |
 | `config/table_layers.json` | переходы ETL-слоёв по группам листов |
 
 Новые подтверждённые алиасы листов и заголовков добавляются в текущие JSON-конфигурации без дублей.
@@ -621,7 +649,7 @@ storage/database.py            схема и хранение исходных �
 storage/s2t.py                 операции с S2T transformations
 sheet_skills/                  обработчики групп Excel-листов
 services/analysis.py           post-upload pipeline
-services/graph_sync.py         проекция SQLite → Neo4j
+services/graph_sync.py         проекция SQL-хранилища → Neo4j
 graph_storage/                 lifecycle и настройки Neo4j
 agents/supervisor.py           верхний LangGraph
 agents/coordinator.py          выбор pipeline, downstream/workers/upstream
@@ -663,4 +691,4 @@ Langfuse необязателен. Для включения задайте `LAN
 - очистка и повторная запись требуют явного действия пользователя;
 - свободный SQL и Cypher ограничены read-only операциями;
 - полные tool results не размножаются в LLM-контексте;
-- SQLite остаётся источником истины даже при включённом Neo4j.
+- Основное SQL-хранилище остаётся источником истины даже при включённом Neo4j.
