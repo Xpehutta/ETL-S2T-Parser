@@ -2212,6 +2212,22 @@ def _assert_exact_s2t_pair_was_read(
     return calls
 
 
+def _assert_exact_s2t_target_was_read(
+    exchange: _LiveExchange,
+    *,
+    target_table: str,
+) -> list:
+    calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "read_s2t_by_target_table"
+        and item.arguments == {"target_table": target_table}
+    ]
+    assert calls, exchange.metrics.tool_calls
+    assert not [item for item in calls if item.has_error], calls
+    return calls
+
+
 def _assert_exact_s2t_field_pair_was_read(
     exchange: _LiveExchange,
     *,
@@ -3643,6 +3659,52 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
     )
 
     _assert_cardinality_paraphrase(exchange, case)
+
+
+@pytest.mark.live_validation
+def test_live_agent_investigates_two_duplicates_in_final_target_table(
+    live_chat_client,
+):
+    _require_live_semantic_judge()
+    case = _protocol_live_case(
+        require_join=True,
+        require_effective_join_predicate=True,
+        require_target_catalog=True,
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"В физической конечной таблице {case.target_table} обнаружены "
+        "две дублирующиеся строки, но доступа к физическим данным у тебя нет. "
+        "По всем сохранённым входящим S2T найди, где в логике загрузки могли "
+        "появиться эти дубли. Все строки S2T с target_table, равной "
+        f"{case.target_table}, прочитай одним target-only чтением; не разбивай их "
+        "на отдельные source→target-чтения и не читай каталог target_tables. "
+        "Для каждой различающейся source_table и transformation rule проверь JOIN, "
+        "фильтры и формирование ключа. Назови самую вероятную точку размножения "
+        "строк, обе стороны точного JOIN predicate и какой правый JOIN-ключ "
+        "нужно проверить на уникальность. Явно отдели подтверждённую "
+        "структуру SQL от гипотезы о причине: не утверждай, что уникальность ключа или "
+        "фактическая причина доказаны без данных. Не дедуплицируй и не изменяй данные. "
+        "Полный список входящих S2T покажи отдельно в scrollable UI.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    _assert_exact_s2t_target_was_read(
+        exchange,
+        target_table=case.target_table,
+    )
+    assert "read_s2t_by_target_table" in exchange.metrics.display_tools, (
+        exchange.metrics.display_tools
+    )
+    assert exchange.metrics.sql_risk_operation is None, (
+        exchange.metrics.sql_risk_operation
+    )
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools={"read_s2t_by_target_table"},
+        require_analysis=True,
+    )
 
 
 def _assert_scope_has_no_agentic_llm_stages(exchange: _LiveExchange) -> None:
