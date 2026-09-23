@@ -136,7 +136,7 @@ def run_sql(
     export_csv: bool = False,
     preview_limit: int = 20,
 ) -> Dict[str, Any]:
-    """Выполнить составленный агентом или переданный read-only SQL по SQLite.
+    """Выполнить составленный агентом или переданный read-only SQL по ETL-хранилищу.
 
     Используй для read-only агрегаций, JOIN, UNION, подзапросов, оконных функций,
     произвольных выражений и других срезов, которых нет в готовых tools.
@@ -153,7 +153,7 @@ def run_sql(
     source_tables, target_tables, source_columns, target_columns,
     additional_objects, pxf_to_a,
     s2t_transformations и data. Логические ETL-таблицы вида t_* не являются
-    физическими SQLite-таблицами: не выполняй для них PRAGMA и не пиши `FROM t_*`;
+    физическими таблицами хранилища: не выполняй для них системные команды и не пиши `FROM t_*`;
     ищи их имена в source_table/target_table и связанных строках.
 
     Таблица s2t_transformations глобальная: запросы к ней не должны содержать
@@ -167,7 +167,7 @@ def run_sql(
     Не используй для самостоятельного построения lineage, путей и цепочек:
     это сценарий Neo4j. Не используй также для разбора переданного пользователем
     SQL-текста без выполнения: для этого предназначены parse_sql_column_lineage
-    и parse_sql_table_lineage. Поддерживаются SELECT, WITH и EXPLAIN QUERY PLAN.
+    и parse_sql_table_lineage. Поддерживаются SELECT, WITH и EXPLAIN.
     Без CSV-экспорта возвращается не более MAX_INLINE_SQL_ROWS строк. При
     export_csv=True полный результат сохраняется в CSV, а модели возвращается
     только preview. Пустой rows означает пустой результат выполненного запроса,
@@ -182,6 +182,7 @@ def run_sql(
         preview_limit: Число первых строк в preview, от 0 до 100.
     """
     from storage.database import get_db_connection
+    from storage.postgres import is_postgres_error
 
     text = (query or "").strip()
     validation_error = _validate_readonly_sql(text)
@@ -190,13 +191,19 @@ def run_sql(
 
     conn = get_db_connection()
     try:
-        conn.execute("PRAGMA query_only = ON")
-        if hasattr(conn, "set_authorizer"):
+        if hasattr(conn, "set_read_only"):
+            conn.set_read_only()
+        else:
+            conn.execute("PRAGMA query_only = ON")
+        if hasattr(conn, "set_authorizer") and not hasattr(conn, "set_read_only"):
             conn.set_authorizer(_readonly_sql_authorizer)
 
         cursor = conn.cursor()
         cursor.execute(text)
-        columns = [item[0] for item in (cursor.description or [])]
+        columns = [
+            str(getattr(item, "name", None) or item[0])
+            for item in (cursor.description or [])
+        ]
         column_error = _result_column_error(columns)
         if column_error:
             return {
@@ -220,20 +227,19 @@ def run_sql(
             "truncated": truncated,
             "max_inline_rows": MAX_INLINE_SQL_ROWS,
         }
-    except sqlite3.Error as exc:
+    except Exception as exc:
         logger.exception("SQL execution failed")
-        error = (
-            "Exactly one SQL statement is allowed"
-            if "one statement at a time" in str(exc).casefold()
-            else "SQL query failed"
-        )
-        return {
-            "error": error,
-            "error_message": str(exc),
-            "query": text,
-        }
-    except Exception:
-        logger.exception("SQL execution failed")
+        if isinstance(exc, sqlite3.Error) or is_postgres_error(exc):
+            error = (
+                "Exactly one SQL statement is allowed"
+                if "one statement at a time" in str(exc).casefold()
+                else "SQL query failed"
+            )
+            return {
+                "error": error,
+                "error_message": str(exc),
+                "query": text,
+            }
         return {"error": "SQL query failed", "query": text}
     finally:
         conn.close()

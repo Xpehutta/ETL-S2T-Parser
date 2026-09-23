@@ -1,1 +1,1 @@
-"""SQLite persistence repositories."""
+"""Durable SQL persistence repositories and backend adapters."""

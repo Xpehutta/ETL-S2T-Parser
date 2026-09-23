@@ -16,12 +16,14 @@ from storage.database import (
     S2T_TRANSFORMATION_COLUMNS,
     S2T_FIELDS,
     S2T_LAYER_FIELDS,
+    SCHEMA_TABLE_COMMENT_COLUMNS,
     SOURCE_COLUMN_COLUMNS,
     SOURCE_TABLE_COLUMNS,
     STORAGE_SCHEMA_COLUMNS,
     STORAGE_SCHEMA_TABLE_ORDER,
     TARGET_TABLE_COLUMNS,
     TARGET_COLUMN_COLUMNS,
+    TABLE_COMMENTS,
     USER_FACING_TABLES,
     clear_all_data,
     clear_all_data_with_graph_snapshot,
@@ -72,6 +74,16 @@ def test_init_db(temp_db):
     cursor.execute("PRAGMA table_info(graph_sync_generation)")
     generation_columns = [row[1] for row in cursor.fetchall()]
     assert generation_columns == list(GRAPH_SYNC_GENERATION_COLUMNS)
+    cursor.execute("PRAGMA table_info(schema_table_comments)")
+    comment_columns = [row[1] for row in cursor.fetchall()]
+    assert comment_columns == list(SCHEMA_TABLE_COMMENT_COLUMNS)
+    comments = {
+        row[0]: row[1]
+        for row in cursor.execute(
+            "SELECT table_name, comment FROM schema_table_comments"
+        ).fetchall()
+    }
+    assert comments == TABLE_COMMENTS
 
 
 def test_store_excel_data_preserves_long_cell_values(temp_db):
@@ -105,6 +117,8 @@ def test_storage_schema_constants_cover_current_tables():
     assert set(STORAGE_SCHEMA_COLUMNS) == set(CORE_TABLES)
     assert set(STORAGE_SCHEMA_TABLE_ORDER) == set(CORE_TABLES)
     assert set(USER_FACING_TABLES + INTERNAL_TABLES) == set(CORE_TABLES)
+    assert set(TABLE_COMMENTS) == set(CORE_TABLES)
+    assert all(comment.strip() for comment in TABLE_COMMENTS.values())
     assert USER_FACING_TABLES == (
         "files",
         "file_sheet_headers",
@@ -121,6 +135,7 @@ def test_storage_schema_constants_cover_current_tables():
         "graph_sync_generation",
         "graph_sync_outbox",
         "embedding_index_metadata",
+        "schema_table_comments",
     )
     assert tuple(get_usefull_col_extraction_target("source_tables")["fields"]) == tuple(
         SOURCE_TABLE_COLUMNS[4:-1]
@@ -279,7 +294,9 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
     assert tables == set(CORE_TABLES)
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
         expected_count = (
-            1
+            len(TABLE_COMMENTS)
+            if table_name == "schema_table_comments"
+            else 1
             if table_name in {"graph_sync_generation", "graph_sync_outbox"}
             else 0
         )
@@ -473,6 +490,26 @@ def test_init_db_adds_column_catalog_tables_to_previous_current_schema(temp_db):
             ).fetchall()
         )
         assert actual_columns == tuple(expected_columns)
+
+
+def test_init_db_adds_schema_comments_without_changing_existing_data(temp_db):
+    temp_db.execute(
+        "INSERT INTO files (filename, upload_time, model_used) VALUES (?, ?, ?)",
+        ("existing.xlsx", "2026-09-22", "model"),
+    )
+    temp_db.execute("DROP TABLE schema_table_comments")
+    temp_db.commit()
+
+    init_db()
+
+    assert temp_db.execute("SELECT filename FROM files").fetchone()[0] == "existing.xlsx"
+    comments = {
+        row[0]: row[1]
+        for row in temp_db.execute(
+            "SELECT table_name, comment FROM schema_table_comments"
+        ).fetchall()
+    }
+    assert comments == TABLE_COMMENTS
 
 
 @pytest.mark.parametrize("with_description_aliases", [False, True])

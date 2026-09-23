@@ -117,7 +117,7 @@ def list_additional_objects(
         clean_name = str(name).strip()
         if not clean_name:
             return {"error": "name must be non-empty", "rows": []}
-        where_parts.append("TRIM(objects.name) = ? COLLATE NOCASE")
+        where_parts.append("LOWER(TRIM(objects.name)) = LOWER(TRIM(?))")
         params.append(clean_name)
         filters["name"] = clean_name
     if additional_object_id is not None:
@@ -134,7 +134,7 @@ def list_additional_objects(
         clean_sheet = str(sheet_name).strip()
         if not clean_sheet:
             return {"error": "sheet_name must be non-empty", "rows": []}
-        where_parts.append("TRIM(objects.sheet_name) = ? COLLATE NOCASE")
+        where_parts.append("LOWER(TRIM(objects.sheet_name)) = LOWER(TRIM(?))")
         params.append(clean_sheet)
         filters["sheet_name"] = clean_sheet
     if row_num is not None:
@@ -183,17 +183,17 @@ def search_additional_objects(
     where_parts: List[str] = []
     params: List[Any] = []
     if search_in == "name":
-        where_parts.append("INSTR(LOWER(COALESCE(objects.name, '')), LOWER(?)) > 0")
+        where_parts.append("LOWER(COALESCE(objects.name, '')) LIKE '%' || LOWER(?) || '%'")
         params.append(text)
         searched_columns = ["name"]
     elif search_in == "sql":
-        where_parts.append("INSTR(LOWER(COALESCE(objects.sql, '')), LOWER(?)) > 0")
+        where_parts.append("LOWER(COALESCE(objects.sql, '')) LIKE '%' || LOWER(?) || '%'")
         params.append(text)
         searched_columns = ["sql"]
     else:
         where_parts.append(
-            "(INSTR(LOWER(COALESCE(objects.name, '')), LOWER(?)) > 0 "
-            "OR INSTR(LOWER(COALESCE(objects.sql, '')), LOWER(?)) > 0)"
+            "(LOWER(COALESCE(objects.name, '')) LIKE '%' || LOWER(?) || '%' "
+            "OR LOWER(COALESCE(objects.sql, '')) LIKE '%' || LOWER(?) || '%')"
         )
         params.extend((text, text))
         searched_columns = ["name", "sql"]

@@ -194,7 +194,7 @@ def _load_rows(
         """
         SELECT row_num, column_id, value
         FROM data
-        WHERE file_id = ? AND table_name = ? COLLATE NOCASE
+        WHERE file_id = ? AND LOWER(TRIM(table_name)) = LOWER(TRIM(?))
         ORDER BY row_num, id
         """,
         (file_id, sheet_name),
@@ -351,8 +351,8 @@ def _load_persisted_table_descriptions(file_id: int) -> List[Dict[str, str]]:
                 SELECT table_name, description
                 FROM {table_name}
                 WHERE file_id = ?
-                  AND IFNULL(TRIM(table_name), '') != ''
-                  AND IFNULL(TRIM(description), '') != ''
+                  AND COALESCE(TRIM(table_name), '') != ''
+                  AND COALESCE(TRIM(description), '') != ''
                 ORDER BY row_num
                 """,
                 (file_id,),
@@ -439,7 +439,7 @@ def fetch_file_data(file_id: int) -> Dict[str, Any]:
                   SELECT 1
                   FROM data
                   WHERE data.file_id = headers.file_id
-                    AND data.table_name = headers.sheet_name COLLATE NOCASE
+                    AND LOWER(data.table_name) = LOWER(headers.sheet_name)
               )
             ORDER BY sheet_name
             """,

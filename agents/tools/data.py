@@ -135,7 +135,7 @@ def search_excel_values(
             FROM data
             JOIN file_sheet_headers AS headers
               ON headers.file_id = data.file_id
-             AND headers.sheet_name = data.table_name COLLATE NOCASE
+             AND LOWER(headers.sheet_name) = LOWER(data.table_name)
             JOIN files ON files.file_id = headers.file_id
             WHERE {' AND '.join(clauses)}
             ORDER BY files.file_id, headers.sheet_name,
@@ -213,7 +213,7 @@ def get_excel_row(
             FROM file_sheet_headers AS headers
             JOIN files ON files.file_id = headers.file_id
             WHERE headers.file_id = ?
-              AND headers.sheet_name = ? COLLATE NOCASE
+              AND LOWER(TRIM(headers.sheet_name)) = LOWER(TRIM(?))
             """,
             (clean_file_id, clean_sheet_name),
         ).fetchone()
@@ -221,7 +221,8 @@ def get_excel_row(
             """
             SELECT column_id, value
             FROM data
-            WHERE file_id = ? AND table_name = ? COLLATE NOCASE
+            WHERE file_id = ?
+              AND LOWER(TRIM(table_name)) = LOWER(TRIM(?))
               AND row_num = ?
             ORDER BY column_id, id
             """,
@@ -502,7 +503,9 @@ def semantic_search_descriptions(
                 value = clean_column_filters.get(field)
                 if value is None:
                     continue
-                conditions.append(f"TRIM(catalog.{field}) = ? COLLATE NOCASE")
+                conditions.append(
+                    f"LOWER(TRIM(catalog.{field})) = LOWER(TRIM(?))"
+                )
                 column_params.append(value)
             for field in ("primary_key", "not_null"):
                 if field not in clean_column_filters:

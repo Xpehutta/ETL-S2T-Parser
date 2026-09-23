@@ -27,7 +27,7 @@ SchemaName = Literal[
 
 SCHEMA_CATALOG: Dict[str, str] = {
     "SQLite ETL": (
-        "Реальные колонки публичных SQLite-таблиц; нужна для составления "
+        "Реальные колонки публичных таблиц ETL-хранилища; нужна для составления "
         "произвольного run_sql (только read-only) и проверки физической "
         "структуры хранения."
     ),
@@ -266,20 +266,6 @@ def _sql_risk_aspect_context(
     )
 
 
-_DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
-    "files": "загруженные Excel-файлы и их сохранённые описания",
-    "file_sheet_headers": "листы файлов и распознанные заголовки",
-    "source_tables": "исходные логические таблицы и бизнес-описания таблиц",
-    "target_tables": "целевые логические таблицы и бизнес-описания таблиц",
-    "source_columns": "исходные колонки, их таблицы, типы и описания полей",
-    "target_columns": "целевые колонки, их таблицы, типы и описания полей",
-    "additional_objects": "Additional objects с точным именем и полным SQL",
-    "pxf_to_a": "соответствия external, materialized и replica-таблиц",
-    "s2t_transformations": "точные source→target таблицы, поля и текст правила",
-    "data": "сырые значения ячеек Excel с координатами происхождения",
-}
-
-
 def get_downstream_capability_context() -> str:
     """Return compact planning capabilities without concrete tool names."""
     return "\n".join(
@@ -299,23 +285,15 @@ def get_downstream_capability_context() -> str:
 
 def get_downstream_table_context() -> str:
     """Return exact storage table names with compact planning descriptions."""
-    from storage.database import USER_FACING_TABLES
+    from storage.database import TABLE_COMMENTS, USER_FACING_TABLES
 
-    configured = set(_DOWNSTREAM_TABLE_DESCRIPTIONS)
-    actual = set(USER_FACING_TABLES)
-    if configured != actual:
-        raise RuntimeError(
-            "Downstream table descriptions are out of sync: "
-            f"missing={sorted(actual - configured)}, "
-            f"extra={sorted(configured - actual)}"
-        )
     return "\n".join(
         [
             "Реальные таблицы хранилища (справка, не список шагов; "
             "наличие таблицы не требует её чтения):"
         ]
         + [
-            f"- `{name}` — {_DOWNSTREAM_TABLE_DESCRIPTIONS[name]}."
+            f"- `{name}` — {TABLE_COMMENTS[name]}."
             for name in USER_FACING_TABLES
         ]
     )
@@ -336,46 +314,72 @@ def _format_backtick_list(names: Tuple[str, ...]) -> str:
 
 
 def get_sqlite_schema_cheatsheet() -> str:
-    """Собрать блок схемы SQLite для prompt-ов агентов из storage/database.py."""
+    """Собрать блок активной SQL-схемы для prompt-ов агентов."""
     from storage.database import (
         INTERNAL_TABLES,
         STORAGE_SCHEMA_COLUMNS,
         STORAGE_SCHEMA_TABLE_ORDER,
         S2T_RECORD_FIELDS,
+        TABLE_COMMENTS,
         USER_FACING_TABLES,
+        is_postgres_backend,
     )
 
+    postgres = is_postgres_backend()
+    if postgres:
+        from storage.postgres_schema import (
+            postgres_schema_columns,
+            postgres_table_names,
+        )
+
+        schema_columns = postgres_schema_columns()
+        table_order = postgres_table_names()
+    else:
+        schema_columns = STORAGE_SCHEMA_COLUMNS
+        table_order = STORAGE_SCHEMA_TABLE_ORDER
+
     rows = []
-    for table_name in STORAGE_SCHEMA_TABLE_ORDER:
-        columns = STORAGE_SCHEMA_COLUMNS[table_name]
+    for table_name in table_order:
+        columns = schema_columns[table_name]
         role = "публичная" if table_name in USER_FACING_TABLES else "внутренняя"
         rows.append(
-            f"| `{table_name}` | {role} | "
+            f"| `{table_name}` | {role} | {TABLE_COMMENTS[table_name]} | "
             + ", ".join(f"`{column}`" for column in columns)
             + " |"
         )
 
     public_tables = _format_backtick_list(USER_FACING_TABLES)
-    internal_tables = _format_backtick_list(INTERNAL_TABLES)
+    active_internal_tables = tuple(
+        table_name for table_name in INTERNAL_TABLES if table_name in table_order
+    )
+    internal_tables = _format_backtick_list(active_internal_tables)
     internal_guidance = (
         f"- Внутренние таблицы упоминай только для явных вопросов про хранение или debug: {internal_tables}.\n"
-        if INTERNAL_TABLES
+        if active_internal_tables
+        else ""
+    )
+    backend_label = "PostgreSQL" if postgres else "SQLite"
+    system_catalog = "`pg_catalog`" if postgres else "`sqlite_master`"
+    comment_guidance = (
+        "- Описания таблиц и колонок хранятся нативно через PostgreSQL COMMENT ON.\n"
+        if postgres
         else ""
     )
     s2t_display_columns = _format_backtick_list(("row_num", *S2T_RECORD_FIELDS))
     return (
-        "## Актуальная схема SQLite\n\n"
+        f"## Актуальная схема {backend_label}\n\n"
         "Блок с таблицами и колонками сгенерирован из `storage/database.py`; не подменяй его устаревшей документацией.\n\n"
-        "| Таблица | Роль | Колонки (реальные имена) |\n"
-        "|---------|------|--------------------------|\n"
+        "| Таблица | Роль | Комментарий | Колонки (реальные имена) |\n"
+        "|---------|------|-------------|--------------------------|\n"
         + "\n".join(rows)
         + "\n\n"
         "## Публичная DDL-схема для обычных вопросов в чате\n"
-        "- Вопросы пользователя про \"таблицы\", \"DDL\" и \"схему\" трактуй как вопросы про публичный слой ETL/S2T, а не про все внутренние SQLite-таблицы.\n"
+        f"- Вопросы пользователя про \"таблицы\", \"DDL\" и \"схему\" трактуй как вопросы про публичный слой ETL/S2T, а не про все внутренние таблицы {backend_label}.\n"
         f"- По умолчанию показывай только публичные таблицы: {public_tables}.\n"
         + internal_guidance
+        + comment_guidance
         + f"- Для `s2t_transformations` по умолчанию показывай только {s2t_display_columns}, если пользователь явно не просит сырой DDL.\n"
-        "- Не перечисляй `sqlite_master` и служебные таблицы, если пользователь прямо не спрашивает про внутреннюю реализацию БД.\n"
+        f"- Не перечисляй {system_catalog} и служебные таблицы, если пользователь прямо не спрашивает про внутреннюю реализацию БД.\n"
     )
 
 
@@ -445,7 +449,7 @@ def get_neo4j_schema_cheatsheet() -> str:
         "- `(:ETLTable)-[:TABLE_TRANSFORMS_TO]->(:ETLTable)` — направленная "
         "табличная связь; SQL правила может находиться на ребре.\n"
         "- Все узлы проекции имеют label `ETLProjection`; исходные факты "
-        "остаются в SQLite."
+        "остаются в основном SQL-хранилище."
     )
 
 

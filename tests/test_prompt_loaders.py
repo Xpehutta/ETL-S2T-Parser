@@ -179,6 +179,7 @@ def test_load_schemas_includes_exact_excel_and_sqlite_sources():
     assert "## Актуальная схема SQLite" in text
     assert "`additional_objects`" in text
     assert "`sql`" in text
+    assert "Additional objects с точным именем и полным SQL" in text
     assert "## Схемы Excel-маппингов" in text
     assert '"additional_objects"' in text
     assert '"sheet_group":"additional_objects"' in text

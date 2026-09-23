@@ -457,7 +457,7 @@ def load_file_sheets_for_grouping(file_id: int) -> List[Dict[str, Any]]:
             """
             SELECT sheet_name
             FROM file_sheet_headers
-            WHERE file_id = ? AND IFNULL(skipped, 0) = 0
+            WHERE file_id = ? AND COALESCE(skipped, 0) = 0
             ORDER BY sheet_name
             """,
             (file_id,),

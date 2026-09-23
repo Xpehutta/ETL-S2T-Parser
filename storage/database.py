@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseSchemaError(RuntimeError):
-    """Raised when an existing SQLite database does not match the current schema."""
+    """Raised when the configured durable database has an incompatible schema."""
 
 
 DB_PATH = "excel_data.db"
@@ -110,6 +110,10 @@ EMBEDDING_INDEX_METADATA_COLUMNS = (
     "dimension",
     "updated_at",
 )
+SCHEMA_TABLE_COMMENT_COLUMNS = (
+    "table_name",
+    "comment",
+)
 DATA_COLUMNS = (
     "id",
     "file_id",
@@ -134,9 +138,32 @@ INTERNAL_TABLES = (
     "graph_sync_generation",
     "graph_sync_outbox",
     "embedding_index_metadata",
+    "schema_table_comments",
 )
 CORE_TABLES = USER_FACING_TABLES + INTERNAL_TABLES
 STORAGE_SCHEMA_TABLE_ORDER = CORE_TABLES
+TABLE_COMMENTS = {
+    "files": "загруженные Excel-файлы и их сохранённые описания",
+    "file_sheet_headers": "листы файлов и распознанные заголовки",
+    "source_tables": "исходные логические таблицы и бизнес-описания таблиц",
+    "target_tables": "целевые логические таблицы и бизнес-описания таблиц",
+    "source_columns": "исходные колонки, их таблицы, типы и описания полей",
+    "target_columns": "целевые колонки, их таблицы, типы и описания полей",
+    "additional_objects": "Additional objects с точным именем и полным SQL",
+    "pxf_to_a": "соответствия external, materialized и replica-таблиц",
+    "s2t_transformations": "точные source→target таблицы, поля и текст правила",
+    "data": "сырые значения ячеек Excel с координатами происхождения",
+    "graph_sync_generation": "текущая версия производной Neo4j-проекции",
+    "graph_sync_outbox": "очередь запросов синхронизации SQLite с Neo4j",
+    "embedding_index_metadata": "параметры построенных embedding-индексов",
+    "schema_table_comments": "краткие назначения таблиц текущей схемы SQLite",
+}
+if set(TABLE_COMMENTS) != set(CORE_TABLES):
+    raise RuntimeError(
+        "SQLite table comments are out of sync: "
+        f"missing={sorted(set(CORE_TABLES) - set(TABLE_COMMENTS))}, "
+        f"extra={sorted(set(TABLE_COMMENTS) - set(CORE_TABLES))}"
+    )
 STORAGE_SCHEMA_COLUMNS = {
     "files": FILES_COLUMNS,
     "file_sheet_headers": FILE_SHEET_HEADER_COLUMNS,
@@ -151,6 +178,7 @@ STORAGE_SCHEMA_COLUMNS = {
     "graph_sync_generation": GRAPH_SYNC_GENERATION_COLUMNS,
     "graph_sync_outbox": GRAPH_SYNC_OUTBOX_COLUMNS,
     "embedding_index_metadata": EMBEDDING_INDEX_METADATA_COLUMNS,
+    "schema_table_comments": SCHEMA_TABLE_COMMENT_COLUMNS,
 }
 PRE_COLUMN_CATALOG_CORE_TABLES = tuple(
     table_name
@@ -180,7 +208,22 @@ def _column_catalog_fields_sql(fields: tuple[str, ...], indent: str) -> str:
     )
 
 
-def get_db_connection() -> sqlite3.Connection:
+def database_backend_name() -> str:
+    """Return the configured durable storage backend without opening it."""
+    from .postgres import postgres_enabled
+
+    return "postgresql" if postgres_enabled() else "sqlite"
+
+
+def is_postgres_backend() -> bool:
+    return database_backend_name() == "postgresql"
+
+
+def get_db_connection() -> Any:
+    if is_postgres_backend():
+        from .postgres import connect_postgres
+
+        return connect_postgres()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -395,6 +438,22 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
         )
         """
     )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {names['schema_table_comments']} (
+            table_name TEXT PRIMARY KEY,
+            comment TEXT NOT NULL CHECK (trim(comment) <> '')
+        )
+        """
+    )
+    cursor.executemany(
+        f"""
+        INSERT INTO {names['schema_table_comments']} (table_name, comment)
+        VALUES (?, ?)
+        ON CONFLICT(table_name) DO UPDATE SET comment = excluded.comment
+        """,
+        [(table_name, TABLE_COMMENTS[table_name]) for table_name in CORE_TABLES],
+    )
 
 
 def _legacy_schema_recovery_hint(cursor: sqlite3.Cursor) -> str:
@@ -468,6 +527,20 @@ def _schema_mismatches(
             mismatches.append(
                 "embedding_index_metadata.index_name: expected TEXT PRIMARY KEY"
             )
+    if "schema_table_comments" in selected:
+        comments_info = {
+            str(row[1]): row
+            for row in _table_info(cursor, "schema_table_comments")
+        }
+        table_key = comments_info.get("table_name")
+        if (
+            table_key is None
+            or str(table_key[2]).upper() != "TEXT"
+            or int(table_key[5]) != 1
+        ):
+            mismatches.append(
+                "schema_table_comments.table_name: expected TEXT PRIMARY KEY"
+            )
     if "file_sheet_headers" in selected:
         headers_info = {
             str(row[1]): row for row in _table_info(cursor, "file_sheet_headers")
@@ -532,6 +605,12 @@ def _create_indexes(cursor: sqlite3.Cursor) -> None:
 
 def init_db() -> None:
     """Create the current schema or reject an incompatible existing database."""
+    if is_postgres_backend():
+        from .postgres_schema import init_postgres_schema
+
+        init_postgres_schema()
+        logger.info("PostgreSQL database initialized with the current schema")
+        return
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -709,6 +788,11 @@ def _migrate_column_catalog_schema(cursor: sqlite3.Cursor) -> List[str]:
 
 def migrate_column_catalog_schema() -> Dict[str, Any]:
     """Remove obsolete column provenance/alias fields from prior schemas."""
+    if is_postgres_backend():
+        from .postgres_schema import init_postgres_schema
+
+        init_postgres_schema()
+        return {"changed": False, "tables_rebuilt": []}
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -734,6 +818,11 @@ def migrate_column_catalog_schema() -> Dict[str, Any]:
 
 def migrate_s2t_layer_columns() -> Dict[str, Any]:
     """Explicitly add nullable source/target layer columns to the prior schema."""
+    if is_postgres_backend():
+        from .postgres_schema import init_postgres_schema
+
+        init_postgres_schema()
+        return {"changed": False, "columns_added": []}
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -763,7 +852,11 @@ def migrate_s2t_layer_columns() -> Dict[str, Any]:
 
 
 def clear_all_data_with_graph_snapshot() -> tuple[Dict[str, int], Dict[str, Any]]:
-    """Clear SQLite and return the exact graph-clear generation to acknowledge."""
+    """Clear durable storage and return the graph generation to acknowledge."""
+    if is_postgres_backend():
+        from .postgres_schema import clear_postgres_data_with_graph_snapshot
+
+        return clear_postgres_data_with_graph_snapshot()
     deletion_order = tuple(reversed(STORAGE_SCHEMA_TABLE_ORDER))
     conn = get_db_connection()
     try:
@@ -869,14 +962,25 @@ def store_excel_data(
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
-        cursor.execute(
-            """
-            INSERT INTO files (filename, model_used, upload_time)
-            VALUES (?, ?, ?)
-            """,
-            (filename, model_used, upload_time),
-        )
-        current_file_id = int(cursor.lastrowid)
+        if is_postgres_backend():
+            cursor.execute(
+                """
+                INSERT INTO files (filename, model_used, upload_time)
+                VALUES (?, ?, ?)
+                RETURNING file_id
+                """,
+                (filename, model_used, upload_time),
+            )
+            current_file_id = int(cursor.fetchone()[0])
+        else:
+            cursor.execute(
+                """
+                INSERT INTO files (filename, model_used, upload_time)
+                VALUES (?, ?, ?)
+                """,
+                (filename, model_used, upload_time),
+            )
+            current_file_id = int(cursor.lastrowid)
 
         for sheet in sheets:
             sheet_name = str(sheet["sheet_name"])
@@ -1022,7 +1126,8 @@ def get_columns_by_sheet(file_id: int, sheet_name: str) -> List[Dict[str, Any]]:
             """
             SELECT headers_json
             FROM file_sheet_headers
-            WHERE file_id = ? AND sheet_name = ? COLLATE NOCASE
+            WHERE file_id = ?
+              AND LOWER(TRIM(sheet_name)) = LOWER(TRIM(?))
             """,
             (int(file_id), str(sheet_name)),
         ).fetchone()

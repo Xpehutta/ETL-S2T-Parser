@@ -323,7 +323,7 @@ def _table_rows(
     where = f"NULLIF(TRIM({column}), '') IS NOT NULL"
     params: List[Any] = []
     if exact is not None:
-        where += f" AND TRIM({column}) = ? COLLATE NOCASE"
+        where += f" AND LOWER(TRIM({column})) = LOWER(TRIM(?))"
         params.append(str(exact).strip())
     conn = get_db_connection()
     try:
