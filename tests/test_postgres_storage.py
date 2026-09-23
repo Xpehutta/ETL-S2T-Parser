@@ -29,6 +29,19 @@ from scripts import migrate_sqlite_to_postgres as migration
 from scripts.migrate_sqlite_to_postgres import _source_manifest
 
 
+def _native_schema_metadata(prefix: str = "native") -> dict[str, dict[str, Any]]:
+    return {
+        table_name: {
+            "comment": f"{prefix} table {table_name}",
+            "columns": {
+                column_name: f"{prefix} column {table_name}.{column_name}"
+                for column_name in columns
+            },
+        }
+        for table_name, columns in postgres_schema.postgres_schema_columns().items()
+    }
+
+
 class _SQLitePostgresCursor:
     def __init__(self, connection: "_SQLitePostgresConnection") -> None:
         self.connection = connection
@@ -360,6 +373,108 @@ def test_postgres_schema_contract_uses_native_comments_and_no_comment_table():
     assert all("schema_table_comments" not in statement for statement in statements)
 
 
+def test_read_postgres_schema_metadata_uses_pg_catalog(monkeypatch):
+    expected = _native_schema_metadata()
+    rows = [
+        {
+            "table_name": table_name,
+            "table_comment": table["comment"],
+            "column_name": column_name,
+            "column_comment": column_comment,
+            "ordinal_position": position,
+        }
+        for table_name, table in expected.items()
+        for position, (column_name, column_comment) in enumerate(
+            table["columns"].items(),
+            start=1,
+        )
+    ]
+
+    class FakeConnection:
+        def __init__(self):
+            self.statement = ""
+            self.params = None
+            self.closed = False
+
+        def execute(self, statement, params=None):
+            self.statement = str(statement)
+            self.params = params
+            return self
+
+        def fetchall(self):
+            return rows
+
+        def close(self):
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        postgres_schema,
+        "connect_postgres",
+        lambda database_url=None, schema=None: connection,
+    )
+
+    metadata = postgres_schema.read_postgres_schema_metadata(
+        "postgresql://example/db",
+        schema="etl",
+    )
+
+    assert metadata == expected
+    assert "obj_description" in connection.statement
+    assert "col_description" in connection.statement
+    assert connection.params == (
+        "etl",
+        list(postgres_schema.postgres_schema_columns()),
+    )
+    assert connection.closed is True
+
+
+def test_read_postgres_schema_metadata_rejects_missing_native_comment(monkeypatch):
+    expected = _native_schema_metadata()
+    rows = [
+        {
+            "table_name": table_name,
+            "table_comment": table["comment"],
+            "column_name": column_name,
+            "column_comment": (
+                None
+                if (table_name, column_name) == ("files", "filename")
+                else column_comment
+            ),
+            "ordinal_position": position,
+        }
+        for table_name, table in expected.items()
+        for position, (column_name, column_comment) in enumerate(
+            table["columns"].items(),
+            start=1,
+        )
+    ]
+
+    class FakeConnection:
+        def execute(self, _statement, _params=None):
+            return self
+
+        def fetchall(self):
+            return rows
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        postgres_schema,
+        "connect_postgres",
+        lambda database_url=None, schema=None: FakeConnection(),
+    )
+
+    with pytest.raises(
+        postgres_schema.PostgresSchemaError,
+        match=r"missing column comment: files\.filename",
+    ):
+        postgres_schema.read_postgres_schema_metadata(
+            "postgresql://example/db"
+        )
+
+
 def test_init_postgres_schema_applies_ddl_comments_and_validates(monkeypatch):
     columns = postgres_schema.postgres_schema_columns()
 
@@ -648,6 +763,12 @@ def test_context_loader_empty_and_unknown_branches(monkeypatch):
 
 def test_schema_cheatsheet_describes_native_postgres_comments(monkeypatch):
     monkeypatch.setattr(db_storage, "is_postgres_backend", lambda: True)
+    metadata = _native_schema_metadata("catalog")
+    monkeypatch.setattr(
+        postgres_schema,
+        "read_postgres_schema_metadata",
+        lambda: metadata,
+    )
 
     text = get_sqlite_schema_cheatsheet()
 
@@ -655,6 +776,13 @@ def test_schema_cheatsheet_describes_native_postgres_comments(monkeypatch):
     assert "COMMENT ON" in text
     assert "`schema_table_comments`" not in text
     assert "`pg_catalog`" in text
+    assert metadata["files"]["comment"] in text
+    assert metadata["files"]["columns"]["filename"] in text
+    assert db_storage.TABLE_COMMENTS["files"] not in text
+
+    downstream = context_tools.get_downstream_table_context()
+    assert metadata["files"]["comment"] in downstream
+    assert db_storage.TABLE_COMMENTS["files"] not in downstream
 
 
 def test_sqlite_migration_manifest_covers_every_postgres_table(temp_db):

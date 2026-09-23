@@ -283,9 +283,23 @@ def get_downstream_capability_context() -> str:
     )
 
 
-def get_downstream_table_context() -> str:
+def get_downstream_table_context(*, read_native_comments: bool = True) -> str:
     """Return exact storage table names with compact planning descriptions."""
-    from storage.database import TABLE_COMMENTS, USER_FACING_TABLES
+    from storage.database import (
+        TABLE_COMMENTS,
+        USER_FACING_TABLES,
+        is_postgres_backend,
+    )
+
+    table_comments = TABLE_COMMENTS
+    if read_native_comments and is_postgres_backend():
+        from storage.postgres_schema import read_postgres_schema_metadata
+
+        metadata = read_postgres_schema_metadata()
+        table_comments = {
+            table_name: str(table["comment"])
+            for table_name, table in metadata.items()
+        }
 
     return "\n".join(
         [
@@ -293,7 +307,7 @@ def get_downstream_table_context() -> str:
             "наличие таблицы не требует её чтения):"
         ]
         + [
-            f"- `{name}` — {TABLE_COMMENTS[name]}."
+            f"- `{name}` — {table_comments[name]}."
             for name in USER_FACING_TABLES
         ]
     )
@@ -326,14 +340,28 @@ def get_sqlite_schema_cheatsheet() -> str:
     )
 
     postgres = is_postgres_backend()
+    table_comments = TABLE_COMMENTS
+    column_comments: Dict[str, Dict[str, str]] = {}
     if postgres:
-        from storage.postgres_schema import (
-            postgres_schema_columns,
-            postgres_table_names,
-        )
+        from storage.postgres_schema import read_postgres_schema_metadata
 
-        schema_columns = postgres_schema_columns()
-        table_order = postgres_table_names()
+        metadata = read_postgres_schema_metadata()
+        table_order = tuple(metadata)
+        schema_columns = {
+            table_name: tuple(table["columns"])
+            for table_name, table in metadata.items()
+        }
+        table_comments = {
+            table_name: str(table["comment"])
+            for table_name, table in metadata.items()
+        }
+        column_comments = {
+            table_name: {
+                column_name: str(comment)
+                for column_name, comment in table["columns"].items()
+            }
+            for table_name, table in metadata.items()
+        }
     else:
         schema_columns = STORAGE_SCHEMA_COLUMNS
         table_order = STORAGE_SCHEMA_TABLE_ORDER
@@ -342,10 +370,17 @@ def get_sqlite_schema_cheatsheet() -> str:
     for table_name in table_order:
         columns = schema_columns[table_name]
         role = "публичная" if table_name in USER_FACING_TABLES else "внутренняя"
+        rendered_columns = (
+            ", ".join(
+                f"`{column}` — {column_comments[table_name][column]}"
+                for column in columns
+            )
+            if postgres
+            else ", ".join(f"`{column}`" for column in columns)
+        )
         rows.append(
-            f"| `{table_name}` | {role} | {TABLE_COMMENTS[table_name]} | "
-            + ", ".join(f"`{column}`" for column in columns)
-            + " |"
+            f"| `{table_name}` | {role} | {table_comments[table_name]} | "
+            f"{rendered_columns} |"
         )
 
     public_tables = _format_backtick_list(USER_FACING_TABLES)
@@ -361,14 +396,23 @@ def get_sqlite_schema_cheatsheet() -> str:
     backend_label = "PostgreSQL" if postgres else "SQLite"
     system_catalog = "`pg_catalog`" if postgres else "`sqlite_master`"
     comment_guidance = (
-        "- Описания таблиц и колонок хранятся нативно через PostgreSQL COMMENT ON.\n"
+        "- Описания таблиц и колонок прочитаны из `pg_catalog` через "
+        "PostgreSQL `COMMENT ON`; используй именно их.\n"
         if postgres
         else ""
+    )
+    schema_source = (
+        "Блок с таблицами, колонками и описаниями прочитан из `pg_catalog`."
+        if postgres
+        else (
+            "Блок с таблицами и колонками сгенерирован из "
+            "`storage/database.py`; не подменяй его устаревшей документацией."
+        )
     )
     s2t_display_columns = _format_backtick_list(("row_num", *S2T_RECORD_FIELDS))
     return (
         f"## Актуальная схема {backend_label}\n\n"
-        "Блок с таблицами и колонками сгенерирован из `storage/database.py`; не подменяй его устаревшей документацией.\n\n"
+        f"{schema_source}\n\n"
         "| Таблица | Роль | Комментарий | Колонки (реальные имена) |\n"
         "|---------|------|-------------|--------------------------|\n"
         + "\n".join(rows)

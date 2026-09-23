@@ -133,7 +133,9 @@ _UPSTREAM_ANSWER_TOOL_NAME = "submit_upstream_answer"
 _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
 _DOWNSTREAM_CAPABILITY_CONTEXT = get_downstream_capability_context()
-_DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context()
+_DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context(
+    read_native_comments=False,
+)
 
 
 def _typed_sql_risk_aspects_enabled() -> bool:
@@ -526,6 +528,19 @@ reroute построй полный план по original_task и problem; пр
 
 {_DOWNSTREAM_TABLE_CONTEXT}
 """.strip()
+
+
+def _runtime_downstream_plan_prompt() -> str:
+    """Refresh PostgreSQL table descriptions before each downstream plan."""
+
+    current_table_context = get_downstream_table_context()
+    if current_table_context == _DOWNSTREAM_TABLE_CONTEXT:
+        return _DOWNSTREAM_PLAN_PROMPT
+    return _DOWNSTREAM_PLAN_PROMPT.replace(
+        _DOWNSTREAM_TABLE_CONTEXT,
+        current_table_context,
+    )
+
 
 _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` нарушает схему или смысловой контракт.
@@ -1930,7 +1945,7 @@ def build_coordinator_graph(
                 content="\n\n".join(
                     part
                     for part in (
-                        _DOWNSTREAM_PLAN_PROMPT,
+                        _runtime_downstream_plan_prompt(),
                         plan_operation_context,
                     )
                     if part

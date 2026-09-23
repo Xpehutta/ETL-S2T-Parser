@@ -213,7 +213,9 @@ CHAT_AGENT_MODE=single_agent
 При заданном `DATABASE_URL` основное хранилище работает в PostgreSQL. Без него
 сохраняется совместимый локальный fallback `excel_data.db`. В PostgreSQL
 назначение каждой таблицы и колонки записывается нативно через
-`COMMENT ON TABLE` и `COMMENT ON COLUMN` и доступно в системном каталоге.
+`COMMENT ON TABLE` и `COMMENT ON COLUMN`. Runtime читает эти описания обратно
+из `pg_catalog` для downstream-плана и лениво выбранного schema-context; при
+неполных комментариях статический fallback не используется.
 
 Минимальная конфигурация:
 
