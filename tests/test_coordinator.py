@@ -2891,6 +2891,25 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "required_evidence" not in step_schema["properties"]
 
 
+def test_runtime_downstream_prompt_refreshes_postgres_comments(monkeypatch):
+    from agents import coordinator
+
+    native_context = (
+        "Реальные таблицы хранилища:\n"
+        "- `files` — описание из PostgreSQL pg_catalog."
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "get_downstream_table_context",
+        lambda: native_context,
+    )
+
+    prompt = coordinator._runtime_downstream_plan_prompt()
+
+    assert native_context in prompt
+    assert coordinator._DOWNSTREAM_TABLE_CONTEXT not in prompt
+
+
 def test_upstream_native_tools_enforce_linear_payloads():
     from agents.coordinator import (
         CoordinatorResponseError,

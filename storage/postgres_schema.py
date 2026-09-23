@@ -125,6 +125,91 @@ def postgres_column_comments() -> dict[str, dict[str, str]]:
     }
 
 
+def read_postgres_schema_metadata(
+    database_url: Optional[str] = None,
+    *,
+    schema: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
+    """Read table and column descriptions from the active PostgreSQL catalog."""
+
+    selected_schema = configured_postgres_schema(schema)
+    expected_columns = postgres_schema_columns()
+    connection = connect_postgres(database_url, schema=selected_schema)
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                relation.relname AS table_name,
+                obj_description(relation.oid, 'pg_class') AS table_comment,
+                attribute.attname AS column_name,
+                col_description(relation.oid, attribute.attnum) AS column_comment,
+                attribute.attnum AS ordinal_position
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+            WHERE namespace.nspname = ?
+              AND relation.relkind IN ('r', 'p')
+              AND relation.relname = ANY(?)
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY relation.relname, attribute.attnum
+            """,
+            (selected_schema, list(expected_columns)),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    discovered: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        table_name = str(row["table_name"])
+        if table_name not in expected_columns:
+            continue
+        table = discovered.setdefault(
+            table_name,
+            {
+                "comment": str(row["table_comment"] or "").strip(),
+                "columns": {},
+            },
+        )
+        column_name = str(row["column_name"])
+        table["columns"][column_name] = str(
+            row["column_comment"] or ""
+        ).strip()
+
+    issues: list[str] = []
+    for table_name, columns in expected_columns.items():
+        table = discovered.get(table_name)
+        if table is None:
+            issues.append(f"missing table metadata: {table_name}")
+            continue
+        if not table["comment"]:
+            issues.append(f"missing table comment: {table_name}")
+        actual_columns = table["columns"]
+        for column_name in columns:
+            if column_name not in actual_columns:
+                issues.append(f"missing column metadata: {table_name}.{column_name}")
+            elif not actual_columns[column_name]:
+                issues.append(f"missing column comment: {table_name}.{column_name}")
+    if issues:
+        raise PostgresSchemaError(
+            "PostgreSQL native schema descriptions are incomplete: "
+            + "; ".join(issues)
+        )
+
+    return {
+        table_name: {
+            "comment": discovered[table_name]["comment"],
+            "columns": {
+                column_name: discovered[table_name]["columns"][column_name]
+                for column_name in columns
+            },
+        }
+        for table_name, columns in expected_columns.items()
+    }
+
+
 def _text_fields(fields: tuple[str, ...], indent: str = "            ") -> str:
     return (",\n" + indent).join(f"{_identifier(field)} TEXT" for field in fields)
 
@@ -505,4 +590,5 @@ __all__ = [
     "postgres_column_comments",
     "postgres_schema_columns",
     "postgres_table_names",
+    "read_postgres_schema_metadata",
 ]
