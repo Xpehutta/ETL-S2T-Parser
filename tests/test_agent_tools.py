@@ -13,6 +13,7 @@ def test_sqlite_schema_cheatsheet_is_generated_from_db_storage():
     text = get_sqlite_schema_cheatsheet()
     for table_name, columns in db_storage.STORAGE_SCHEMA_COLUMNS.items():
         assert f"`{table_name}`" in text
+        assert db_storage.TABLE_COMMENTS[table_name] in text
         for column_name in columns:
             assert f"`{column_name}`" in text
     assert "сгенерирован из `storage/database.py`" in text

@@ -91,7 +91,7 @@ def _subset_conditions(
         clean_value = _clean_exact_filter(value, field)
         if clean_value is None:
             continue
-        conditions.append(f"TRIM({field}) = ? COLLATE NOCASE")
+        conditions.append(f"LOWER(TRIM({field})) = LOWER(TRIM(?))")
         params.append(clean_value)
         filters[field] = clean_value
 
@@ -106,7 +106,7 @@ def _subset_conditions(
         pattern = f"%{needle}%"
         conditions.append(
             "(" + " OR ".join(
-                f"COALESCE({field}, '') LIKE ? COLLATE NOCASE"
+                f"LOWER(COALESCE({field}, '')) LIKE LOWER(?)"
                 for field in (
                     "table_name",
                     "column_name",

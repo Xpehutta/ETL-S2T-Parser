@@ -61,7 +61,7 @@ def resolve_file(filename: str) -> Dict[str, Any]:
         rows = conn.execute(
             """SELECT file_id, filename, upload_time
             FROM files
-            WHERE filename = ? COLLATE NOCASE
+            WHERE LOWER(TRIM(filename)) = LOWER(TRIM(?))
             ORDER BY upload_time DESC""",
             (clean_filename,),
         ).fetchall()
