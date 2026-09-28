@@ -29,6 +29,9 @@ os.environ["LANGFUSE_PUBLIC_KEY"] = ""
 os.environ["LANGFUSE_SECRET_KEY"] = ""
 os.environ["OTEL_SDK_DISABLED"] = "true"
 os.environ.setdefault("GIGACHAT_VERIFY_SSL", "0")
+# Unit tests must never inherit a developer DATABASE_URL from a parent .env.
+# PostgreSQL integration tests opt in explicitly with their own monkeypatch.
+os.environ["DATABASE_URL"] = ""
 # Unit fakes are intentionally sync-only; production keeps this compatibility
 # path disabled unless an integration opts in explicitly.
 os.environ.setdefault("ASYNC_COMPAT_SYNC_FALLBACK", "1")
