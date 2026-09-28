@@ -1,7 +1,7 @@
 # ETL S2T Agent
 
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
-[![Flask 3](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-ASGI-009688.svg)](https://fastapi.tiangolo.com/)
 [![LangGraph](https://img.shields.io/badge/agents-LangGraph-orange.svg)](https://www.langchain.com/langgraph)
 
 ETL S2T Agent — chat-first приложение для загрузки и анализа Excel-файлов с Source-to-Target-маппингами. Оно сохраняет исходные факты в SQLite, извлекает S2T- и SQL-lineage, при наличии Neo4j строит графовую проекцию и отвечает на вопросы через многоагентный LangGraph.
@@ -24,6 +24,7 @@ ETL S2T Agent — chat-first приложение для загрузки и а�
 - read-only вопросы к SQLite и Neo4j на естественном языке;
 - полные табличные результаты в отдельном scrollable-блоке, а не в тексте чата;
 - сравнение многоагентного режима с базовым одноагентным режимом;
+- FastAPI/ASGI HTTP-слой с неблокирующим выносом линейного runtime в worker threads;
 - метрики времени, LLM-вызовов, инструментов и токенов для live-сценариев.
 
 ## Архитектура
@@ -278,10 +279,15 @@ uv sync
 Скопируйте `.env.example` в `.env`, заполните выбранный provider и запустите:
 
 ```bash
-uv run python app.py
+uv run uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-Интерфейс будет доступен на `http://127.0.0.1:5000`. Пути `/` и `/chat_app` открывают один и тот же chat-first экран с загрузкой файла, прогрессом анализа, чатом и просмотром полной таблицы трансформаций.
+Интерфейс будет доступен на `http://127.0.0.1:8000`. Пути `/` и `/chat_app`
+открывают один и тот же chat-first экран с загрузкой файла, прогрессом анализа,
+чатом и просмотром полной таблицы трансформаций. Линейный агент остаётся
+синхронным; FastAPI выносит его и блокирующие границы хранилища из event loop.
+Для autoreload используйте `--reload` либо `UVICORN_RELOAD=1` при запуске через
+`python app.py`.
 
 ## Настройка LLM
 
@@ -370,15 +376,15 @@ NEO4J_DATABASE=neo4j
 |---|---|---|
 | `GET` | `/`, `/chat_app` | chat-first UI |
 | `POST` | `/upload` | загрузка и полный анализ Excel |
-| `GET` | `/analysis_progress/<upload_id>` | прогресс загрузки |
+| `GET` | `/analysis_progress/{upload_id}` | прогресс загрузки |
 | `POST` | `/chat` | запрос к выбранному агентному режиму |
-| `GET` | `/summary/<file_id>` | summary файла |
-| `GET` | `/description/<file_id>` | краткое описание файла |
+| `GET` | `/summary/{file_id}` | summary файла |
+| `GET` | `/description/{file_id}` | краткое описание файла |
 | `GET` | `/transformations` | глобальная таблица S2T |
-| `GET` | `/transformations/<file_id>` | S2T указанного файла |
-| `DELETE` | `/transformations/<file_id>` | явная очистка S2T файла |
+| `GET` | `/transformations/{file_id}` | S2T указанного файла |
+| `DELETE` | `/transformations/{file_id}` | явная очистка S2T файла |
 | `DELETE` | `/storage` | явная полная очистка хранилищ |
-| `GET` | `/sheet_groups/<file_id>/classify` | классификация листов |
+| `GET` | `/sheet_groups/{file_id}/classify` | классификация листов |
 | `GET` | `/exports/...` | скачивание полных результатов |
 
 История чата хранится в `sessionStorage` браузера и передаётся в `/chat`. В SQLite история не записывается.
@@ -394,7 +400,7 @@ pytest tests/ --cov=. --cov-config=.coveragerc
 
 ### Live-сценарии
 
-Live-тесты используют реальный Flask `/chat`, выбранный provider и запущенный
+Live-тесты используют реальный FastAPI/ASGI `/chat`, выбранный provider и запущенный
 Neo4j для графовых сценариев. SQLite берётся из `LIVE_AGENT_DB_PATH`, если
 переменная задана, иначе из workspace `excel_data.db`; путь должен указывать на
 существующий файл. Таймаут одного локального HTTP `/chat`-обмена задаётся
@@ -615,7 +621,7 @@ LLM assessment; scope default по-прежнему выключен.
 ## Структура проекта
 
 ```text
-app.py                         Flask API и выбор режима чата
+app.py                         FastAPI/ASGI API и выбор режима чата
 processing/excel.py            механический разбор Excel
 storage/database.py            схема и хранение исходных данных
 storage/s2t.py                 операции с S2T transformations
